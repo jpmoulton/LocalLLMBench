@@ -1,0 +1,7 @@
+{
+ "name": "@fixture/title-case",
+ "private": true,
+ "scripts": {
+  "test": "jest ."
+ }
+}

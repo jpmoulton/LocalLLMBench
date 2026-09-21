@@ -1,0 +1,258 @@
+{
+ "artifacts": [
+  "cleanup.json",
+  "config.json",
+  "evaluation.json",
+  "evaluator/inspect.log",
+  "logs/compose-down.log",
+  "logs/compose-up.log",
+  "logs/inference-final.log",
+  "logs/startup.log",
+  "plan/compose-resolved.json",
+  "plan/compose.json",
+  "plan/server-argv.json",
+  "preflight.json",
+  "reports/campaign.json",
+  "reports/candidate.md",
+  "reports/report.html",
+  "reports/report.md",
+  "settings-evidence.json",
+  "stages.jsonl",
+  "verify.json"
+ ],
+ "context_fields": [
+  "artifacts",
+  "artifacts_dir",
+  "base_url",
+  "clock",
+  "coding_client",
+  "coding_hook",
+  "deadline_monotonic",
+  "policy_path",
+  "session_lock"
+ ],
+ "docker_calls": [
+  {
+   "argv": [
+    "docker",
+    "image",
+    "inspect",
+    "--format",
+    "{{json .}}",
+    "ghcr.io/ggml-org/llama.cpp@sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "compose",
+    "--ansi",
+    "never",
+    "--progress",
+    "plain",
+    "-p",
+    "PROJECT",
+    "--project-directory",
+    "RUN_DIR/plan",
+    "-f",
+    "RUN_DIR/plan/compose.json",
+    "config",
+    "--format",
+    "json"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "compose",
+    "--ansi",
+    "never",
+    "--progress",
+    "plain",
+    "-p",
+    "PROJECT",
+    "--project-directory",
+    "RUN_DIR/plan",
+    "-f",
+    "RUN_DIR/plan/compose.json",
+    "up",
+    "--detach",
+    "--no-build",
+    "--pull",
+    "never",
+    "inference"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 120
+  },
+  {
+   "argv": [
+    "docker",
+    "compose",
+    "--ansi",
+    "never",
+    "--progress",
+    "plain",
+    "-p",
+    "PROJECT",
+    "--project-directory",
+    "RUN_DIR/plan",
+    "-f",
+    "RUN_DIR/plan/compose.json",
+    "ps",
+    "--all",
+    "--format",
+    "json"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "compose",
+    "--ansi",
+    "never",
+    "--progress",
+    "plain",
+    "-p",
+    "PROJECT",
+    "--project-directory",
+    "RUN_DIR/plan",
+    "-f",
+    "RUN_DIR/plan/compose.json",
+    "port",
+    "inference",
+    "8080"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 4096,
+   "timeout_seconds": 10
+  },
+  {
+   "argv": [
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 4096,
+   "timeout_seconds": 10
+  },
+  {
+   "argv": [
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 4096,
+   "timeout_seconds": 10
+  },
+  {
+   "argv": [
+    "docker",
+    "logs",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 16777216,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 4096,
+   "timeout_seconds": 10
+  },
+  {
+   "argv": [
+    "docker",
+    "logs",
+    "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeeabcd"
+   ],
+   "max_output_bytes": 16777216,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "compose",
+    "--ansi",
+    "never",
+    "--progress",
+    "plain",
+    "-p",
+    "PROJECT",
+    "--project-directory",
+    "RUN_DIR/plan",
+    "-f",
+    "RUN_DIR/plan/compose.json",
+    "down",
+    "--volumes",
+    "--timeout",
+    "15"
+   ],
+   "max_output_bytes": 1048576,
+   "timeout_seconds": 45
+  },
+  {
+   "argv": [
+    "docker",
+    "ps",
+    "--all",
+    "--filter",
+    "label=com.docker.compose.project=PROJECT",
+    "--format",
+    "{{.ID}}"
+   ],
+   "max_output_bytes": 65536,
+   "timeout_seconds": 30
+  },
+  {
+   "argv": [
+    "docker",
+    "network",
+    "ls",
+    "--filter",
+    "label=com.docker.compose.project=PROJECT",
+    "--format",
+    "{{.ID}}"
+   ],
+   "max_output_bytes": 65536,
+   "timeout_seconds": 30
+  }
+ ],
+ "stages": [
+  "admit",
+  "hash",
+  "plan",
+  "start",
+  "ready",
+  "verify",
+  "quality",
+  "verify",
+  "cleanup",
+  "report"
+ ]
+}

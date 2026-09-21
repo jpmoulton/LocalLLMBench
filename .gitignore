@@ -1,0 +1,29 @@
+# environments and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.tmp/
+
+# everything a run produces: images metadata, staged datasets, results, logs
+artifacts/
+runs/
+eval-logs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# machine-local authorisation: copy runtime-policy.example.json, never commit the real one
+runtime-policy.json
+.env
+
+# editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

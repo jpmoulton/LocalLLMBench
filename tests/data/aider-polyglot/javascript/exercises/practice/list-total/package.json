@@ -1,0 +1,7 @@
+{
+ "name": "@fixture/list-total",
+ "private": true,
+ "scripts": {
+  "test": "jest ."
+ }
+}

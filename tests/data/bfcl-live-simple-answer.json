@@ -1,0 +1,2 @@
+{"id": "live_simple_0-0-0", "ground_truth": [[{"flights.search": {"origin": ["Paris"], "destination": ["Tokyo"], "date": ["2026-03-01"], "trip": ["one_way"]}}], [{"flights.search": {"origin": ["Paris"], "destination": ["Tokyo"], "date": ["2026-03-01"], "trip": ["return"]}}]]}
+{"id": "live_simple_1-1-0", "ground_truth": [{"math.round": {"value": [3.5], "digits": [0]}}]}

@@ -1,0 +1,33 @@
+{
+  "adapter_revision": "bfcl-v4-ast-subset-v1",
+  "upstream_package": "bfcl-eval",
+  "upstream_version": "0.0.0-test-fixture",
+  "source_commit": "0000000000000000000000000000000000000000",
+  "provenance": "Hand-made fixtures that mirror the upstream BFCL record shape (function schema in upstream's type language plus a possible-answer/ground-truth list). No upstream data is redistributed here; a real bundle is baked from the pinned bfcl-eval package at image build time and carries its real version, commit and file digests.",
+  "categories": {
+    "simple": {
+      "records": "data/BFCL_v4_simple.json",
+      "answers": "data/possible_answer/BFCL_v4_simple.json",
+      "count": 4,
+      "sha256": {"records": "", "answers": ""}
+    },
+    "parallel": {
+      "records": "data/BFCL_v4_parallel.json",
+      "answers": "data/possible_answer/BFCL_v4_parallel.json",
+      "count": 2,
+      "sha256": {"records": "", "answers": ""}
+    },
+    "irrelevance": {
+      "records": "data/BFCL_v4_irrelevance.json",
+      "answers": "data/possible_answer/BFCL_v4_irrelevance.json",
+      "count": 2,
+      "sha256": {"records": "", "answers": ""}
+    },
+    "live_simple": {
+      "records": "data/BFCL_v4_live_simple.json",
+      "answers": "data/possible_answer/BFCL_v4_live_simple.json",
+      "count": 2,
+      "sha256": {"records": "", "answers": ""}
+    }
+  }
+}

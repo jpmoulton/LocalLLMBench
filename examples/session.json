@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "session_id": "q4-kv-8k",
+  "image_bundle": null,
+  "assets": [
+    {
+      "role": "main",
+      "host_path": "/models/your-model.gguf",
+      "container_path": "/models/model.gguf",
+      "size_bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "gguf",
+      "quantization": "Q4_K_M",
+      "model_name": "your-model",
+      "source_revision": "local:models"
+    }
+  ],
+  "base": {
+    "schema_version": 1,
+    "label": "q4-8k",
+    "assets": [
+      {
+        "role": "main",
+        "host_path": "/models/your-model.gguf",
+        "container_path": "/models/model.gguf",
+        "size_bytes": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "model_name": "your-model",
+        "source_revision": "local:models"
+      }
+    ],
+    "inference_image": {
+      "role": "inference",
+      "reference": "ghcr.io/ggml-org/llama.cpp@sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e",
+      "image_id": "sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e",
+      "platform": "linux/amd64",
+      "entrypoint": [
+        "/app/llama-server"
+      ],
+      "build_info": "b11011-aa39d7a3e",
+      "help_sha256": "8f7317a678e9bbea0a3e81efc839d6175dd27ff61fd5089b530650632cd9aeb7",
+      "source": "ghcr.io/ggml-org/llama.cpp server-cuda13"
+    },
+    "evaluator": {
+      "mode": "host-process"
+    },
+    "engine": {
+      "engine": "llama.cpp",
+      "ctx_size": 8192,
+      "n_gpu_layers": "all",
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "kv_offload": true,
+      "flash_attn": "on",
+      "load_mode": "none",
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "threads": 8,
+      "threads_batch": 8,
+      "reasoning": "off",
+      "spec_type": "none",
+      "log_verbosity": 4
+    },
+    "generation": {
+      "temperature": 0,
+      "top_p": 1,
+      "seed": 42,
+      "max_output_tokens": 512
+    },
+    "speed": {
+      "repetitions": 3,
+      "warmup_repetitions": 1,
+      "output_tokens": 512,
+      "ignore_eos": true
+    },
+    "requested_input_tokens": 4096,
+    "template_reserve_tokens": 256,
+    "benchmarks": [
+      {
+        "benchmark_id": "tool-probes",
+        "revision": "local-tools-v1",
+        "task_ids": [
+          "tools/nested-exact-v1",
+          "tools/no-call-v1"
+        ]
+      },
+      {
+        "benchmark_id": "niah",
+        "revision": "local-niah-v1",
+        "task_ids": [
+          "single-middle",
+          "multi"
+        ],
+        "seed": 42
+      }
+    ],
+    "harness_revision": "0.1.0",
+    "limits": {
+      "max_foreign_vram_mib": 6144
+    }
+  },
+  "search": {
+    "quantizations": [
+      "Q4_K_M"
+    ],
+    "kv_pairs": [
+      [
+        "f16",
+        "f16"
+      ],
+      [
+        "q8_0",
+        "q8_0"
+      ]
+    ],
+    "ctx_tiers": [
+      8192
+    ],
+    "spec_types": [
+      "none"
+    ],
+    "reasoning": [
+      "off"
+    ],
+    "batch_sizes": [
+      2048
+    ]
+  },
+  "holdout": {
+    "niah_task_ids": [
+      "single-middle",
+      "multi"
+    ],
+    "niah_seed": 7
+  },
+  "budgets": {
+    "wall_seconds": 2400,
+    "holdout_reserve_seconds": 900,
+    "cleanup_reserve_seconds": 120,
+    "max_candidates": 2,
+    "candidate_wall_seconds": 900,
+    "max_validation_candidates": 2
+  },
+  "proposal_mode": "deterministic",
+  "proposal_file": null,
+  "policy": {
+    "schema_version": 1,
+    "name": "q4-kv-8k",
+    "mode": "live"
+  }
+}

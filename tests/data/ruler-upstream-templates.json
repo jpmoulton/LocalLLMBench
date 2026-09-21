@@ -1,0 +1,206 @@
+{
+  "_source": "NVIDIA RULER, Apache-2.0, github.com/NVIDIA/RULER",
+  "_commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+  "_fetched": "2026-09-18 via raw.githubusercontent.com",
+  "_note": "Verbatim upstream strings/parameters. Do not edit by hand: re-fetch at a new commit and regenerate, then re-read the divergence list in docs/workstreams/session7-ruler.md.",
+  "_files": {
+    "task_templates": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/data/synthetic/constants.py",
+    "task_args": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/synthetic.yaml",
+    "niah": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/data/synthetic/niah.py",
+    "variable_tracking": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/data/synthetic/variable_tracking.py",
+    "common_words_extraction": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/data/synthetic/common_words_extraction.py",
+    "metrics": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/eval/synthetic/constants.py",
+    "postprocess_pred": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/eval/evaluate.py"
+  },
+  "tasks": {
+    "niah": {
+      "template": "Some special magic {type_needle_v} are hidden within the following text. Make sure to memorize it. I will quiz you about the {type_needle_v} afterwards.\n{context}\nWhat are all the special magic {type_needle_v} for {query} mentioned in the provided text?",
+      "answer_prefix": " The special magic {type_needle_v} for {query} mentioned in the provided text are",
+      "tokens_to_generate": 128
+    },
+    "variable_tracking": {
+      "template": "Memorize and track the chain(s) of variable assignment hidden in the following text.\n\n{context}\nQuestion: Find all variables that are assigned the value {query} in the text above.",
+      "answer_prefix": " Answer: According to the chain(s) of variable assignment in the text above, {num_v} variables are assigned the value {query}, they are: ",
+      "tokens_to_generate": 30
+    },
+    "common_words_extraction": {
+      "template": "Below is a numbered list of words. In these words, some appear more often than others. Memorize the ones that appear most often.\n{context}\nQuestion: What are the 10 most common words in the above list?",
+      "answer_prefix": " Answer: The top 10 words that appear most often in the list are:",
+      "tokens_to_generate": 120
+    },
+    "freq_words_extraction": {
+      "template": "Read the following coded text and track the frequency of each coded word. Find the three most frequently appeared coded words. {context}\nQuestion: Do not provide any explanation. Please ignore the dots '....'. What are the three most frequently appeared words in the above coded text?",
+      "answer_prefix": " Answer: According to the coded text above, the three most frequently appeared words are:",
+      "tokens_to_generate": 50
+    },
+    "qa": {
+      "template": "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents.\n\n{context}\n\nAnswer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {query}",
+      "answer_prefix": " Answer:",
+      "tokens_to_generate": 32
+    }
+  },
+  "metrics": {
+    "niah": "string_match_all",
+    "variable_tracking": "string_match_all",
+    "common_words_extraction": "string_match_all",
+    "freq_words_extraction": "string_match_all",
+    "qa": "string_match_part"
+  },
+  "niah_needle": "One of the special magic {type_needle_v} for {key} is: {value}.",
+  "noise_sentence": "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.",
+  "depths": [
+    0,
+    3,
+    5,
+    8,
+    10,
+    13,
+    15,
+    18,
+    21,
+    23,
+    26,
+    28,
+    31,
+    33,
+    36,
+    38,
+    41,
+    44,
+    46,
+    49,
+    51,
+    54,
+    56,
+    59,
+    62,
+    64,
+    67,
+    69,
+    72,
+    74,
+    77,
+    79,
+    82,
+    85,
+    87,
+    90,
+    92,
+    95,
+    97,
+    100
+  ],
+  "depths_expression": "list(np.round(np.linspace(0, 100, num=40, endpoint=True)).astype(int))",
+  "task_args": {
+    "niah_single_1": {
+      "task": "niah",
+      "type_haystack": "noise",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_single_2": {
+      "task": "niah",
+      "type_haystack": "essay",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_single_3": {
+      "task": "niah",
+      "type_haystack": "essay",
+      "type_needle_k": "words",
+      "type_needle_v": "uuids",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_multikey_1": {
+      "task": "niah",
+      "type_haystack": "essay",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 4,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_multikey_2": {
+      "task": "niah",
+      "type_haystack": "needle",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_multikey_3": {
+      "task": "niah",
+      "type_haystack": "needle",
+      "type_needle_k": "uuids",
+      "type_needle_v": "uuids",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 1
+    },
+    "niah_multivalue": {
+      "task": "niah",
+      "type_haystack": "essay",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 1,
+      "num_needle_v": 4,
+      "num_needle_q": 1
+    },
+    "niah_multiquery": {
+      "task": "niah",
+      "type_haystack": "essay",
+      "type_needle_k": "words",
+      "type_needle_v": "numbers",
+      "num_needle_k": 1,
+      "num_needle_v": 1,
+      "num_needle_q": 4
+    },
+    "vt": {
+      "task": "variable_tracking",
+      "type_haystack": "noise",
+      "num_chains": 1,
+      "num_hops": 4
+    },
+    "cwe": {
+      "task": "common_words_extraction",
+      "freq_cw": 30,
+      "freq_ucw": 3,
+      "num_cw": 10
+    },
+    "fwe": {
+      "task": "freq_words_extraction",
+      "alpha": "2.0"
+    },
+    "qa_1": {
+      "task": "qa",
+      "dataset": "squad"
+    },
+    "qa_2": {
+      "task": "qa",
+      "dataset": "hotpotqa"
+    }
+  },
+  "prompt_assembly": {
+    "prepare.py": "config['template'] = model_template.format(task_template=task_template) + answer_prefix",
+    "call_api.py": "input_list=[data_point['input'] + data_point.get('answer_prefix', '')]",
+    "niah_singular_rewrite": [
+      "if num_needle_q * num_needle_v == 1:",
+      "    template = template.replace('Some', 'A')",
+      "    template = template.replace('are all', 'is')",
+      "    template = template.replace('are', 'is')",
+      "    template = template.replace('answers', 'answer')",
+      "    type_needle_v = type_needle_v[:-1]"
+    ],
+    "vt_num_v": "num_v=num_hops + 1",
+    "cwe_fewshot": "return few_shots + '\\n' + input_text  # num_fewshot=1, get_example(40, 10, 3, num_cw)"
+  }
+}

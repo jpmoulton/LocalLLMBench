@@ -1,0 +1,8 @@
+{
+ "blurb": "Hand-made fixture exercise; not upstream content.",
+ "files": {
+  "solution": ["sum_pair.py"],
+  "test": ["sum_pair_test.py"],
+  "example": [".meta/example.py"]
+ }
+}

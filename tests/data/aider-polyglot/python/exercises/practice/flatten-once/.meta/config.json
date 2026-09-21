@@ -1,0 +1,7 @@
+{
+ "blurb": "Hand-made fixture exercise with a deliberately repeated stub line; not upstream content.",
+ "files": {
+  "solution": ["flatten_once.py"],
+  "test": ["flatten_once_test.py"]
+ }
+}

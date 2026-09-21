@@ -1,0 +1,56 @@
+{
+  "status": 200,
+  "body": {
+    "models": [
+      {
+        "name": "qwen3.8-27b-q4_k_m",
+        "model": "qwen3.8-27b-q4_k_m",
+        "modified_at": "",
+        "size": "",
+        "digest": "",
+        "type": "model",
+        "description": "",
+        "tags": [
+          ""
+        ],
+        "capabilities": [
+          "completion"
+        ],
+        "parameters": "",
+        "details": {
+          "parent_model": "",
+          "format": "gguf",
+          "family": "",
+          "families": [
+            ""
+          ],
+          "parameter_size": "",
+          "quantization_level": ""
+        }
+      }
+    ],
+    "object": "list",
+    "data": [
+      {
+        "id": "qwen3.8-27b-q4_k_m",
+        "aliases": [
+          "qwen3.8-27b-q4_k_m"
+        ],
+        "tags": [],
+        "object": "model",
+        "created": 1789685215,
+        "owned_by": "llamacpp",
+        "meta": {
+          "vocab_type": true,
+          "n_vocab": 248320,
+          "n_ctx": 8192,
+          "n_ctx_train": 262144,
+          "n_embd": 5120,
+          "n_params": 27320697856,
+          "size": 16799719424,
+          "ftype": "Q4_K - Medium"
+        }
+      }
+    ]
+  }
+}

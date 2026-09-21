@@ -1,0 +1,178 @@
+{
+  "count_route": {
+    "no_tools": {
+      "apply_template_status": 200,
+      "apply_template_keys": [
+        "prompt"
+      ],
+      "rendered_prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nReply with the single word: ready.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "tokenize_counts": {
+        "add_special=True": 67,
+        "add_special=False": 67
+      },
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 67,
+        "total_tokens": 68,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 67,
+        "prompt_ms": 270.735,
+        "prompt_per_token_ms": 4.040820895522388,
+        "prompt_per_second": 247.47446765287089,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    },
+    "tools": {
+      "apply_template_status": 200,
+      "apply_template_keys": [
+        "prompt"
+      ],
+      "rendered_prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"lookup\", \"description\": \"Look up a record by id.\", \"parameters\": {\"type\": \"object\", \"required\": [\"id\"], \"additionalProperties\": false, \"properties\": {\"id\": {\"type\": \"integer\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nReply with the single word: ready.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "tokenize_counts": {
+        "add_special=True": 325,
+        "add_special=False": 325
+      },
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 325,
+        "total_tokens": 326,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 325,
+        "prompt_ms": 260.782,
+        "prompt_per_token_ms": 0.8024061538461538,
+        "prompt_per_second": 1246.251658473361,
+        "predicted_n": 1,
+        "predicted_ms": 0.001,
+        "predicted_per_token_ms": 0.0,
+        "predicted_per_second": 0.0
+      }
+    }
+  },
+  "stream_chat": {
+    "status": 200,
+    "chunks": 97,
+    "chunks_with_timings": [
+      96
+    ],
+    "chunks_with_usage": [
+      96
+    ],
+    "finish": [
+      [
+        95,
+        "length"
+      ]
+    ],
+    "delta_keys": [
+      "content",
+      "reasoning_content",
+      "role"
+    ],
+    "last_chunk": {
+      "choices": [],
+      "created": 1789686191,
+      "id": "chatcmpl-z3BPGravKOKHtgIHaeWE6S4YHQplezlw",
+      "model": "qwen3.8-27b-q4_k_m",
+      "system_fingerprint": "b11011-aa39d7a3e",
+      "object": "chat.completion.chunk",
+      "usage": {
+        "completion_tokens": 96,
+        "prompt_tokens": 60,
+        "total_tokens": 156,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 60,
+        "prompt_ms": 191.112,
+        "prompt_per_token_ms": 3.1852,
+        "prompt_per_second": 313.9520281301017,
+        "predicted_n": 96,
+        "predicted_ms": 642.389,
+        "predicted_per_token_ms": 6.761989473684211,
+        "predicted_per_second": 147.88547126429623,
+        "draft_n": 90,
+        "draft_n_accepted": 65
+      }
+    },
+    "second_last_chunk": {
+      "choices": [
+        {
+          "finish_reason": "length",
+          "index": 0,
+          "delta": {}
+        }
+      ],
+      "created": 1789686191,
+      "id": "chatcmpl-z3BPGravKOKHtgIHaeWE6S4YHQplezlw",
+      "model": "qwen3.8-27b-q4_k_m",
+      "system_fingerprint": "b11011-aa39d7a3e",
+      "object": "chat.completion.chunk"
+    },
+    "first_chunk": {
+      "choices": [
+        {
+          "finish_reason": null,
+          "index": 0,
+          "delta": {
+            "role": "assistant",
+            "content": null
+          }
+        }
+      ],
+      "created": 1789686190,
+      "id": "chatcmpl-z3BPGravKOKHtgIHaeWE6S4YHQplezlw",
+      "model": "qwen3.8-27b-q4_k_m",
+      "system_fingerprint": "b11011-aa39d7a3e",
+      "object": "chat.completion.chunk"
+    }
+  },
+  "repeat_nonstream_cache": {
+    "usage": {
+      "completion_tokens": 96,
+      "prompt_tokens": 60,
+      "total_tokens": 156,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 60,
+      "prompt_ms": 189.522,
+      "prompt_per_token_ms": 3.1587,
+      "prompt_per_second": 316.58593725266724,
+      "predicted_n": 96,
+      "predicted_ms": 614.524,
+      "predicted_per_token_ms": 6.468673684210526,
+      "predicted_per_second": 154.59119578730855,
+      "draft_n": 87,
+      "draft_n_accepted": 66
+    },
+    "finish_reason": "length"
+  },
+  "overflow_completion": {
+    "n_ctx": 131072,
+    "status": 400,
+    "body": "{\"error\":{\"code\":400,\"message\":\"request (131136 tokens) exceeds the available context size (131072 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":131136,\"n_ctx\":131072}}"
+  },
+  "overflow_chat": {
+    "status": 400,
+    "body": "{\"error\":{\"code\":400,\"message\":\"request (131188 tokens) exceeds the available context size (131072 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":131188,\"n_ctx\":131072}}"
+  }
+}

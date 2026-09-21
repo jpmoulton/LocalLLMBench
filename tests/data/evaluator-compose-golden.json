@@ -1,0 +1,246 @@
+{
+  "name": "llmbench-0123456789ab",
+  "networks": {
+    "bench": {
+      "internal": true,
+      "labels": {
+        "llmbench.attempt": "0123456789abcdef0123456789abcdef",
+        "llmbench.owner": "llmbench",
+        "llmbench.role": "network",
+        "llmbench.session": "session-1"
+      }
+    }
+  },
+  "services": {
+    "evaluator": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": [
+        "--config",
+        "/run/llmbench/config.json",
+        "--policy",
+        "/run/llmbench/runtime-policy.json",
+        "--grant-seconds",
+        "900",
+        "--artifact-bytes",
+        "268435456"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "2.0",
+            "memory": "4294967296",
+            "pids": 256
+          }
+        }
+      },
+      "entrypoint": [
+        "python",
+        "-m",
+        "llmbench.container_eval"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "image": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "init": true,
+      "labels": {
+        "llmbench.attempt": "0123456789abcdef0123456789abcdef",
+        "llmbench.owner": "llmbench",
+        "llmbench.role": "evaluator",
+        "llmbench.session": "session-1"
+      },
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-file": "2",
+          "max-size": "16m"
+        }
+      },
+      "networks": [
+        "bench"
+      ],
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "no",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "10s",
+      "tmpfs": [
+        "/tmp:size=256m,mode=1777"
+      ],
+      "user": "10001:10001",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/runs/attempt/plan/evaluator-config.json",
+          "target": "/run/llmbench/config.json",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/runs/attempt/plan/runtime-policy.json",
+          "target": "/run/llmbench/runtime-policy.json",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/runs/attempt/evaluator",
+          "target": "/artifacts",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/runs/attempt/spool/requests",
+          "target": "/spool/requests",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/runs/attempt/spool/results",
+          "target": "/spool/results",
+          "type": "bind"
+        }
+      ]
+    },
+    "inference": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": [
+        "--model",
+        "/models/model.gguf",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080",
+        "--alias",
+        "llmbench-c2f476be8842",
+        "--ctx-size",
+        "8192",
+        "--n-gpu-layers",
+        "all",
+        "--cache-type-k",
+        "f16",
+        "--cache-type-v",
+        "f16",
+        "--kv-offload",
+        "--flash-attn",
+        "on",
+        "--load-mode",
+        "none",
+        "--batch-size",
+        "2048",
+        "--ubatch-size",
+        "512",
+        "--threads",
+        "8",
+        "--threads-batch",
+        "8",
+        "--parallel",
+        "1",
+        "--no-cache-prompt",
+        "--cache-reuse",
+        "0",
+        "--cache-ram",
+        "0",
+        "--no-context-shift",
+        "--fit",
+        "off",
+        "--jinja",
+        "--reasoning",
+        "off",
+        "--reasoning-format",
+        "deepseek",
+        "--reasoning-budget",
+        "-1",
+        "--spec-type",
+        "none",
+        "--warmup",
+        "--no-ui",
+        "--metrics",
+        "--slots",
+        "--offline",
+        "--log-verbosity",
+        "4"
+      ],
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": "12.0",
+            "memory": "25769803776"
+          },
+          "reservations": {
+            "devices": [
+              {
+                "capabilities": [
+                  "gpu"
+                ],
+                "device_ids": [
+                  "0"
+                ],
+                "driver": "nvidia"
+              }
+            ]
+          }
+        }
+      },
+      "entrypoint": [
+        "/app/llama-server"
+      ],
+      "healthcheck": {
+        "disable": true
+      },
+      "image": "ghcr.io/ggml-org/llama.cpp@sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e",
+      "init": true,
+      "labels": {
+        "llmbench.attempt": "0123456789abcdef0123456789abcdef",
+        "llmbench.owner": "llmbench",
+        "llmbench.role": "inference",
+        "llmbench.session": "session-1"
+      },
+      "logging": {
+        "driver": "local",
+        "options": {
+          "max-file": "2",
+          "max-size": "16m"
+        }
+      },
+      "networks": [
+        "bench"
+      ],
+      "pull_policy": "never",
+      "restart": "no",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "15s",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/srv/models/model.gguf",
+          "target": "/models/model.gguf",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}

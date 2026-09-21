@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "session_id": "live-smoke-1",
+  "image_bundle": "artifacts/container-prep/image-bundle.json",
+  "assets": [
+    {
+      "role": "main",
+      "host_path": "/models/your-model.gguf",
+      "container_path": "/models/model.gguf",
+      "size_bytes": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "gguf",
+      "quantization": "Q4_K_M",
+      "model_name": "your-model",
+      "source_revision": "local:models"
+    }
+  ],
+  "base": {
+    "schema_version": 1,
+    "label": "session-base",
+    "session_id": null,
+    "parent_grant_seconds": null,
+    "assets": [
+      {
+        "role": "main",
+        "host_path": "/models/your-model.gguf",
+        "container_path": "/models/model.gguf",
+        "size_bytes": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "model_name": "your-model",
+        "source_revision": "local:models"
+      }
+    ],
+    "inference_image": {
+      "role": "inference",
+      "reference": "ghcr.io/ggml-org/llama.cpp@sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e",
+      "image_id": "sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e",
+      "platform": "linux/amd64",
+      "entrypoint": [
+        "/app/llama-server"
+      ],
+      "build_info": "b11011-aa39d7a3e",
+      "help_sha256": "8f7317a678e9bbea0a3e81efc839d6175dd27ff61fd5089b530650632cd9aeb7",
+      "source": "ghcr.io/ggml-org/llama.cpp server-cuda13"
+    },
+    "evaluator": {
+      "mode": "host-process",
+      "image": null,
+      "watchdog_slack_seconds": 30
+    },
+    "worker_image": null,
+    "broker": null,
+    "engine": {
+      "engine": "llama.cpp",
+      "ctx_size": 4864,
+      "n_gpu_layers": "all",
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "kv_offload": true,
+      "flash_attn": "on",
+      "load_mode": "none",
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "threads": 8,
+      "threads_batch": 8,
+      "parallel": 1,
+      "cache_prompt": false,
+      "cache_reuse": 0,
+      "cache_ram_mib": 0,
+      "context_shift": false,
+      "fit": "off",
+      "swa_full": false,
+      "jinja": true,
+      "reasoning": "off",
+      "reasoning_format": "deepseek",
+      "reasoning_budget": -1,
+      "spec_type": "none",
+      "spec_draft_n_max": 3,
+      "warmup": true,
+      "log_verbosity": 4
+    },
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": null,
+      "seed": 42,
+      "max_output_tokens": 512,
+      "reasoning": "model-default",
+      "tool_emulation": false,
+      "strict_tools": false,
+      "repair_attempts": 0
+    },
+    "speed": {
+      "repetitions": 3,
+      "warmup_repetitions": 1,
+      "output_tokens": 512,
+      "ignore_eos": true
+    },
+    "requested_input_tokens": 4096,
+    "template_reserve_tokens": 256,
+    "benchmarks": [
+      {
+        "benchmark_id": "niah",
+        "revision": "local-niah-v1",
+        "task_ids": [
+          "single-early",
+          "single-middle",
+          "single-late",
+          "multi",
+          "missing",
+          "tool-multi"
+        ],
+        "split": "development",
+        "seed": 42,
+        "options": {}
+      },
+      {
+        "benchmark_id": "tool-episodes",
+        "revision": "local-tools-v1",
+        "task_ids": [
+          "tools/read-edit-test-v1"
+        ],
+        "split": "development",
+        "seed": 42,
+        "options": {}
+      },
+      {
+        "benchmark_id": "tool-probes",
+        "revision": "local-tools-v1",
+        "task_ids": [
+          "tools/nested-exact-v1",
+          "tools/no-call-v1"
+        ],
+        "split": "development",
+        "seed": 42,
+        "options": {}
+      }
+    ],
+    "registry_digest": null,
+    "limits": {
+      "gpu_device_id": "0",
+      "inference_memory_mib": 24576,
+      "inference_cpus": 12.0,
+      "evaluator_memory_mib": 4096,
+      "evaluator_cpus": 2.0,
+      "evaluator_artifact_bytes": 268435456,
+      "evaluator_pids": 256,
+      "evaluator_tmpfs_mib": 256,
+      "log_max_bytes": 16777216,
+      "max_artifact_bytes": 1073741824,
+      "max_foreign_vram_mib": 6144
+    },
+    "bounds": {
+      "candidate_wall_seconds": 1800,
+      "hash_seconds": 300,
+      "startup_seconds": 300,
+      "readiness_poll_seconds": 1.0,
+      "verify_seconds": 60,
+      "request_timeout_seconds": 300,
+      "evaluation_seconds": 1200,
+      "cleanup_reserve_seconds": 60
+    },
+    "harness_revision": "0.1.0"
+  },
+  "search": {
+    "quantizations": [
+      "Q4_K_M"
+    ],
+    "kv_pairs": [
+      [
+        "f16",
+        "f16"
+      ],
+      [
+        "q8_0",
+        "q8_0"
+      ]
+    ],
+    "ctx_tiers": [
+      4864,
+      5888,
+      7168,
+      8960
+    ],
+    "spec_types": [
+      "none"
+    ],
+    "reasoning": [
+      "off"
+    ],
+    "batch_sizes": [
+      2048
+    ],
+    "context_floor": 4096,
+    "context_ceiling": 8192,
+    "context_n_ctx_train": 262144,
+    "context_points_dropped": []
+  },
+  "holdout": {
+    "niah_task_ids": [
+      "single-early",
+      "single-middle",
+      "single-late",
+      "multi",
+      "missing",
+      "tool-multi"
+    ],
+    "niah_seed": 7
+  },
+  "budgets": {
+    "wall_seconds": 7200,
+    "holdout_reserve_seconds": 900,
+    "cleanup_reserve_seconds": 120,
+    "max_candidates": 5,
+    "candidate_wall_seconds": 900,
+    "max_validation_candidates": 2
+  },
+  "proposal_mode": "deterministic",
+  "proposal_file": null,
+  "policy": {
+    "schema_version": 1,
+    "name": "tune-your-model",
+    "mode": "live",
+    "search_mode": "optimize-within-budget",
+    "budgets": {
+      "wall_seconds": 14400,
+      "max_candidates": 12,
+      "max_validation_candidates": 2,
+      "reserve_validation_seconds": 600,
+      "task_timeout_seconds": 120,
+      "max_download_bytes": 0,
+      "max_artifact_bytes": 1073741824
+    },
+    "acceptance": {
+      "minimum_tokens_per_second": 50.0,
+      "speed_repetitions": 5,
+      "maximum_stream_gap_seconds": 2.0,
+      "minimum_coding_score": 0.8,
+      "minimum_tool_score": 0.95,
+      "minimum_retrieval_score": 0.95,
+      "max_quality_loss": 0.02,
+      "require_effective_settings_verified": true,
+      "require_actual_context_verified": true,
+      "require_holdout": true
+    },
+    "deploy_winner": false,
+    "languages": [
+      "python",
+      "typescript",
+      "javascript"
+    ]
+  }
+}

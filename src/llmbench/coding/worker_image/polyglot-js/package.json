@@ -1,0 +1,13 @@
+{
+  "name": "llmbench-polyglot-js-toolchain",
+  "description": "The jest/babel toolchain every Exercism JavaScript exercise in the pinned Aider Polyglot corpus declares. Baked because workers run with --network=none; exact top-level versions, transitive versions recorded in /opt/llmbench/polyglot-js-packages.json.",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "@babel/core": "7.25.2",
+    "@exercism/babel-preset-javascript": "0.2.1",
+    "babel-jest": "29.7.0",
+    "core-js": "3.37.1",
+    "jest": "29.7.0"
+  }
+}

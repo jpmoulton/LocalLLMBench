@@ -1,0 +1,6 @@
+{
+  "allow_model_operations": true,
+  "allow_inference": true,
+  "allow_container_execution": true,
+  "reason": "Copied from runtime-policy.example.json by the machine's owner to allow GPU and container work."
+}

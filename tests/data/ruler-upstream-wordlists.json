@@ -1,0 +1,58 @@
+{
+  "_source": "NVIDIA RULER, Apache-2.0, github.com/NVIDIA/RULER",
+  "_commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+  "_fetched": "2026-09-18 via raw.githubusercontent.com",
+  "_note": "wonderwords is NOT pinned in RULER's docker/requirements.txt; these are the 3.0.1 lists, verified identical to the project's master branch.",
+  "_files": {
+    "loader": "https://raw.githubusercontent.com/NVIDIA/RULER/c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a/scripts/data/synthetic/niah.py",
+    "wonderwords": "https://pypi.org/project/wonderwords/3.0.1/ (MIT), wonderwords/assets/*.txt"
+  },
+  "wonderwords": {
+    "adjectivelist": {
+      "sha256": "66814d46b7e292c83e839d12fe2fa083c8f66779b14b294e1be4e1342c5d4131",
+      "bytes": 7403,
+      "entries": 912,
+      "distinct": 910,
+      "first": "quizzical",
+      "last": "rural"
+    },
+    "nounlist": {
+      "sha256": "8d88b3ebc2e2969ed92ebe49cdb0c8a87c2ad3b27493d7afdff608f2e51c5bc9",
+      "bytes": 54752,
+      "entries": 6782,
+      "distinct": 6782,
+      "first": "ATM",
+      "last": "zucchini"
+    },
+    "verblist": {
+      "sha256": "9fbf5e4e69b8869aebd88e6d545312ff9f878a747327ede5f6dbbba5c27b08ad",
+      "bytes": 6967,
+      "entries": 1042,
+      "distinct": 1041,
+      "first": "abide",
+      "last": "zoom"
+    }
+  },
+  "pools": {
+    "niah_words": {
+      "expression": "sorted(list(set([f'{adj}-{noun}' for adj in adjs for noun in nouns])))",
+      "size": 6171620,
+      "used_by": [
+        "niah_multiquery keys"
+      ]
+    },
+    "cwe": {
+      "expression": "sorted(list(set(nouns + adjs + verbs))) then Random(42).shuffle",
+      "size": 8166,
+      "used_by": [
+        "cwe"
+      ]
+    },
+    "cwe_fallback": {
+      "file": "scripts/data/synthetic/json/english_words.json",
+      "git_lfs_oid_sha256": "affcd6d45fdf3cc843d585c99c97ad615094e760e6c4756b654bab6c73bc2eca",
+      "bytes": 8564991,
+      "note": "used only when num_words > len(cwe pool); NOT vendored here"
+    }
+  }
+}

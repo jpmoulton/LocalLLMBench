@@ -1,0 +1,4 @@
+{"id": "simple_0", "ground_truth": [{"geometry.circle_area": {"radius": [5, 5.0], "unit": ["cm", "centimetres", "centimeters", ""]}}]}
+{"id": "simple_1", "ground_truth": [{"job.configure": {"name": ["deploy", "the deploy job"], "verbose": [true], "retries": [3]}}]}
+{"id": "simple_2", "ground_truth": [{"restaurant.book": {"restaurant": ["Nonna's"], "party": [4], "tags": [["outdoor", "quiet"]]}}]}
+{"id": "simple_3", "ground_truth": [{"cache.configure": {"options": [{"memory_gib": 2, "policy": "lru"}]}}]}

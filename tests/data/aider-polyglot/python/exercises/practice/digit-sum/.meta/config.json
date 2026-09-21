@@ -1,0 +1,7 @@
+{
+ "blurb": "Hand-made fixture exercise; not upstream content.",
+ "files": {
+  "solution": ["digit_sum.py"],
+  "test": ["digit_sum_test.py"]
+ }
+}

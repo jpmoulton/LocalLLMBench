@@ -1,0 +1,7 @@
+{
+ "blurb": "Hand-made fixture exercise; not upstream content.",
+ "files": {
+  "solution": ["title-case.js"],
+  "test": ["title-case.spec.js"]
+ }
+}

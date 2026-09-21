@@ -1,0 +1,47 @@
+{
+ "_comment": "Model response bodies for the deterministic extraction tests. entry_point is always similar_elements. Exactly one of method/error is non-null: a response whose intent is ambiguous must be refused, never guessed.",
+ "bare_function": {
+  "content": "def similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n",
+  "method": "bare-module", "error": null},
+ "fenced_python": {
+  "content": "Here is the solution.\n\n```python\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```\n",
+  "method": "fenced", "error": null},
+ "fenced_untagged": {
+  "content": "```\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```",
+  "method": "fenced", "error": null},
+ "fenced_indented": {
+  "content": "Solution:\n\n```python\n    def similar_elements(a, b):\n        return tuple(sorted(set(a) & set(b)))\n```\n",
+  "method": "fenced", "error": null},
+ "fenced_plus_foreign_language_block": {
+  "content": "```python\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```\n\nRun it with:\n\n```bash\npython solution.py\n```\n",
+  "method": "fenced", "error": null},
+ "fenced_identical_twice": {
+  "content": "```python\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```\n\nAgain, for clarity:\n\n```python\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```\n",
+  "method": "fenced", "error": null},
+ "prose_wrapped": {
+  "content": "Sure! Here is a compact way to do it:\n\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n\nThis works because set intersection keeps only shared values.\n",
+  "method": "prose-trimmed", "error": null},
+ "prose_wrapped_with_import": {
+  "content": "You need the itertools module here, I think:\n\nimport itertools\n\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n\nHope that helps!",
+  "method": "prose-trimmed", "error": null},
+ "two_different_blocks": {
+  "content": "One option:\n\n```python\ndef similar_elements(a, b):\n    return tuple(set(a) & set(b))\n```\n\nOr, if you want it sorted:\n\n```python\ndef similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n```\n",
+  "method": null, "error": "ambiguous_code_blocks"},
+ "entry_point_missing": {
+  "content": "```python\ndef shared_values(a, b):\n    return tuple(set(a) & set(b))\n```\n",
+  "method": null, "error": "entry_point_missing"},
+ "block_does_not_parse": {
+  "content": "```python\ndef similar_elements(a, b)\n    return a\n```\n",
+  "method": null, "error": "code_block_does_not_parse"},
+ "unterminated_fence": {
+  "content": "```python\ndef similar_elements(a, b):\n    return tuple(set(a) & set(b))\n",
+  "method": null, "error": "unterminated_or_nested_fence"},
+ "foreign_language_block_only": {
+  "content": "```javascript\nfunction similarElements(a, b) { return a; }\n```\n",
+  "method": null, "error": "no_python_code_block"},
+ "prose_only": {
+  "content": "I am not able to solve this problem for you.",
+  "method": null, "error": "no_code_found"},
+ "empty": {"content": "   ", "method": null, "error": "no_text_content"},
+ "not_text": {"content": null, "method": null, "error": "no_text_content"}
+}

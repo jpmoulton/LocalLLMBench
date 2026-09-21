@@ -1,0 +1,2 @@
+{"id": "parallel_0", "ground_truth": [{"weather.current": {"city": ["Berlin"], "metric": [true, ""]}}, {"weather.current": {"city": ["Lisbon"], "metric": [true, ""]}}]}
+{"id": "parallel_1", "ground_truth": [{"money.convert": {"amount": [10, 10.0], "source": ["USD"], "target": ["EUR"]}}, {"weather.current": {"city": ["Oslo"], "metric": [true, ""]}}]}

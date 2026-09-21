@@ -1,0 +1,117 @@
+{
+  "request": {
+    "model": "pilot",
+    "temperature": 0,
+    "seed": 42,
+    "max_tokens": 1024,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "create_ticket",
+          "description": "Create a support ticket.",
+          "parameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "title",
+              "priority",
+              "tags",
+              "assignee"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "assignee": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "team",
+                  "id"
+                ],
+                "properties": {
+                  "team": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "File a high priority ticket titled 'Checkout 500 on submit' tagged payments and regression, assigned to team 'web-platform' member id 4172. Use the tool."
+      }
+    ]
+  },
+  "status": 200,
+  "wall_seconds": 2.6529390000000603,
+  "body": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "The user is asking to create a support ticket with the following details:\n- Title: \"Checkout 500 on submit\"\n- Priority: high\n- Tags: payments, regression\n- Assignee: team \"web-platform\", ID 4172\n\nLet's call the create_ticket tool with these parameters.\n",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "create_ticket",
+                "arguments": "{\"title\":\"Checkout 500 on submit\",\"priority\":\"high\",\"tags\":[\"payments\", \"regression\"],\"assignee\":{\"team\": \"web-platform\", \"id\": 4172}}"
+              },
+              "id": "TZTdRicoWdJ8aT3taYs51xEJxrL5oRIV"
+            }
+          ]
+        }
+      }
+    ],
+    "created": 1789685241,
+    "model": "qwen3.8-27b-q4_k_m",
+    "system_fingerprint": "b11011-aa39d7a3e",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 159,
+      "prompt_tokens": 446,
+      "total_tokens": 605,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-9hk4Rey9Mhd5YXbKWe9DEtf1vJpw6jgz",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 446,
+      "prompt_ms": 293.252,
+      "prompt_per_token_ms": 0.6575156950672646,
+      "prompt_per_second": 1520.8762429582746,
+      "predicted_n": 159,
+      "predicted_ms": 2340.236,
+      "predicted_per_token_ms": 14.811620253164556,
+      "predicted_per_second": 67.51455836078071
+    }
+  }
+}

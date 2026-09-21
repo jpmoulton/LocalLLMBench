@@ -1,0 +1,7 @@
+{
+ "blurb": "Hand-made fixture exercise; not upstream content.",
+ "files": {
+  "solution": ["word_reverse.py"],
+  "test": ["word_reverse_test.py"]
+ }
+}
