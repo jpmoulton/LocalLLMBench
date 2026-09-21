@@ -1,12 +1,20 @@
 # LocalLLMBench
 
-Find the best llama.cpp serving settings for a local GGUF model — and know how much to trust the answer.
+**LocalLLMBench finds the best inference settings for a local model - both speed *and* quality - across different
+quantizations and different serving settings, so you can pick the best trade-off for your situation.**
+
+Is the Q4 fast enough, or is the Q6 worth the speed it costs? Does a quantized KV cache hurt tool calling? How much
+context fits on your GPU, and how fast is it when it is actually full? Does speculative decoding double your speed
+for free? The answers depend on your model, your hardware and what you need from them, so LocalLLMBench measures
+them on your machine instead of guessing.
 
 LocalLLMBench (the command is `llmbench`) runs **any GGUF model you have on disk** in a pinned llama.cpp container,
-sweeps the settings that matter (KV-cache precision, speculative decoding, reasoning, context size, CPU/RAM
-offload, quantization), and scores every variation on speed, VRAM, verified context and **official public
-benchmarks**: BFCL (tool calling), RULER (long-context retrieval), EvalPlus MBPP+ and Aider Polyglot (coding). You
-get a report of everything that was tried, not just a winner.
+sweeps the settings that matter (quantization, KV-cache precision, speculative decoding, reasoning, context size,
+CPU/RAM offload), and scores every variation on speed, VRAM, verified context and **official public benchmarks**:
+BFCL (tool calling), RULER (long-context retrieval), EvalPlus MBPP+ and Aider Polyglot (coding). You get a report
+of everything that was tried - the whole trade-off curve, not just a winner. What matters to you goes in as
+input: a speed floor, minimum scores and a quality tolerance as the acceptance policy, and the context range you
+need as part of the search.
 
 Nothing is tied to a particular model. Point `--model` at a file: its size, hash, architecture, quantization,
 training context and speculative-decoding support are read from the file itself, and the search space is derived
@@ -69,6 +77,30 @@ python scripts/sweep_models.py --models a.gguf b.gguf --output runs/compare
 Coding benchmarks execute generated code, so they also need the sandboxed worker image:
 [docs/usage.md](docs/usage.md#coding-benchmarks).
 
+## Point an agent at it
+
+LocalLLMBench is built to be driven by a coding agent (Claude Code, or anything that can run shell commands). The
+idea: you say *"find the best settings for this model on this machine - I need at least 50 tok/s and 64K of
+context"*, and the agent has the tools to get there and the guardrails to report it honestly.
+
+What the agent gets:
+
+* **One command that derives a search from a model file** (`tune`), and a **proposal file** format for choosing its
+  own candidates when the default search is not what the question needs - long context on a quantized KV baseline,
+  RAM offload, a quantization ladder ([docs/usage.md](docs/usage.md#choosing-the-candidates-yourself)).
+* **Free checks before spending GPU time:** `validate`, `plan` and `capabilities` print the exact server argv and
+  what the pinned llama.cpp build supports, without starting anything.
+* **Machine-readable evidence:** every report is also JSON, every candidate records which settings the server was
+  *observed* using, and `analyze` re-scores a finished run under a different policy without the GPU. An agent can
+  iterate: run a session, read the results, write the next proposal file, run again. Every session has a
+  wall-clock budget, and `resume` continues an interrupted one.
+* **A skill that teaches the rules:** [.claude/skills/benchmark-model/SKILL.md](.claude/skills/benchmark-model/SKILL.md)
+  covers how to run a session and how to report one: check for cut-off responses before quoting a score, never
+  rank on noise, never call a context size supported unless a prompt that long ran, never invent a winner.
+
+What the agent does not get: `runtime-policy.json` is the machine owner's authorisation and the agent is told never
+to write it; one GPU workload runs at a time behind a lock; and model-written code only ever runs in the sandbox.
+
 ## Commands
 
 | Command | What it does | Starts containers |
@@ -99,7 +131,8 @@ Without installing: `python run.py <command>` is the same program.
 
 ## Documentation
 
-* [docs/usage.md](docs/usage.md) — sessions, context ranges, RAM offload, proposal files, coding benchmarks, agents
+* [docs/usage.md](docs/usage.md) — sessions, context ranges, RAM offload, proposal files, several models (one per
+  quantization), coding benchmarks, agents
 * [docs/architecture.md](docs/architecture.md) — containers, trust boundaries, how evidence is recorded
 * [docs/benchmarks.md](docs/benchmarks.md) — the four public suites, what is pinned, where we deviate from upstream
 * [docs/lessons.md](docs/lessons.md) — measurement traps and what guards against each

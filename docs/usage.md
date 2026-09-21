@@ -125,6 +125,9 @@ candidate it measured but could not validate. To validate one, raise the item co
 
 ## Driving it from a coding agent
 
+The intended workflow is to give an agent a goal ("best coding quality at 50 tok/s or more, with 64K of context")
+and let it work: check configurations for free with `validate`, `plan` and `capabilities`, run `tune`, read the
+JSON reports, write a proposal file for the next question, and run again.
 `.claude/skills/benchmark-model/SKILL.md` tells an agent how to run a session and, more importantly, how to
 report one without overstating it. The same rules apply to people.
 
