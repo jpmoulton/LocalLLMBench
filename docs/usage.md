@@ -3,6 +3,18 @@
 All commands are `llmbench <command>` (or `python run.py <command>` from a checkout). Commands that start
 containers need `runtime-policy.json` in the working directory; without it they exit 2 and do nothing.
 
+## Preparation and retries
+
+Stage datasets before preparing the evaluator image when using container evaluation. `prepare` discovers
+`artifacts/benchmark-datasets/`, copies its regular files into the build context, rejects links, and records
+SHA-256 hashes. An empty benchmark directory is created when no datasets are staged.
+
+The wheel builder checks the chosen interpreter for `pip`, `setuptools` and `wheel` before Docker work. Missing
+dependencies produce an installation command; nothing is installed automatically. Repeating a failed preparation
+in the same output directory builds a fresh private context and preserves earlier contexts and unrelated files.
+A same-version wheel is replaced only after a successful fresh build. Completed `image-bundle.json` outputs are
+not overwritten: use a new output directory to prepare another completed bundle.
+
 ## Tuning one model
 
 ```bash
@@ -106,6 +118,75 @@ set `worker_image.image_id` and `worker_image.reference` to the id in `worker-im
 Give reasoning models a real output budget (`generation.max_output_tokens`, 8192 or more) or their thinking is
 cut off and scored as failure; `scripts/coding_report.py --root <sweep> [--suite aider-polyglot]` prints how many
 responses hit the cap beside every score, and paired significance tests between candidates and models.
+
+## Screen, measure interactions, then confirm
+
+`optimize` takes a **session configuration containing the full confirmation workload**, with real model hashes
+and the desired frozen search space. Use a saved `session-config.json` from `tune` or a fully populated session
+config; increase its benchmark selections before running if stronger quality evidence is needed.
+
+```bash
+llmbench optimize --config my-session.json --output runs/optimized --plan-only
+llmbench optimize --config my-session.json --output runs/optimized \
+  --screen-items 8 --finalists 2 --max-combinations 4 --budget-seconds 14400
+```
+
+The command runs sequential stages under one wall budget:
+
+1. **Screen:** baseline plus the configured proposals, using the first `--screen-items` declared tasks per suite.
+   Benchmark options and fixture seeds are unchanged, so screening is a nested subset of confirmation.
+2. **Interactions:** valid pairwise combinations of shortlisted changes, each actually measured alongside the
+   original baseline. Conflicting axis values are excluded. Model weights, context and generation settings stay
+   fixed; combinations may change KV cache, MTP, reasoning, batching and offload. Set `--max-combinations 0` to
+   disable this stage.
+3. **Confirm:** the original baseline and up to `--finalists` non-baseline picks, using every task in the supplied
+   configuration. Shortlisting alternates measured speed and worst-category quality extremes, not claims of
+   statistical significance. Failed, synthetic, unverified and below-floor measurements cannot enter it.
+
+By default, screening can use 40% of the wall budget and interactions 20%; confirmation gets the remaining time.
+Without interactions, screening can use 50%. Stage bounds are checked before execution; an insufficient budget
+is refused rather than silently shrinking the workload. Unused stage time remains available for confirmation.
+Cleanup uncertainty stops all later stages.
+
+`optimization-plan.json` records item counts and candidates; `optimization-report.json` links each stage's
+standard session reports and carries only the confirmation stage's recommendation. `--plan-only` prints the plan
+without creating output or requiring live authorization. Execution requires a new output directory. If interrupted,
+the per-stage session artifacts remain available to `resume`; the outer optimization is not automatically resumed.
+
+**Confirmation is not a new holdout.** It repeats the selected configurations on the full declared development
+set. Existing non-inferiority and separate holdout requirements still decide what can be called validated.
+If the configured full workload is no larger than the screening subset, the second stage adds repetitions,
+not independent items. Supply enough distinct tasks for the quality tolerance you want to establish.
+
+For manual proposal files, an explicit `combination` family accepts two or more serving axes, for example
+`{"family": "combination", "changes": {"kv_pair": ["q8_0", "q8_0"], "spec_type": "draft-mtp"}}`.
+It does not authorize changes to weights, input length, sampling, benchmark tasks, or provenance.
+
+## Separate generation-sampling experiments
+
+```bash
+llmbench sample --config candidate.json --output runs/sampling-plan \
+  --temperature 0.6 --temperature 0.8 --seed 42 --seed 43 --seed 44 \
+  --top-p 0.95 --budget-seconds 7200 --plan-only
+llmbench sample --config candidate.json --output runs/sampling \
+  --temperature 0.6 --temperature 0.8 --seed 42 --seed 43 --seed 44 \
+  --top-p 0.95 --budget-seconds 7200
+```
+
+The input is a complete **candidate** configuration, not a session. Defaults are temperatures 0.6/0.8, seeds
+42/43/44, and top-p 0.95. One greedy control (`temperature=0`, `top_p=1`, first seed) precedes the deduplicated
+stochastic grid. All other generation settings, engine reasoning, and benchmark fixtures are inherited unchanged.
+Give reasoning enough output tokens in the candidate; this command does not increase its cap.
+
+Both planning and execution require a new output directory. Planning records an immutable config and grid but
+does not authorize or run inference. Live attempts run sequentially and stop when the remaining wall budget cannot
+cover the next candidate's minimum stage bounds. `sampling-report.json` records per-suite/category scores, item
+counts, available truncation evidence, failures, cleanup evidence and unattempted grid members.
+
+Seed means/ranges/standard deviations are descriptive only. Replaying an item with a new generation seed does
+not create an independent benchmark item. A group receives aggregate scores only when **every planned seed**
+has verified measured evidence; incomplete groups keep null aggregates and explicit planned/measured seed lists.
+Failed attempts have no scores. No winner, non-inferiority conclusion or validated preset is exported.
 
 ## Re-scoring without the GPU
 

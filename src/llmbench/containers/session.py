@@ -502,14 +502,18 @@ def build_candidates(session: ContainerSessionConfig, bundle, proposals, facts: 
     for proposal in proposals:
         config = run_config_for(session, bundle, proposal, baseline=baseline)
         meta = facts[config.model.sha256]
-        pairs.append((config, to_manifest(config, template_hash=meta["template_hash"], scorer_revision=scorer_revision,
-                                          environment_hash=environment_hash, block_count=meta.get("block_count"))))
+        manifest = to_manifest(config, template_hash=meta["template_hash"], scorer_revision=scorer_revision,
+                               environment_hash=environment_hash, block_count=meta.get("block_count"))
+        if proposal.family == "combination":
+            manifest = manifest.model_copy(update={"annotations": {
+                **manifest.annotations, "treatment_family": "combination"}})
+        pairs.append((config, manifest))
     return pairs
 
 
 # ---- durable files ------------------------------------------------------------------------------------------
 
-def write_exclusive_json(path: str | Path, payload: dict) -> Path:
+def write_exclusive_json(path: str | Path, payload: dict | list) -> Path:
     """Exclusive creation; a crash leaves no truncated file at the path."""
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     target = Path(path)

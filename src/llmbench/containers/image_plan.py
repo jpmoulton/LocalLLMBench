@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -111,8 +112,9 @@ def evaluator_image_build_plan(*, base_image: str, artifact_dir: str | Path, whe
 
 
 def build_evaluator_context(staging_dir: str | Path, *, wheel_path: str | Path, base_image: str,
-                            lock_path: str | Path | None = None) -> dict[str, str]:
-    """Copy exactly Dockerfile (digest rendered into the ARG default), .dockerignore, lock and wheel."""
+                            lock_path: str | Path | None = None,
+                            dataset_root: str | Path | None = None) -> dict[str, str]:
+    """Stage the evaluator build inputs and optional public datasets, recording every file's hash."""
     if type(base_image) is not str or not re.fullmatch(EVALUATOR_BASE, base_image):
         raise ValueError("An official python:3.12-slim-bookworm@sha256 digest is required")
     staging = Path(staging_dir)
@@ -131,17 +133,39 @@ def build_evaluator_context(staging_dir: str | Path, *, wheel_path: str | Path, 
         raise ValueError("the source Dockerfile must declare exactly one bare `ARG BASE_IMAGE`")
     rendered = dockerfile.replace("\nARG BASE_IMAGE\n", f"\nARG BASE_IMAGE={base_image}\n", 1)
     staging.mkdir(parents=True, exist_ok=True)
-    payloads = {"Dockerfile": rendered.encode("utf-8"),
-                ".dockerignore": _regular(source / ".dockerignore", ".dockerignore").read_bytes(),
-                LOCK_NAME: lock.read_bytes(), wheel.name: wheel.read_bytes()}
+    payloads: dict[str, bytes | Path] = {"Dockerfile": rendered.encode("utf-8"),
+                                       ".dockerignore": _regular(source / ".dockerignore", ".dockerignore"),
+                                       LOCK_NAME: lock, wheel.name: wheel}
+    if dataset_root is not None:
+        root = Path(dataset_root)
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("dataset_root must be a directory and never a link")
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("benchmark datasets must not contain links")
+            if path.is_dir():
+                continue
+            relative = (Path("benchmarks") / path.relative_to(root)).as_posix()
+            payloads[relative] = _regular(path, "benchmark dataset")
+    # Docker COPY requires this directory even when no public datasets have been staged yet.
+    (staging / "benchmarks").mkdir()
     digests = {}
     for name, content in payloads.items():
         target = staging / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
         with target.open("xb") as handle:
-            handle.write(content)
+            if isinstance(content, Path):
+                with content.open("rb") as source_stream:
+                    for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                        handle.write(chunk)
+                        digest.update(chunk)
+            else:
+                handle.write(content)
+                digest.update(content)
             handle.flush()
             os.fsync(handle.fileno())
-        digests[name] = hashlib.sha256(content).hexdigest()
+        digests[name] = digest.hexdigest()
     return digests
 
 
@@ -172,12 +196,21 @@ def read_iidfile(path: str | Path) -> str:
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("xb") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                     delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            handle.close()
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _inspect(executor, reference: str, *, bound: int) -> dict:
@@ -199,7 +232,7 @@ def prepare_images(inputs: PrepareInputs, *, executor, artifact_dir: str | Path,
         session_lock.check("container", RunMode.LIVE)
     artifacts = Path(artifact_dir).resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
-    if (artifacts / BUNDLE_NAME).exists():
+    if (artifacts / BUNDLE_NAME).exists() or (artifacts / BUNDLE_NAME).is_symlink():
         raise ValueError(f"{BUNDLE_NAME} already exists in {artifacts}; use a new output directory")
     started, log = clock(), []
 
@@ -214,6 +247,28 @@ def prepare_images(inputs: PrepareInputs, *, executor, artifact_dir: str | Path,
             raise ValueError(f"{what} failed ({result.status}, rc={result.returncode}): "
                              + (result.stdout + result.stderr).decode("utf-8", "replace")[-1500:])
         return result
+
+    # Stage privately and promote only a complete context. An older context may contain
+    # user files, so retries leave it intact and use a fresh generated name instead.
+    plan = evaluator_image_build_plan(base_image=inputs.evaluator_base, artifact_dir=artifacts,
+                                      wheel_path=inputs.wheel_path,
+                                      lock_path=inputs.lock_path or source_dir() / LOCK_NAME)
+    dataset_root = Path("artifacts/benchmark-datasets")
+    with tempfile.TemporaryDirectory(prefix=f".{CONTEXT_DIR}-", dir=artifacts) as directory:
+        temporary = Path(directory)
+        staged = build_evaluator_context(temporary / "context", wheel_path=inputs.wheel_path,
+                                         base_image=inputs.evaluator_base, lock_path=inputs.lock_path,
+                                         dataset_root=dataset_root if dataset_root.exists() else None)
+        context = artifacts / CONTEXT_DIR
+        if context.exists() or context.is_symlink():
+            context = artifacts / temporary.name.removeprefix(".")
+        os.rename(temporary / "context", context)
+        iidfile = Path(plan["iidfile"])
+        if iidfile.exists() or iidfile.is_symlink():
+            iidfile = artifacts / (temporary.name.removeprefix(".") + ".id")
+    plan["context"], plan["iidfile"] = str(context), str(iidfile)
+    plan["build_argv"][-2:] = [str(context / "Dockerfile"), str(context)]
+    plan["build_argv"][plan["build_argv"].index("--iidfile") + 1] = str(iidfile)
 
     # 1. Inference image by digest, with its help/version captured from the exact image.
     require(call(("docker", "pull", inputs.inference), bound=bound_seconds), "pull inference")
@@ -238,11 +293,6 @@ def prepare_images(inputs: PrepareInputs, *, executor, artifact_dir: str | Path,
     # 2. Evaluator base by digest, context staging, build with --iidfile, identity readback.
     require(call(("docker", "pull", pull_reference(inputs.evaluator_base)), bound=bound_seconds),
             "pull evaluator base")
-    plan = evaluator_image_build_plan(base_image=inputs.evaluator_base, artifact_dir=artifacts,
-                                      wheel_path=inputs.wheel_path,
-                                      lock_path=inputs.lock_path or source_dir() / LOCK_NAME)
-    staged = build_evaluator_context(artifacts / CONTEXT_DIR, wheel_path=inputs.wheel_path,
-                                     base_image=inputs.evaluator_base, lock_path=inputs.lock_path)
     build = call(tuple(plan["build_argv"]), bound=bound_seconds, max_output_bytes=16 * 1024 * 1024)
     (artifacts / "evaluator-build.log").write_bytes(build.stdout + build.stderr)
     require(build, "docker build evaluator")
@@ -300,16 +350,29 @@ def _host_registry_digest() -> str:
 
 def build_wheel(project_root: str | Path, output_dir: str | Path, *, python: str | None = None,
                 run: Callable[..., Any] = subprocess.run) -> Path:
-    """`pip wheel . --no-deps --no-build-isolation` from the working tree; returns the single wheel path."""
+    """Build with the chosen interpreter in a fresh directory, then promote the successful wheel."""
+    interpreter = python or sys.executable
+    project = str(Path(project_root).resolve())
+    check = run([interpreter, "-c", "import setuptools, wheel, pip"], cwd=project,
+                capture_output=True, timeout=60)
+    if check.returncode != 0:
+        command = f'"{interpreter}" -m pip install --upgrade pip setuptools wheel'
+        raise ValueError(f"Wheel build requires pip, setuptools and wheel in {interpreter}. "
+                         f"Install them with: {command} "
+                         f"(If pip is missing, first run: \"{interpreter}\" -m ensurepip --upgrade)")
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    before = {path.name for path in output.glob("*.whl")}
-    argv = [python or sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--no-build-isolation",
-            "--wheel-dir", str(output)]
-    done = run(argv, cwd=str(Path(project_root).resolve()), capture_output=True, timeout=900)
-    if done.returncode != 0:
-        raise ValueError("pip wheel failed: " + (done.stdout + done.stderr).decode("utf-8", "replace")[-1500:])
-    created = sorted(path for path in output.glob("*.whl") if path.name not in before)
-    if len(created) != 1:
-        raise ValueError(f"expected exactly one new wheel in {output}, found {len(created)}")
-    return created[0]
+    with tempfile.TemporaryDirectory(prefix=".wheel-build-", dir=output) as directory:
+        temporary = Path(directory)
+        argv = [interpreter, "-m", "pip", "wheel", ".", "--no-deps", "--no-build-isolation",
+                "--wheel-dir", str(temporary)]
+        done = run(argv, cwd=project, capture_output=True, timeout=900)
+        if done.returncode != 0:
+            raise ValueError("pip wheel failed: " + (done.stdout + done.stderr).decode("utf-8", "replace")[-1500:])
+        created = sorted(temporary.glob("*.whl"))
+        if len(created) != 1:
+            raise ValueError(f"expected exactly one newly built wheel, found {len(created)}")
+        wheel = _regular(created[0], "built wheel")
+        destination = output / wheel.name
+        os.replace(wheel, destination)
+    return destination

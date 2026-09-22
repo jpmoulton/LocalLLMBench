@@ -56,13 +56,13 @@ pip install -e ".[eval]"                            # use ".[eval,dev]" to run t
 # 1. Allow GPU and container work on THIS machine. Without this file every live command refuses to run.
 cp runtime-policy.example.json runtime-policy.json
 
-# 2. Once: pull the pinned llama.cpp image, build the evaluator image, record what the server supports.
+# 2. Once: fetch and pin the public benchmark datasets (checksummed; nothing is fetched at run time).
+python scripts/stage_benchmark_datasets.py
+
+# 3. Once: pull the pinned llama.cpp image, build the evaluator image, record what the server supports.
 llmbench prepare --output artifacts/container-prep \
   --inference ghcr.io/ggml-org/llama.cpp@sha256:d84303da604d44b7656058d91728f623f87b24b3223abd8016b7cbadeadc8d5e \
   --evaluator-base python:3.12-slim-bookworm@sha256:<digest>
-
-# 3. Once: fetch and pin the public benchmark datasets (checksummed; nothing is fetched at run time).
-python scripts/stage_benchmark_datasets.py
 
 # 4. Tune a model. It prints which benchmarks will run, and why any are skipped, before it starts.
 llmbench tune --model /path/to/model.gguf --output runs/my-model --budget-seconds 7200
@@ -73,6 +73,10 @@ python scripts/sweep_models.py --models a.gguf b.gguf --output runs/compare
 
 `runs/my-model/reports/` holds the report as Markdown, HTML and JSON. An interrupted session continues with
 `llmbench resume --output runs/my-model`; its deadline keeps running while it is down.
+
+Preparation copies staged datasets from `artifacts/benchmark-datasets/` into the evaluator image and records
+their file hashes. Without staged datasets, it builds with an empty benchmark directory; host-process evaluation
+can use datasets staged afterward, but container evaluation requires rebuilding the image to include them.
 
 Coding benchmarks execute generated code, so they also need the sandboxed worker image:
 [docs/usage.md](docs/usage.md#coding-benchmarks).
@@ -106,6 +110,8 @@ to write it; one GPU workload runs at a time behind a lock; and model-written co
 | Command | What it does | Starts containers |
 |---|---|---|
 | `tune`, `resume` | Run or continue a tuning session for one model | yes |
+| `optimize` | Screen settings, measure interactions, confirm finalists on the full configured workload | yes, unless `--plan-only` |
+| `sample` | Compare generation sampling across seeds, separately from controlled tuning | yes, unless `--plan-only` |
 | `candidate` | Run exactly one configuration | yes |
 | `prepare` | Pull/build the pinned images and record server capabilities | yes |
 | `validate`, `plan`, `capabilities` | Check a configuration; print the exact server argv and Compose project | no |
@@ -124,8 +130,9 @@ Without installing: `python run.py <command>` is the same program.
   category at the default 2% tolerance. The plan says so before it starts, and the report names the faster or
   larger candidate it measured but could not validate. A category no benchmark covered is `unmeasured`, never
   failed. `llmbench analyze` re-scores a finished run under a different policy without re-running anything.
-* **Everything runs at temperature 0.** That is right for comparing settings and unfair to reasoning modes, which
-  can loop under greedy decoding. Treat "reasoning did not help" as a statement about greedy decoding.
+* **Controlled optimization uses temperature 0.** That is useful for comparing serving settings but can be unfair
+  to reasoning modes. Use `sample` for separate temperature/top-p/seed experiments; repeated seeds are not new
+  independent benchmark items, and incomplete seed groups do not receive an aggregate score.
 
 [docs/lessons.md](docs/lessons.md) lists the measurement traps this project fell into, so you can avoid them.
 

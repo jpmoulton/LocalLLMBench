@@ -35,8 +35,8 @@ absent."""
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog=PROG, description="Tune and benchmark llama.cpp serving settings in "
-                                   "containers. Only `candidate`, `prepare`, `tune` and `resume` start "
-                                   "containers, and only under runtime-policy.json.")
+                                   "containers. Live commands require runtime-policy.json; optimize and sample "
+                                   "also support --plan-only.")
     sub = root.add_subparsers(dest="command", required=True)
     for name, text in (("validate", "Validate a candidate configuration; no I/O beyond reading it"),
                        ("capabilities", "Parse the saved llama-server help/version; optionally check a configuration"),
@@ -62,8 +62,12 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--lock", help="hash-pinned Linux lock; default is the packaged requirements.linux.lock")
     from ..evidence_cli import add_evidence_commands
     from .session import add_session_commands
+    from .optimization import add_optimization_commands
+    from .sampling import add_sampling_commands
     add_session_commands(sub)
     add_evidence_commands(sub)
+    add_optimization_commands(sub)
+    add_sampling_commands(sub)
     _add_dataset_root(sub.choices["tune"])
     return root
 
@@ -190,6 +194,12 @@ def _run_tune(args, main_tune) -> int:
 
 def main(argv=None, *, runner_factory=None, preparer=None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "optimize":
+        from .optimization import main_optimize
+        return main_optimize(args)
+    if args.command == "sample":
+        from .sampling import main_sampling
+        return main_sampling(args)
     if args.command in ("tune", "resume"):  # session commands take a ContainerSessionConfig, not a run config
         from .session import main_resume, main_tune
         if args.command == "resume":

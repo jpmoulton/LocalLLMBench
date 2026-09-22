@@ -145,6 +145,8 @@ def propose(base: ExperimentManifest, changes: dict, family: str) -> ExperimentM
         "weights": {"model"},
         "reasoning": {"backend.reasoning"},
     }
+    # A combined serving treatment keeps weights, context, generation, tasks and provenance fixed.
+    axes["combination"] = axes["kv"] | axes["performance"] | axes["reasoning"]
     if family not in axes or not changes or set(changes) - axes[family]:
         raise ValueError("proposal changes fields outside the declared experiment family")
     payload = base.model_dump(mode="json")

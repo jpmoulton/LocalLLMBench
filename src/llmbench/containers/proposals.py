@@ -7,6 +7,7 @@ external proposer. ``apply`` turns a proposal into a fully re-validated ``Contai
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,7 +20,7 @@ from .config import NAME, ContainerRunConfig
 from .session import output_reserve_tokens, usable_input_tokens
 
 Family = Literal["baseline", "kv", "weights", "context", "performance", "reasoning", "speculation", "offload",
-                 "kv-placement"]
+                 "kv-placement", "combination"]
 AXES = ("quantization", "kv_pair", "ctx_tier", "spec_type", "reasoning", "batch_size", "gpu_layers", "kv_offload")
 FAMILY_AXES: dict[str, frozenset[str]] = {
     "baseline": frozenset(AXES), "kv": frozenset({"kv_pair"}), "weights": frozenset({"quantization"}),
@@ -29,6 +30,7 @@ FAMILY_AXES: dict[str, frozenset[str]] = {
     # (``--n-gpu-layers``); "kv-placement" puts the KV cache on the GPU or in system RAM (``--kv-offload`` /
     # ``--no-kv-offload``).
     "offload": frozenset({"gpu_layers"}), "kv-placement": frozenset({"kv_offload"}),
+    "combination": frozenset({"kv_pair", "spec_type", "reasoning", "batch_size", "gpu_layers", "kv_offload"}),
 }
 # ``context`` stays LAST and ascending: ``deterministic_schedule`` cuts the schedule at ``max_candidates`` and
 # ``session._coherent_context_schedule`` depends on the ceiling tier being the last thing a cap can
@@ -49,6 +51,8 @@ class Proposal(StrictModel):
             raise ValueError(f"{self.family} proposal may only change {sorted(FAMILY_AXES[self.family])}")
         if self.family == "baseline" and keys != set(AXES):
             raise ValueError("a baseline proposal must fix every axis")
+        if self.family == "combination" and len(keys) < 2:
+            raise ValueError("a combination proposal must change at least two axes")
         normalized = {}
         for key, value in self.changes.items():
             if key == "kv_pair":
@@ -76,6 +80,8 @@ class Proposal(StrictModel):
     def label(self) -> str:
         if self.family == "baseline":
             return "baseline"
+        if self.family == "combination":
+            return "combo-" + hashlib.sha256(canonical_json(self.changes).encode()).hexdigest()[:16]
         (axis, value), = self.changes.items()
         if axis == "kv_offload":  # the label names the PLACEMENT, not the flag: "kv-cache-ram" reads as it runs
             text = "gpu" if value else "ram"

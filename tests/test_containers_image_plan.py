@@ -14,7 +14,7 @@ from llmbench.coding.sandbox import WorkerResult
 from llmbench.containers.capabilities import help_sha256
 from llmbench.containers.config import ImageBundle, read_image_bundle
 from llmbench.containers.executor import ComposeExecutor
-from llmbench.containers.image_plan import (PrepareInputs, build_evaluator_context, evaluator_image_build_plan,
+from llmbench.containers.image_plan import (PrepareInputs, build_evaluator_context, build_wheel, evaluator_image_build_plan,
                                             lock_is_hash_pinned, prepare_images, read_iidfile, source_dir)
 from llmbench.registry import builtin_registry
 from llmbench.safety import OperationForbidden, SessionLock
@@ -29,6 +29,12 @@ INFERENCE_ID, EVALUATOR_ID, WORKER_ID = ("sha256:" + c * 64 for c in "fed")
 OK = WorkerResult("completed", 0, b"ok")
 LOCK = ("# derived\n" "pydantic==2.13.5 --hash=sha256:" + "1" * 64 + "\n" "inspect_ai==0.3.265 --hash=sha256:"
         + "2" * 64 + "\n")
+
+
+@pytest.fixture(autouse=True)
+def isolated_working_directory(tmp_path, monkeypatch):
+    # Preparation discovers staged datasets relative to cwd; never consume the developer's live corpora.
+    monkeypatch.chdir(tmp_path)
 
 
 def wheel_file(directory: Path, name="localllmbench-0.1.0-py3-none-any.whl") -> Path:
@@ -143,7 +149,8 @@ def test_context_staging_copies_exact_files_and_rejects_symlinks(tmp_path):
     staging = tmp_path / "ctx"
     digests = build_evaluator_context(staging, wheel_path=wheel, base_image=BASE, lock_path=lock)
     assert sorted(path.name for path in staging.iterdir()) == sorted([".dockerignore", "Dockerfile",
-                                                                       "requirements.linux.lock", wheel.name])
+                                                                       "requirements.linux.lock", wheel.name,
+                                                                       "benchmarks"])
     rendered = (staging / "Dockerfile").read_text(encoding="utf-8")
     assert f"\nARG BASE_IMAGE={BASE}\n" in rendered and rendered.count("ARG BASE_IMAGE") == 1
     assert "\nARG BASE_IMAGE\n" not in rendered
@@ -152,6 +159,7 @@ def test_context_staging_copies_exact_files_and_rejects_symlinks(tmp_path):
     assert digests == {name: hashlib.sha256((staging / name).read_bytes()).hexdigest() for name in digests}
     assert (staging / "requirements.linux.lock").read_text(encoding="utf-8") == LOCK
     assert (staging / ".dockerignore").read_bytes() == (source_dir() / ".dockerignore").read_bytes()
+    assert (staging / "benchmarks").is_dir()
     with pytest.raises(ValueError, match="new or empty"):
         build_evaluator_context(staging, wheel_path=wheel, base_image=BASE, lock_path=lock)
     with pytest.raises(ValueError, match="digest"):
@@ -171,6 +179,22 @@ def test_context_staging_copies_exact_files_and_rejects_symlinks(tmp_path):
     with pytest.raises(ValueError, match="never a link"):
         build_evaluator_context(tmp_path / "linked-staging", wheel_path=wheel, base_image=BASE, lock_path=lock)
     assert not list((tmp_path / "elsewhere").iterdir())
+
+
+def test_context_staging_includes_nested_benchmark_data(tmp_path):
+    wheel, lock = wheel_file(tmp_path / "w"), lock_file(tmp_path / "l")
+    datasets = tmp_path / "datasets"
+    corpus = datasets / "ruler" / "essays"
+    corpus.mkdir(parents=True)
+    (corpus / "sample.txt").write_bytes(b"retrieval corpus\n")
+    (datasets / "staging-manifest.json").write_bytes(b'{"schema_version": 1}\n')
+    staging = tmp_path / "ctx"
+    digests = build_evaluator_context(staging, wheel_path=wheel, base_image=BASE, lock_path=lock,
+                                      dataset_root=datasets)
+    for relative in ("ruler/essays/sample.txt", "staging-manifest.json"):
+        expected = (datasets / relative).read_bytes()
+        assert (staging / "benchmarks" / relative).read_bytes() == expected
+        assert digests[f"benchmarks/{relative}"] == hashlib.sha256(expected).hexdigest()
 
 
 def test_prepare_images_records_bundle_from_scripted_docker(tmp_path):
@@ -231,6 +255,133 @@ def test_prepare_refuses_when_self_check_fails_or_registry_digest_differs(tmp_pa
     assert not (output / "image-bundle.json").exists() and not (output / "image-bundle.json.tmp").exists()
     for argv in docker.calls:
         assert "--privileged" not in argv and "--network=host" not in argv
+
+
+def test_build_wheel_replaces_same_version_only_after_successful_build(tmp_path):
+    output = tmp_path / "wheels"
+    stale = wheel_file(output)
+    stale.write_bytes(b"previous build")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "-c":
+            return OK
+        target = Path(argv[argv.index("--wheel-dir") + 1])
+        assert target != output and not list(target.iterdir())
+        (target / stale.name).write_bytes(b"fresh build")
+        return OK
+
+    result = build_wheel(tmp_path, output, python="chosen-python", run=run)
+    assert result == stale and result.read_bytes() == b"fresh build"
+    assert all(argv[0] == "chosen-python" for argv in calls)
+    assert list(output.iterdir()) == [result]
+
+
+@pytest.mark.parametrize("result, fragment", [
+    (WorkerResult("completed", 1, b"", b"backend failed"), "pip wheel failed"),
+    (OK, "exactly one newly built wheel"),
+])
+def test_build_wheel_failed_retry_never_returns_stale_wheel(tmp_path, result, fragment):
+    output = tmp_path / "wheels"
+    stale = wheel_file(output)
+    before = stale.read_bytes()
+
+    def run(argv, **kwargs):
+        if argv[1] == "-c":
+            return OK
+        if result.returncode != 0:
+            target = Path(argv[argv.index("--wheel-dir") + 1])
+            (target / stale.name).write_bytes(b"incomplete build")
+        return result
+
+    with pytest.raises(ValueError, match=fragment):
+        build_wheel(tmp_path, output, run=run)
+    assert stale.read_bytes() == before
+    assert list(output.iterdir()) == [stale]
+
+
+def test_build_wheel_missing_backend_explains_chosen_interpreter_install(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return WorkerResult("completed", 1, b"", b"ModuleNotFoundError: setuptools")
+
+    with pytest.raises(ValueError) as caught:
+        build_wheel(tmp_path, tmp_path / "wheels", python="chosen-python", run=run)
+    assert '"chosen-python" -m pip install --upgrade pip setuptools wheel' in str(caught.value)
+    assert '"chosen-python" -m ensurepip --upgrade' in str(caught.value)
+    assert len(calls) == 1 and calls[0][1] == "-c"
+    assert not (tmp_path / "wheels").exists()
+
+
+def test_prepare_retry_preserves_old_context_and_unrelated_paths(tmp_path):
+    output = tmp_path / "prep"
+    prepared_inputs = inputs(tmp_path)
+    failed = ScriptedPrep(build=WorkerResult("completed", 1, b"", b"failed build"))
+    with pytest.raises(ValueError, match="docker build"):
+        prepare_images(prepared_inputs, executor=failed, artifact_dir=output)
+    old_context = output / "evaluator-context"
+    unrelated = old_context / "keep-user-data.txt"
+    unrelated.write_bytes(b"keep context contents")
+    sibling = output / "unrelated"
+    sibling.mkdir()
+    (sibling / "notes.txt").write_bytes(b"keep sibling contents")
+    old_atomic_temporary = output / "image-bundle.json.tmp"
+    old_atomic_temporary.write_bytes(b"interrupted old write")
+    old_iid = (output / "evaluator-image.id").read_bytes()
+    prepared_inputs.wheel_path.write_bytes(b"updated wheel")
+
+    bundle = prepare_images(prepared_inputs, executor=ScriptedPrep(), artifact_dir=output)
+    plan = bundle.evaluator_build["plan"]
+    context = Path(plan["context"])
+    assert context != old_context
+    assert (context / prepared_inputs.wheel_path.name).read_bytes() == b"updated wheel"
+    assert unrelated.read_bytes() == b"keep context contents"
+    assert (sibling / "notes.txt").read_bytes() == b"keep sibling contents"
+    assert old_atomic_temporary.read_bytes() == b"interrupted old write"
+    assert (output / "evaluator-image.id").read_bytes() == old_iid
+    assert Path(plan["iidfile"]) != output / "evaluator-image.id"
+    assert read_iidfile(plan["iidfile"]) == EVALUATOR_ID
+    assert read_image_bundle(output / "image-bundle.json") == bundle
+    refused = ScriptedPrep()
+    with pytest.raises(ValueError, match="already exists"):
+        prepare_images(prepared_inputs, executor=refused, artifact_dir=output)
+    assert not refused.calls
+
+
+def test_prepare_retry_after_interrupted_context_staging(tmp_path, monkeypatch):
+    import llmbench.containers.image_plan as image_plan
+
+    output = tmp_path / "prep"
+    old_context = output / "evaluator-context"
+    old_context.mkdir(parents=True)
+    (old_context / "unrelated.txt").write_bytes(b"do not delete")
+    prepared_inputs = inputs(tmp_path)
+    failed = ScriptedPrep()
+
+    def interrupted(staging, **kwargs):
+        Path(staging).mkdir()
+        (Path(staging) / "partial").write_bytes(b"incomplete")
+        raise OSError("interrupted staging")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(image_plan, "build_evaluator_context", interrupted)
+        with pytest.raises(OSError, match="interrupted staging"):
+            prepare_images(prepared_inputs, executor=failed, artifact_dir=output)
+    assert not failed.calls
+    assert sorted(path.name for path in output.iterdir()) == ["evaluator-context"]
+    datasets = tmp_path / "artifacts" / "benchmark-datasets" / "ruler"
+    datasets.mkdir(parents=True)
+    (datasets / "sample.txt").write_bytes(b"staged corpus")
+    bundle = prepare_images(prepared_inputs, executor=ScriptedPrep(), artifact_dir=output)
+    context = Path(bundle.evaluator_build["plan"]["context"])
+    assert context != old_context
+    assert (old_context / "unrelated.txt").read_bytes() == b"do not delete"
+    assert (context / "benchmarks" / "ruler" / "sample.txt").read_bytes() == b"staged corpus"
+    assert bundle.evaluator_build["staged_sha256"]["benchmarks/ruler/sample.txt"] == hashlib.sha256(
+        b"staged corpus").hexdigest()
 
 
 def test_lock_script_output_is_hash_pinned_and_excludes_host_only_packages(tmp_path):

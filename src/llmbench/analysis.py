@@ -38,6 +38,9 @@ def infer_comparison_family(left: ExperimentManifest, right: ExperimentManifest)
         except ValueError:
             continue
     if len(compatible) != 1:
+        if right.annotations.get("treatment_family") == "combination":
+            assert_comparable(a, b, "combination")
+            return "combination"
         raise ValueError("comparison must vary exactly one declared family with fixed provenance")
     return compatible[0]
 
