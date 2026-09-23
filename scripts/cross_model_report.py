@@ -52,6 +52,18 @@ def _runtime_of(session_config) -> str | None:
     return runtime if isinstance(runtime, str) else None
 
 
+def _session_model_sha256(session_config, model_path: str | None) -> str | None:
+    """Use the asset pinned by the session only when it is the model named by the sweep index."""
+    assets = session_config.get("assets") if isinstance(session_config, dict) else None
+    if not isinstance(assets, list) or not model_path:
+        return None
+    for asset in assets:
+        if isinstance(asset, dict) and asset.get("host_path") == model_path:
+            digest = asset.get("sha256")
+            return digest if isinstance(digest, str) and digest else None
+    return None
+
+
 def _blocked_suites(selection) -> list[dict]:
     """The suites a session's plan blocked, each with the reason it recorded. Only a plan that carried a sandbox
     verdict has any (``derive.public_benchmark_plan``); an NVIDIA plan has none."""
@@ -99,7 +111,9 @@ def collect_model(slug: str, meta: dict, root: Path) -> dict:
     ledger = _read_json(run / "session.json")
     summary_json = _read_json(run / "session-summary.json")
     campaign = _read_json(run / "reports" / "campaign.json")
-    record["runtime"] = _runtime_of(_read_json(run / "session-config.json"))
+    session_config = _read_json(run / "session-config.json")
+    record["runtime"] = _runtime_of(session_config)
+    record["sha256"] = _session_model_sha256(session_config, record["model_path"]) or record["sha256"]
     if ledger is None:
         return record
 
