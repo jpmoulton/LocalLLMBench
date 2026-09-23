@@ -11,6 +11,14 @@ so this module asks the environment what is actually staged (``container_eval.ba
 adapter what its task ids are (``adapter.task_ids``). Nothing is guessed: a dataset that is not there is simply
 not selected, and every offer, selection, bound and skip is recorded with its reason in the plan that
 ``llmbench tune`` prints and writes beside the session config.
+
+The serving runtime shapes a derivation only in ways the session config and the plan record (``_runtime_for``).
+A native bundle (``prepare --runtime metal-native``) turns the template into a metal-native candidate, searches
+``NATIVE_DEFAULT_INPUT_TOKENS`` when no context range is given, and scales the planning estimates by
+``PLANNING_SLOWDOWN``, because every per-item cost in this module was measured on the NVIDIA host. When the Docker
+coding sandbox is unavailable, the suites that execute generated code are planned as ``blocked`` with the reason,
+never selected, and never run on the host instead. Without a native bundle and without a sandbox verdict, a
+derivation is byte-for-byte the one it always was.
 """
 
 from __future__ import annotations
@@ -21,10 +29,10 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from ..config import canonical_json, hash_file
-from .config import ContainerRunConfig, ModelAsset
+from .config import ContainerRunConfig, ModelAsset, NativeBundle
 from .gguf import gguf_summary
-from .session import (MIN_CONTEXT_INPUT_TOKENS, ContainerSessionConfig, SessionBudgets, output_reserve_tokens,
-                      usable_input_tokens)
+from .session import (DEFAULT_PLANNING_SLOWDOWN, MIN_CONTEXT_INPUT_TOKENS, ContainerSessionConfig, SessionBudgets,
+                      native_overlay, output_reserve_tokens, usable_input_tokens)
 
 DEFAULT_KV_PAIRS = (("f16", "f16"), ("q8_0", "q8_0"), ("q4_0", "q4_0"))
 DEFAULT_CTX_TIERS = (8192, 32768, 131072)
@@ -110,6 +118,23 @@ PUBLIC_COUNT_LADDERS: dict[str, tuple[str, tuple[int, ...]]] = {
 }
 """Benchmarks whose item count derivation can tighten, richest first. A suite absent from this table has no
 bounded-count option in the registry and is skipped rather than started at a size that cannot finish."""
+
+# ---- runtime-dependent planning ------------------------------------------------------------------------------
+PLANNING_SLOWDOWN: dict[str, float] = {"nvidia-container": DEFAULT_PLANNING_SLOWDOWN, "metal-native": 3.0}
+"""Every per-item estimate above (``PUBLIC_ITEM_SECONDS``, RULER's ``estimated_item_seconds``) was measured on the
+NVIDIA workstation. An Apple Silicon GPU that shares one memory pool with the host is expected to prefill and decode
+several times slower, so a metal-native session plans each item at three times the cost: it selects fewer items
+per candidate wall instead of starting suites that cannot finish. 3.0 is a planning assumption, not a measurement;
+the adapters' own budget probes still govern what runs, and the factor is frozen in
+``ContainerSessionConfig.planning_slowdown`` so the record says what the selection was sized for."""
+NATIVE_DEFAULT_INPUT_TOKENS = 4096
+"""A metal-native session with no ``--context-floor``/``--context-ceiling`` searches exactly this many usable input
+tokens (floor = ceiling). It is RULER's shortest standard length, so every one of the four public suites can be
+planned at the smallest allocation that holds it; the NVIDIA default tiers (8K..128K) would put most of a small
+unified-memory Mac's pool into KV cache. Capped at what the model's training context holds."""
+SANDBOX_BLOCKED_REASON = ("the Docker sandbox is unavailable ({reason}); generated code is never executed on the "
+                          "host")
+"""The plan reason for every suite that executes generated code while the sandbox cannot run it."""
 
 
 def find_ggufs(model_path: str | Path) -> list[Path]:
@@ -273,18 +298,22 @@ def _option_ladder(benchmark_id: str, options: dict[str, Any]) -> list[dict[str,
     return [dict(options)]
 
 
-def estimated_selection_seconds(benchmark_id: str, *, task_ids: tuple[str, ...], options: dict[str, Any]) -> float:
+def estimated_selection_seconds(benchmark_id: str, *, task_ids: tuple[str, ...], options: dict[str, Any],
+                                slowdown: float = DEFAULT_PLANNING_SLOWDOWN) -> float:
     """Planning estimate for one candidate's run of this selection. Never a measurement; see
     ``PUBLIC_ITEM_SECONDS`` for each number's provenance. RULER models its own items, because a 131K prompt
-    costs two orders of magnitude more than a 4K one."""
+    costs two orders of magnitude more than a 4K one. ``slowdown`` is the runtime's ``PLANNING_SLOWDOWN``; at
+    its default the estimate is exactly the NVIDIA one (no multiplication happens at all)."""
     if benchmark_id == "ruler":
         from ..benchmarks.ruler import estimated_item_seconds
-        return len(options["tasks"]) * sum(estimated_item_seconds(length, options["ruler_output_tokens"], {})
-                                           for length in options["lengths"])
-    if benchmark_id not in PUBLIC_ITEM_SECONDS:  # a default option set without a cost model would select blind
+        seconds = len(options["tasks"]) * sum(estimated_item_seconds(length, options["ruler_output_tokens"], {})
+                                              for length in options["lengths"])
+    elif benchmark_id not in PUBLIC_ITEM_SECONDS:  # a default option set without a cost model would select blind
         raise KeyError(f"{benchmark_id} has default options in _defaults_for but no per-item planning cost in "
                        "PUBLIC_ITEM_SECONDS")
-    return len(task_ids) * PUBLIC_ITEM_SECONDS[benchmark_id]
+    else:
+        seconds = len(task_ids) * PUBLIC_ITEM_SECONDS[benchmark_id]
+    return seconds if slowdown == DEFAULT_PLANNING_SLOWDOWN else seconds * slowdown
 
 
 def _adapter_context(benchmark_id: str, dataset_root: str, options: dict[str, Any]) -> Any:
@@ -309,13 +338,15 @@ def _public_row(benchmark_id: str, *, status: str, reason: str, items: int = 0, 
             "estimated_seconds": round(seconds, 1), "options": options, "notes": list(notes)}
 
 
-def _fit_selection(benchmark_id: str, options: dict[str, Any], *, dataset_root: str,
-                   allowance: float) -> tuple[dict[str, Any] | None, tuple[str, ...], float, str]:
+def _fit_selection(benchmark_id: str, options: dict[str, Any], *, dataset_root: str, allowance: float,
+                   slowdown: float = DEFAULT_PLANNING_SLOWDOWN
+                   ) -> tuple[dict[str, Any] | None, tuple[str, ...], float, str]:
     """``(options, task_ids, seconds, problem)``: the richest option set whose estimate fits ``allowance``.
 
     Every attempt asks the ADAPTER for its task ids, so the recorded task list and the recorded options can
     never disagree. An adapter that refuses (a corrupt pin, an unreadable corpus) becomes ``problem``, never an
-    exception: a missing dataset is a recorded skip, not a failed derivation.
+    exception: a missing dataset is a recorded skip, not a failed derivation. Estimates are scaled by the
+    runtime's ``slowdown``.
     """
     attempts = _option_ladder(benchmark_id, options)
     last = ""
@@ -327,7 +358,7 @@ def _fit_selection(benchmark_id: str, options: dict[str, Any], *, dataset_root: 
             return None, (), 0.0, f"the adapter could not enumerate its tasks: {type(exc).__name__}: {exc}"
         if not task_ids:
             return None, (), 0.0, f"the adapter offers no {PUBLIC_SPLIT} task for this pinned dataset"
-        seconds = estimated_selection_seconds(benchmark_id, task_ids=task_ids, options=options)
+        seconds = estimated_selection_seconds(benchmark_id, task_ids=task_ids, options=options, slowdown=slowdown)
         if seconds <= allowance:
             return options, task_ids, seconds, ""
         last = (f"an estimated {seconds:.0f} s for {len(task_ids)} items does not fit the "
@@ -353,14 +384,29 @@ def public_benchmarks_offered(registry: Any) -> list[str]:
         item for item in runnable if item not in PUBLIC_BENCHMARK_ORDER)
 
 
+def sandbox_blocked_reason(reason: str | None) -> str:
+    """The plan reason a suite that executes generated code gets while the Docker sandbox is unavailable."""
+    return SANDBOX_BLOCKED_REASON.format(reason=reason or "no reason was recorded")
+
+
 def public_benchmark_plan(*, dataset_root: str | None, dataset_root_source: str, broker_configured: bool,
-                          usable_input_ceiling: int, candidate_wall_seconds: int) -> dict[str, Any]:
+                          usable_input_ceiling: int, candidate_wall_seconds: int,
+                          sandbox_available: bool | None = None, sandbox_reason: str | None = None,
+                          planning_slowdown: float = DEFAULT_PLANNING_SLOWDOWN) -> dict[str, Any]:
     """Which official public suites this session will measure, which it will not, and why for every one.
 
     ``selections`` are ready ``BenchmarkSelection`` rows; ``benchmarks`` is the audit a user reads to see why
     something is absent. Availability comes from ``container_eval.baked_datasets`` - the same probe the runner
     uses at admission and the evaluator image uses in its self-check - so derivation can never select a corpus
     the run would then be refused for.
+
+    ``sandbox_available`` is the coding sandbox verdict when one is known (a native bundle records the probe it
+    ran at prepare time). ``False`` plans every suite that executes generated code - EvalPlus, Aider Polyglot and
+    the private coding fixtures, i.e. every registry entry that requires the broker - as ``blocked`` with
+    ``sandbox_reason``, ahead of every other gate: without the sandbox nothing else could make them runnable, and
+    they are never run on the host instead. ``None`` (unknown, the NVIDIA default) changes nothing, and the plan
+    then carries no ``sandbox``/``blocked`` keys at all. ``planning_slowdown`` scales every estimate; it is
+    recorded in the plan only when it is not the NVIDIA 1.0.
     """
     from ..registry import BROKER, builtin_registry
     registry = builtin_registry()
@@ -370,11 +416,15 @@ def public_benchmark_plan(*, dataset_root: str | None, dataset_root_source: str,
         present = baked_datasets(dataset_root)
     allowance = candidate_wall_seconds * PUBLIC_BENCHMARK_WALL_SHARE
     remaining, rows, selections = allowance, [], []
+    blocked = sandbox_blocked_reason(sandbox_reason) if sandbox_available is False else None
     for benchmark_id in public_benchmarks_offered(registry):
         entry = registry.get(benchmark_id)
         if entry is None or entry.capability != "runner" or entry.task_namespace is None:
             rows.append(_public_row(benchmark_id, status="skipped",
                                     reason="the registry does not offer it as a runnable public suite"))
+            continue
+        if BROKER in entry.requires and blocked is not None:
+            rows.append(_public_row(benchmark_id, status="blocked", reason=blocked))
             continue
         if BROKER in entry.requires and not broker_configured:
             rows.append(_public_row(benchmark_id, status="skipped",
@@ -391,20 +441,28 @@ def public_benchmark_plan(*, dataset_root: str | None, dataset_root_source: str,
             rows.append(_public_row(benchmark_id, status="skipped", reason=defaults.refusal))
             continue
         options, task_ids, seconds, problem = _fit_selection(benchmark_id, defaults.options,
-                                                             dataset_root=dataset_root, allowance=remaining)
+                                                             dataset_root=dataset_root, allowance=remaining,
+                                                             slowdown=planning_slowdown)
         if options is None:
             rows.append(_public_row(benchmark_id, status="skipped", reason=problem, notes=defaults.notes))
             continue
         notes = list(defaults.notes)
         if options != defaults.options:
             notes.append(f"item count tightened to fit the wall allowance: {options}")
+        if planning_slowdown != DEFAULT_PLANNING_SLOWDOWN:
+            notes.append(f"estimated at {planning_slowdown:g}x the NVIDIA per-item cost (planning_slowdown)")
         remaining -= seconds
         selections.append({"benchmark_id": benchmark_id, "revision": entry.revision, "task_ids": list(task_ids),
                            "split": PUBLIC_SPLIT, "seed": PUBLIC_SEED, "options": options})
         rows.append(_public_row(benchmark_id, status="selected",
                                 reason=f"its pinned dataset is present under {dataset_root}",
                                 items=len(task_ids), seconds=seconds, options=options, notes=tuple(notes)))
-    return {"power": quality_power(rows, registry),
+    if blocked is not None:  # the local coding fixtures execute generated code too; they are not a public suite
+        for entry in registry.entries:
+            if BROKER in entry.requires and entry.task_namespace is None:
+                notes = () if broker_configured else ("the base candidate config carries no broker either",)
+                rows.append(_public_row(entry.benchmark_id, status="blocked", reason=blocked, notes=notes))
+    plan = {"power": quality_power(rows, registry),
             "dataset_root": dataset_root, "dataset_root_source": dataset_root_source,
             "dataset_root_reason": dataset_root_reason(dataset_root, dataset_root_source),
             "datasets_present": list(present), "broker_configured": broker_configured,
@@ -414,6 +472,12 @@ def public_benchmark_plan(*, dataset_root: str | None, dataset_root_source: str,
             "selected": [row["benchmark_id"] for row in rows if row["status"] == "selected"],
             "skipped": [row["benchmark_id"] for row in rows if row["status"] == "skipped"],
             "benchmarks": rows, "selections": selections}
+    if sandbox_available is not None:
+        plan["sandbox"] = {"available": sandbox_available, "reason": sandbox_reason}
+        plan["blocked"] = [row["benchmark_id"] for row in rows if row["status"] == "blocked"]
+    if planning_slowdown != DEFAULT_PLANNING_SLOWDOWN:
+        plan["planning_slowdown"] = planning_slowdown
+    return plan
 
 
 def quality_power(rows: list[dict], registry: Any) -> list[dict[str, Any]]:
@@ -446,6 +510,13 @@ def benchmark_plan_lines(plan: dict[str, Any]) -> list[str]:
              f"selected: {', '.join(plan['selected']) or 'none'} "
              f"({plan['wall_planned_seconds']:.0f} s of a {plan['wall_allowance_seconds']:.0f} s per-candidate "
              "allowance, estimated)"]
+    if "planning_slowdown" in plan:
+        lines.append(f"runtime: every per-item estimate is {plan['planning_slowdown']:g}x the NVIDIA-measured cost "
+                     "(planning_slowdown)")
+    sandbox = plan.get("sandbox")
+    if sandbox is not None and sandbox["available"] is False:
+        lines.append(f"coding sandbox: unavailable ({sandbox['reason'] or 'no reason was recorded'}); blocked: "
+                     f"{', '.join(plan['blocked']) or 'none'} - generated code is never executed on the host")
     for row in plan["benchmarks"]:
         lines.append(f"  {row['benchmark_id']}: {row['status']} - {row['reason']}"
                      + (f" [{row['items']} items, ~{row['estimated_seconds']:.0f} s]"
@@ -633,9 +704,17 @@ def _read_headers(files: list[Path], summaries: dict[Path, dict]) -> _Headers:
 def _context_shape(headers: _Headers, *, base: ContainerRunConfig, budgets: SessionBudgets,
                    context_floor: int | None, context_ceiling: int | None,
                    gpu_layers: tuple, kv_offload: tuple) -> tuple[tuple[int, ...], int, dict[str, Any]]:
-    """``(ctx_tiers, baseline input fill, recorded context range)``. Independent of the file hashes."""
+    """``(ctx_tiers, baseline input fill, recorded context range)``. Independent of the file hashes.
+
+    A metal-native ``base`` with neither bound given searches ``NATIVE_DEFAULT_INPUT_TOKENS`` exactly, as the
+    recorded range floor = ceiling, so the session config states what was searched just as an explicit
+    ``--context-floor N --context-ceiling N`` would. The NVIDIA default (fixed tiers) is unchanged."""
     reserve, output = base.template_reserve_tokens, output_reserve_tokens(base)
     n_ctx_train = headers.n_ctx_train
+    if context_floor is None and context_ceiling is None and base.runtime == "metal-native":
+        largest = context_range_bounds(None, None, n_ctx_train=n_ctx_train, template_reserve_tokens=reserve,
+                                       output_tokens=output)[1]
+        context_floor = context_ceiling = min(NATIVE_DEFAULT_INPUT_TOKENS, largest)
     if context_floor is None and context_ceiling is None:
         tiers = tuple(tier for tier in DEFAULT_CTX_TIERS if tier <= n_ctx_train) or ((n_ctx_train,)
                                                                                      if n_ctx_train >= 512 else ())
@@ -683,31 +762,115 @@ def ruler_input_ceiling(base: ContainerRunConfig, smallest_tier: int) -> int:
                                output_tokens=max(output_reserve_tokens(base), RULER_OUTPUT_TOKENS))
 
 
+def native_base(base: ContainerRunConfig, bundle: NativeBundle) -> ContainerRunConfig:
+    """The candidate template served by ``bundle``'s pinned llama-server instead of an inference image.
+
+    ``session.native_overlay`` sets the runtime, the native server, the watchdog limits (the template's own, else
+    ``NativeLimits()``) and the bundle's sandbox worker image, and removes the inference image. Derivation also
+    makes the evaluator a host process: the packaged template's evaluator mode is a template choice, and a
+    container evaluator cannot reach a server on the host's loopback, so a native session has exactly one option.
+    """
+    raw = base.model_dump(mode="json")
+    raw["evaluator"] = {**raw["evaluator"], "mode": "host-process", "image": None}
+    return ContainerRunConfig.model_validate_json(canonical_json(native_overlay(raw, bundle)))
+
+
+@dataclass(frozen=True)
+class _Runtime:
+    """What the serving runtime changes about a derivation, settled before any GGUF is read or hashed."""
+
+    base: ContainerRunConfig  # the template as the runtime will serve it (unchanged without a native bundle)
+    planning_slowdown: float
+    sandbox_available: bool | None  # None: no verdict known, which leaves the NVIDIA plan exactly as it was
+    sandbox_reason: str | None
+    broker_configured: bool  # the template's broker, dropped when the sandbox cannot run what it would broker
+
+
+def _runtime_for(base: ContainerRunConfig, *, native_bundle: NativeBundle | None, inference_image,
+                 sandbox_available: bool | None, sandbox_reason: str | None) -> _Runtime:
+    """The runtime shape of a derivation. Evidence first: an explicit ``sandbox_available`` (a probe the caller
+    ran now) wins over the verdict a native bundle recorded at prepare time; a bundle that records no probe at all
+    is a sandbox that was never shown to work, so it is planned as unavailable rather than assumed."""
+    if native_bundle is not None:
+        if inference_image is not None:
+            raise ValueError("a native bundle and an inference image are two different servers; pass one")
+        base = native_base(base, native_bundle)
+        if sandbox_available is None:
+            status = native_bundle.sandbox.get("status")
+            sandbox_available = status == "available"
+            if not sandbox_available:
+                sandbox_reason = sandbox_reason or native_bundle.sandbox.get("reason") or (
+                    f"the native bundle records sandbox status {status!r}" if status
+                    else "the native bundle records no sandbox probe")
+    if sandbox_available is False and not sandbox_reason:
+        sandbox_reason = "the caller reported it unavailable"
+    if sandbox_available is True:
+        sandbox_reason = None
+    return _Runtime(base=base, planning_slowdown=PLANNING_SLOWDOWN[base.runtime],
+                    sandbox_available=sandbox_available, sandbox_reason=sandbox_reason,
+                    broker_configured=base.broker is not None and sandbox_available is not False)
+
+
+def planned_operations(base: ContainerRunConfig, *, native_bundle: NativeBundle | None = None,
+                       sandbox_available: bool | None = None, sandbox_reason: str | None = None) -> tuple[str, ...]:
+    """The ``runtime-policy.json`` operations the session derived from ``base`` will need, known before any GGUF
+    is read or hashed, so ``tune --model`` can refuse first and hash afterwards.
+
+    ``runtime.required_operations`` of the template as the runtime serves it, counting the broker only when the
+    sandbox verdict keeps it. ``derive_session_config`` drops the broker whenever the sandbox is blocked, so asking
+    for ``container`` permission on its behalf would refuse a native-only Mac policy for sandbox workers the
+    session never starts -- and a policy that forbids containers is itself one reason prepare records the sandbox
+    as blocked. The same ``_runtime_for`` decides both, so the authorization cannot disagree with the derivation.
+    """
+    from .runtime import required_operations
+    runtime = _runtime_for(base, native_bundle=native_bundle, inference_image=None,
+                           sandbox_available=sandbox_available, sandbox_reason=sandbox_reason)
+    served = runtime.base if runtime.broker_configured else runtime.base.model_copy(update={"broker": None})
+    return tuple(required_operations(served))
+
+
+def _plan_for(runtime: _Runtime, *, dataset_root: str | None, project_root: str | Path | None,
+              smallest_tier: int, candidate_wall_seconds: int) -> dict[str, Any]:
+    """The public benchmark plan both entry points build, from the same runtime shape and the same tier."""
+    root, source = resolve_dataset_root(runtime.base, dataset_root=dataset_root, project_root=project_root)
+    return public_benchmark_plan(dataset_root=root, dataset_root_source=source,
+                                 broker_configured=runtime.broker_configured,
+                                 usable_input_ceiling=ruler_input_ceiling(runtime.base, smallest_tier),
+                                 candidate_wall_seconds=candidate_wall_seconds,
+                                 sandbox_available=runtime.sandbox_available, sandbox_reason=runtime.sandbox_reason,
+                                 planning_slowdown=runtime.planning_slowdown)
+
+
 def benchmark_plan_for_model(model_path: str | Path, *, base: ContainerRunConfig, budget_seconds: int = 14400,
                              reader: Callable[[Path], dict] = gguf_summary, context_floor: int | None = None,
                              context_ceiling: int | None = None, dataset_root: str | None = None,
                              project_root: str | Path | None = None,
                              gpu_layers: tuple[int | Literal["all"], ...] | None = None,
-                             kv_offload: tuple[bool, ...] | None = None) -> dict[str, Any]:
+                             kv_offload: tuple[bool, ...] | None = None, native_bundle: NativeBundle | None = None,
+                             sandbox_available: bool | None = None,
+                             sandbox_reason: str | None = None) -> dict[str, Any]:
     """Exactly the benchmark plan ``derive_session_config`` will build, WITHOUT hashing the weights.
 
     ``llmbench tune --model`` prints and records this before the session starts, so a user or an agent can see what
     will be measured - and why anything is absent - without waiting for a four-hour run to find out. Same
-    arguments in, same plan out: the two callers share ``_read_headers``, ``_context_shape`` and
-    ``public_benchmark_plan``, so the printed plan cannot drift from the derived one.
+    arguments in, same plan out: the two callers share ``_runtime_for``, ``_read_headers``, ``_context_shape`` and
+    ``_plan_for``, so the printed plan cannot drift from the derived one. A metal-native plan also records its
+    ``runtime`` (an NVIDIA plan carries no such key, as before).
     """
     gpu_layers = DEFAULT_GPU_LAYERS if gpu_layers is None else tuple(gpu_layers)
     kv_offload = DEFAULT_KV_OFFLOAD if kv_offload is None else tuple(kv_offload)
+    runtime = _runtime_for(base, native_bundle=native_bundle, inference_image=None,
+                           sandbox_available=sandbox_available, sandbox_reason=sandbox_reason)
     files = find_ggufs(model_path)
     headers = _read_headers(files, {path: reader(path) for path in files})
     budgets = session_budgets_for(budget_seconds)
-    tiers, _, _ = _context_shape(headers, base=base, budgets=budgets, context_floor=context_floor,
+    tiers, _, _ = _context_shape(headers, base=runtime.base, budgets=budgets, context_floor=context_floor,
                                  context_ceiling=context_ceiling, gpu_layers=gpu_layers, kv_offload=kv_offload)
-    root, source = resolve_dataset_root(base, dataset_root=dataset_root, project_root=project_root)
-    return public_benchmark_plan(dataset_root=root, dataset_root_source=source,
-                                 broker_configured=getattr(base, "broker", None) is not None,
-                                 usable_input_ceiling=ruler_input_ceiling(base, tiers[0]),
-                                 candidate_wall_seconds=budgets.candidate_wall_seconds)
+    plan = _plan_for(runtime, dataset_root=dataset_root, project_root=project_root, smallest_tier=tiers[0],
+                     candidate_wall_seconds=budgets.candidate_wall_seconds)
+    if runtime.base.runtime != "nvidia-container":
+        plan["runtime"] = runtime.base.runtime
+    return plan
 
 
 def derive_session_config(model_path: str | Path, *, base: ContainerRunConfig, budget_seconds: int = 14400,
@@ -717,7 +880,9 @@ def derive_session_config(model_path: str | Path, *, base: ContainerRunConfig, b
                           context_ceiling: int | None = None,
                           gpu_layers: tuple[int | Literal["all"], ...] | None = None,
                           kv_offload: tuple[bool, ...] | None = None, dataset_root: str | None = None,
-                          project_root: str | Path | None = None) -> ContainerSessionConfig:
+                          project_root: str | Path | None = None, native_bundle: NativeBundle | None = None,
+                          sandbox_available: bool | None = None,
+                          sandbox_reason: str | None = None) -> ContainerSessionConfig:
     """Pure given ``hasher``, ``reader`` and the staged datasets: the same inputs always derive the same session.
 
     Coding benchmarks (the private fixtures, EvalPlus and Aider Polyglot) are included only when ``base.broker``
@@ -738,9 +903,21 @@ def derive_session_config(model_path: str | Path, *, base: ContainerRunConfig, b
     today's behaviour (``("all",)`` and ``(True,)``): the derived session is unchanged unless a caller asks for
     the sweep. Extra members cost schedule slots, so they are counted into ``context_points_budget`` before the
     context tiers are sized -- the declared ceiling keeps priority over an offload candidate.
+
+    ``native_bundle`` derives a metal-native session: the base is served by the bundle's pinned llama-server
+    (``native_base``), the default context is ``NATIVE_DEFAULT_INPUT_TOKENS`` (floor = ceiling) instead of the
+    NVIDIA tiers, per-item planning costs are scaled by ``PLANNING_SLOWDOWN`` (recorded as the session's
+    ``planning_slowdown``), and the bundle's recorded sandbox probe decides whether code-executing suites can be
+    planned. ``sandbox_available=False`` (or a bundle whose sandbox is not ``available``) plans them ``blocked``
+    and drops the template's broker from the derived base: nothing selected could use it, and keeping it would
+    demand a container permission for a sandbox that cannot run. ``image_bundle`` is recorded either way; for a
+    native session it is the native bundle's path (the ledger key keeps its name).
     """
     gpu_layers = DEFAULT_GPU_LAYERS if gpu_layers is None else tuple(gpu_layers)
     kv_offload = DEFAULT_KV_OFFLOAD if kv_offload is None else tuple(kv_offload)
+    runtime = _runtime_for(base, native_bundle=native_bundle, inference_image=inference_image,
+                           sandbox_available=sandbox_available, sandbox_reason=sandbox_reason)
+    base = runtime.base
     files = find_ggufs(model_path)
     summaries = {path: reader(path) for path in files}
     headers = _read_headers(files, summaries)
@@ -754,15 +931,15 @@ def derive_session_config(model_path: str | Path, *, base: ContainerRunConfig, b
     tiers, fill, context_search = _context_shape(headers, base=base, budgets=budgets, context_floor=context_floor,
                                                  context_ceiling=context_ceiling, gpu_layers=gpu_layers,
                                                  kv_offload=kv_offload)
-    broker = getattr(base, "broker", None) is not None
-    root, source = resolve_dataset_root(base, dataset_root=dataset_root, project_root=project_root)
-    plan = public_benchmark_plan(dataset_root=root, dataset_root_source=source, broker_configured=broker,
-                                 usable_input_ceiling=ruler_input_ceiling(base, tiers[0]),
-                                 candidate_wall_seconds=budgets.candidate_wall_seconds)
+    broker = runtime.broker_configured
+    plan = _plan_for(runtime, dataset_root=dataset_root, project_root=project_root, smallest_tier=tiers[0],
+                     candidate_wall_seconds=budgets.candidate_wall_seconds)
     raw_base = base.model_dump(mode="json")
-    raw_base.update(label="session-base", session_id=None, parent_grant_seconds=None, dataset_root=root,
-                    assets=[assets[0].model_dump(mode="json")],
+    raw_base.update(label="session-base", session_id=None, parent_grant_seconds=None,
+                    dataset_root=plan["dataset_root"], assets=[assets[0].model_dump(mode="json")],
                     benchmarks=runner_benchmarks(broker_configured=broker) + plan["selections"])
+    if not broker:  # a sandbox that cannot run removes the only reason to carry a broker; see the docstring
+        raw_base["broker"] = None
     if inference_image is not None:
         raw_base["inference_image"] = inference_image.model_dump(mode="json")
     engine = raw_base["engine"]
@@ -796,4 +973,6 @@ def derive_session_config(model_path: str | Path, *, base: ContainerRunConfig, b
         "proposal_mode": "deterministic", "proposal_file": None,
         "policy": {"schema_version": 1, "name": session_id_for(assets[0].model_name), "mode": "live"},
     }
+    if runtime.planning_slowdown != DEFAULT_PLANNING_SLOWDOWN:  # absent at the default: NVIDIA JSON unchanged
+        session["planning_slowdown"] = runtime.planning_slowdown
     return ContainerSessionConfig.model_validate_json(canonical_json(session))

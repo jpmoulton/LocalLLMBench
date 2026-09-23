@@ -12,6 +12,15 @@ it is deliberately conservative about what it claims:
   ggml type the ``llama_ftype`` enum has no entry for, so the header reads Q8_0).
 * Models whose chat templates differ are flagged, because prompt-shaped scores are not comparable between
   them on the strength of this run alone.
+* Memory is labelled by what it measures. An NVIDIA candidate's `VRAM MiB` is dedicated GPU memory; a
+  `metal-native` candidate on Apple Silicon has none, and reports the server's unified-memory footprint, its
+  Metal buffers, host swap growth and the power source instead, in their own columns. A lowest-VRAM or
+  lowest-footprint figure is only ever taken over candidates of ONE memory kind, never across them. The runtime
+  and unified-memory columns appear only when a Metal session is in the sweep, so an NVIDIA sweep's report reads
+  exactly as it always did.
+* A coding suite the session could not run because its Docker sandbox was unavailable is printed as `blocked`
+  with the reason its plan recorded (``benchmark-selection.json``), never as a zero and never as "not
+  configured": generated code is never executed on the host instead.
 
 Usage: python scripts/cross_model_report.py --root <sweep directory written by scripts/sweep_models.py>
 """
@@ -26,9 +35,29 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from llmbench.containers.config import DEFAULT_RUNTIME  # noqa: E402
 from llmbench.containers.gguf import gguf_summary  # noqa: E402
+from llmbench.containers.session_report import NATIVE_RUNTIME, unified_memory_evidence  # noqa: E402
 
 MISSING = "-"
+UNIFIED = "n/a (unified)"  # a VRAM cell on a Metal row: not unmeasured, there is no VRAM to measure
+
+
+def _runtime_of(session_config) -> str | None:
+    """The runtime a session was configured for: ``base.runtime`` in its ``session-config.json``, where an NVIDIA
+    config omits the key (that omission IS the default). None when the file is unreadable: unknown, not NVIDIA."""
+    if not isinstance(session_config, dict) or not isinstance(session_config.get("base"), dict):
+        return None
+    runtime = session_config["base"].get("runtime", DEFAULT_RUNTIME)
+    return runtime if isinstance(runtime, str) else None
+
+
+def _blocked_suites(selection) -> list[dict]:
+    """The suites a session's plan blocked, each with the reason it recorded. Only a plan that carried a sandbox
+    verdict has any (``derive.public_benchmark_plan``); an NVIDIA plan has none."""
+    rows = selection.get("benchmarks") if isinstance(selection, dict) else None
+    return [{"benchmark_id": row.get("benchmark_id"), "reason": row.get("reason")}
+            for row in rows or [] if isinstance(row, dict) and row.get("status") == "blocked"]
 
 
 def _read_json(path: Path):
@@ -70,6 +99,7 @@ def collect_model(slug: str, meta: dict, root: Path) -> dict:
     ledger = _read_json(run / "session.json")
     summary_json = _read_json(run / "session-summary.json")
     campaign = _read_json(run / "reports" / "campaign.json")
+    record["runtime"] = _runtime_of(_read_json(run / "session-config.json"))
     if ledger is None:
         return record
 
@@ -153,6 +183,22 @@ def collect_model(slug: str, meta: dict, root: Path) -> dict:
             candidate[f"{area}_attempted"] = attempted
             candidate[f"{area}_completed"] = completed
             candidate[f"{area}_threshold"] = threshold
+        # What served the candidate: its own result says so (a container result omits the key, which is how the
+        # default is serialised); a candidate with no result inherits the session's configured runtime.
+        runtime = result.get("runtime", DEFAULT_RUNTIME) if result else record["runtime"]
+        memory = unified_memory_evidence(result.get("memory")) if runtime == NATIVE_RUNTIME and result else None
+        blocked = memory is not None and memory["coding_sandbox_status"] not in (None, "available")
+        if runtime == NATIVE_RUNTIME:  # no dedicated VRAM exists to have measured; a stray figure is not one
+            candidate["vram_mib"] = None
+        candidate.update({
+            "runtime": runtime, "unified_memory": memory,
+            "server_footprint_mib": (memory or {}).get("server_footprint_mib"),
+            "metal_mib": (memory or {}).get("metal_mib"), "swap_growth_mib": (memory or {}).get("swap_growth_mib"),
+            "power": (memory or {}).get("power"),
+            # The candidate's own sandbox probe found no usable worker: its coding rows are backfilled
+            # environment errors, whatever number the denominator rule turned them into.
+            "coding_blocked": (memory["coding_sandbox_reason"] or "the Docker sandbox was unavailable")
+            if blocked else None})
         record["candidates"].append(candidate)
 
     selection = _read_json(run / "benchmark-selection.json")
@@ -160,12 +206,30 @@ def collect_model(slug: str, meta: dict, root: Path) -> dict:
         record["benchmark_selection"] = {
             "selected": selection.get("selected") or selection.get("present"),
             "skipped": selection.get("skipped")}
+        blocked_suites = _blocked_suites(selection)
+        if blocked_suites:  # only a plan with a sandbox verdict has any; an NVIDIA selection reads as before
+            record["benchmark_selection"]["blocked"] = blocked_suites
+            record["blocked_suites"] = blocked_suites
     return record
+
+
+def _is_native(record: dict) -> bool:
+    return record.get("runtime") == NATIVE_RUNTIME or any(c.get("runtime") == NATIVE_RUNTIME
+                                                          for c in record["candidates"])
+
+
+def _mib(value) -> str:
+    return f"{value:.0f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else MISSING
 
 
 def render_markdown(records: list[dict], generated: str) -> str:
     out: list[str] = []
     w = out.append
+    # Every addition below is conditional on a Metal session being present, so an NVIDIA sweep renders exactly
+    # the report it always did.
+    native = any(_is_native(record) for record in records)
+    # Only runtimes a session recorded: a model that never started has none, which is not a second runtime.
+    runtimes = sorted({record["runtime"] for record in records if record.get("runtime")})
     w("# Cross-model inference sweep")
     w("")
     w(f"Generated {generated} by `scripts/cross_model_report.py`. Every candidate that each session "
@@ -175,8 +239,9 @@ def render_markdown(records: list[dict], generated: str) -> str:
 
     w("## Models measured")
     w("")
-    w("| Model | Size | Header `file_type` | Tensor types actually present | Template | Session |")
-    w("|---|---|---|---|---|---|")
+    w("| Model | Size | Header `file_type` | Tensor types actually present | Template | Session |"
+      + (" Runtime |" if native else ""))
+    w("|---|---|---|---|---|---|" + ("---|" if native else ""))
     for record in records:
         header = record.get("header") or {}
         types = record.get("tensor_types") or {}
@@ -184,8 +249,16 @@ def render_markdown(records: list[dict], generated: str) -> str:
         template = (header.get("template_hash") or MISSING)
         w(f"| `{record['slug']}` | {_fmt(header.get('size_gib'))} GiB | "
           f"{_fmt(header.get('file_type'))} → {header.get('file_type_name', MISSING)} | {top} | "
-          f"`{template[7:15] if template.startswith('sha256:') else template}` | {record.get('status')} |")
+          f"`{template[7:15] if template.startswith('sha256:') else template}` | {record.get('status')} |"
+          + (f" {record.get('runtime') or 'unknown'} |" if native else ""))
     w("")
+
+    if len(runtimes) > 1:
+        w(f"> **These sessions ran on different runtimes ({', '.join(runtimes)}).** Speed and memory are "
+          "properties of the hardware as much as of the model: tok/s from an NVIDIA GPU and from Apple Silicon "
+          "are not a comparison of the models, and a VRAM figure and a unified-memory footprint measure "
+          "different things, so neither is ever ranked against the other here.")
+        w("")
 
     templates = {(r.get("header") or {}).get("template_hash") for r in records if r.get("header")}
     if len(templates - {None}) > 1:
@@ -214,23 +287,36 @@ def render_markdown(records: list[dict], generated: str) -> str:
       "the whole story on its own. A tok/s marked `(raw)` was measured but the campaign analysis refused it "
       "because that candidate did not complete - treat it as an observation, not an accepted result.")
     w("")
+    if native:
+        w("On a `metal-native` row `VRAM MiB` is `n/a (unified)`: Apple Silicon has no dedicated VRAM. `footprint "
+          "MiB (unified)` is the llama-server process's phys_footprint after load, which includes its Metal "
+          "allocations; `Metal MiB` is the buffers the server logged on the Metal device; `swap growth MiB` is "
+          "host-wide (other applications included); `power` is the power source when the model had loaded. "
+          "`blocked` means the Docker coding sandbox was unavailable, so those suites were not run.")
+        w("")
     w("| Model | Candidate | ctx | KV | spec | reason | tok/s | VRAM MiB | tools | retrieval | coding | "
-      "largest prompt | ctx ok | state |")
-    w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+      "largest prompt | ctx ok | state |"
+      + (" runtime | footprint MiB (unified) | Metal MiB | swap growth MiB | power |" if native else ""))
+    w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|" + ("---|" * 5 if native else ""))
     for record in records:
         if not record["candidates"]:
             w(f"| `{record['slug']}` | *(not run)* | - | - | - | - | - | - | - | - | - | - | - | "
-              f"{record.get('status')} |")
+              f"{record.get('status')} |" + (f" {record.get('runtime') or 'unknown'} | - | - | - | - |"
+                                             if native else ""))
         for c in record["candidates"]:
             kv = f"{c['cache_k']}/{c['cache_v']}" if c["cache_k"] else MISSING
+            metal = c.get("runtime") == NATIVE_RUNTIME
 
             def cell(area: str) -> str:
-                """A score, `0/0` when nothing was attempted, or `unmeasured` when a run died mid-stage."""
+                """A score, `0/0` when nothing was attempted, `unmeasured` when a run died mid-stage, or
+                `blocked` when the Docker sandbox could not run a suite that executes generated code."""
                 value, attempted = c[area], c.get(f"{area}_attempted")
+                if area == "coding" and c.get("coding_blocked"):
+                    return "blocked"  # its rows are backfilled environment errors, never a measured zero
                 if isinstance(value, (int, float)):
                     return f"{value:.3f}"
                 if not attempted:
-                    return "0/0"
+                    return "blocked" if area == "coding" and record.get("blocked_suites") else "0/0"
                 return "unmeasured"
 
             tools, retr, coding = cell("tools"), cell("retrieval"), cell("coding")
@@ -240,7 +326,8 @@ def render_markdown(records: list[dict], generated: str) -> str:
                 tps = f"{c['raw_median_tps']:.1f} (raw)"  # measured, but the analysis did not accept it
             else:
                 tps = MISSING
-            vram = f"{c['vram_mib']:.0f}" if isinstance(c["vram_mib"], (int, float)) else MISSING
+            vram = UNIFIED if metal else f"{c['vram_mib']:.0f}" if isinstance(c["vram_mib"], (int, float)) \
+                else MISSING
             largest = _fmt(c.get("measured_input_max"))
             ok = {True: "✅", False: "❌"}.get(c.get("context_verified"), MISSING)
             if c.get("context_errors"):
@@ -250,7 +337,10 @@ def render_markdown(records: list[dict], generated: str) -> str:
                 state += f" ⚠ mismatch: {', '.join(c['settings_mismatches'])}"
             w(f"| `{record['slug']}` | {c['label']} | {_fmt(c['ctx_size'])} | {kv} | "
               f"{_fmt(c['spec_type'])} | {_fmt(c['reasoning'])} | {tps} | {vram} | {tools} | {retr} | "
-              f"{coding} | {largest} | {ok} | {state} |")
+              f"{coding} | {largest} | {ok} | {state} |"
+              + (f" {c.get('runtime') or 'unknown'} | {_mib(c.get('server_footprint_mib'))} | "
+                 f"{_mib(c.get('metal_mib'))} | {_mib(c.get('swap_growth_mib'))} | {_fmt(c.get('power'))} |"
+                 if native else ""))
     w("")
 
     w("## Cross-model comparison (measured axes only)")
@@ -260,27 +350,34 @@ def render_markdown(records: list[dict], generated: str) -> str:
       "(see below), and the campaign named no winner.")
     w("")
     w("| Model | baseline tok/s | best tok/s (settings) | lowest VRAM | tok/s at 64K | VRAM at 262144 | "
-      "tools range |")
-    w("|---|---|---|---|---|---|---|")
+      "tools range |" + (" lowest footprint MiB (unified) |" if native else ""))
+    w("|---|---|---|---|---|---|---|" + ("---|" if native else ""))
     for record in records:
         done = [c for c in record["candidates"] if c["state"] == "completed"]
         if not done:
-            w(f"| `{record['slug']}` | - | - | - | - | - | - |")
+            w(f"| `{record['slug']}` | - | - | - | - | - | - |" + (" - |" if native else ""))
             continue
         base = next((c for c in done if c["label"] == "baseline"), None)
         speeds = [c for c in done if isinstance(c["median_tps"], (int, float))]
         best = max(speeds, key=lambda c: c["median_tps"]) if speeds else None
-        vrams = [c for c in done if isinstance(c["vram_mib"], (int, float))]
+        # Each minimum is taken over ONE memory kind: VRAM over container candidates, footprint over Metal ones.
+        vrams = [c for c in done if isinstance(c["vram_mib"], (int, float)) and c.get("runtime") != NATIVE_RUNTIME]
         low = min(vrams, key=lambda c: c["vram_mib"]) if vrams else None
+        footprints = [c for c in done if c.get("runtime") == NATIVE_RUNTIME
+                      and isinstance(c.get("server_footprint_mib"), (int, float))]
+        low_footprint = min(footprints, key=lambda c: c["server_footprint_mib"]) if footprints else None
         at64 = next((c for c in done if c["ctx_size"] == 66048), None)
-        ceiling = next((c for c in record["candidates"]
-                        if c["ctx_size"] == 262144 and isinstance(c["vram_mib"], (int, float))), None)
+        ceiling = next((c for c in record["candidates"] if c["ctx_size"] == 262144
+                        and c.get("runtime") != NATIVE_RUNTIME and isinstance(c["vram_mib"], (int, float))), None)
         tools = sorted(c["tools"] for c in done if isinstance(c["tools"], (int, float)))
+        unified = _is_native(record)
         w(f"| `{record['slug']}` | {_fmt(base and base['median_tps'], '.1f')} | "
           f"{_fmt(best and best['median_tps'], '.1f')} ({best['label'] if best else MISSING}) | "
-          f"{_fmt(low and low['vram_mib'], '.0f')} | {_fmt(at64 and at64['median_tps'], '.1f')} | "
-          f"{_fmt(ceiling and ceiling['vram_mib'], '.0f')} | "
-          f"{f'{tools[0]:.3f}-{tools[-1]:.3f}' if tools else MISSING} |")
+          f"{UNIFIED if unified else _fmt(low and low['vram_mib'], '.0f')} | "
+          f"{_fmt(at64 and at64['median_tps'], '.1f')} | "
+          f"{UNIFIED if unified else _fmt(ceiling and ceiling['vram_mib'], '.0f')} | "
+          f"{f'{tools[0]:.3f}-{tools[-1]:.3f}' if tools else MISSING} |"
+          + (f" {_fmt(low_footprint and low_footprint['server_footprint_mib'], '.0f')} |" if native else ""))
     w("")
 
     every = [c for r in records for c in r["candidates"]
@@ -305,8 +402,12 @@ def render_markdown(records: list[dict], generated: str) -> str:
         w(f"- SHA256: `{record.get('sha256')}`")
         w(f"- Session stop reason: **{record.get('status')}**; winner: "
           f"**{record.get('winner') if record.get('winner') else 'none'}**")
+        if native:
+            w(f"- Runtime: {record.get('runtime') or 'unknown'}")
         if record.get("benchmark_selection"):
             w(f"- Benchmarks: {json.dumps(record['benchmark_selection'])}")
+        for item in record.get("blocked_suites") or []:
+            w(f"- Blocked: `{item.get('benchmark_id')}` - {item.get('reason')}")
         if record.get("notes"):
             for note in record["notes"]:
                 w(f"- Note: {note}")
@@ -329,6 +430,16 @@ def render_markdown(records: list[dict], generated: str) -> str:
       "which this sweep does not perform.")
     w("- **Coding is unmeasured** wherever `coding` shows `0/0`: the coding worker broker is not configured "
       "in the base config, so EvalPlus and Aider Polyglot were skipped rather than scored.")
+    blocked = [r["slug"] for r in records if r.get("blocked_suites") or any(c.get("coding_blocked")
+                                                                           for c in r["candidates"])]
+    if blocked:
+        w(f"- **Coding is blocked** for {', '.join('`' + slug + '`' for slug in blocked)}: the Docker sandbox that "
+          "runs generated code was unavailable (the reason is under each model), so those suites were not run. "
+          "That is not a score of zero, and generated code is never executed on the host instead.")
+    if native:
+        w("- **Unified memory is not VRAM.** A `metal-native` footprint includes the Metal buffers and shares one "
+          "pool with everything else on the Mac; it is never compared with an NVIDIA VRAM figure, and swap "
+          "growth is host-wide.")
     return "\n".join(out) + "\n"
 
 

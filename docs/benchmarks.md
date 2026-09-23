@@ -16,6 +16,13 @@ Local fixtures (`tool-probes`, `tool-episodes`, `niah`, `coding`) are hand-writt
 
 Every adapter must return one row per declared task, failures included, so a crash can never shrink a
 denominator; a task that did not really run is `environment_error`, never a silent zero presented as a score.
+EvalPlus, Aider Polyglot and the `coding` fixtures execute generated code, which only ever happens in the sandboxed
+worker container. When that sandbox is unavailable (a Mac without Docker, for example) they are never run on the
+host instead. A plan that already knows it lists them as `blocked` with the reason and does not select them; a
+candidate whose sandbox probe fails at run time records their rows as `environment_error` with a
+`sandbox_unavailable: <reason>` reason. Those rows stay in the denominator like every other failure (so the
+candidate cannot meet a `minimum_coding_score` above zero), but the candidate, session, cross-model and coding
+reports print the category as `blocked`, never as a coding score of zero.
 
 ## Where this differs from upstream, on purpose
 

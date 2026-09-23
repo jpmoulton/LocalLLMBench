@@ -11,16 +11,27 @@ from pathlib import Path
 
 
 _BASE = r"(?:docker\.io/library/)?node:24-bookworm-slim@sha256:[0-9a-f]{64}"
+# linux/amd64 is the original (NVIDIA workstation) worker and stays the default, so its plan and argv are
+# unchanged. linux/arm64 is for an Apple Silicon host, whose Docker runs an arm64 Linux VM (Colima): a worker built
+# for amd64 would run there under emulation, and every coding case's timeout would then measure the emulator.
+WORKER_PLATFORMS = ("linux/amd64", "linux/arm64")
 
 
-def worker_image_build_plan(*, base_image: str, artifact_dir: str | Path) -> dict:
+def worker_image_build_plan(*, base_image: str, artifact_dir: str | Path, platform: str = "linux/amd64") -> dict:
     """Return an unexecuted build manifest requiring an exact official base digest.
 
     Runtime uses the immutable image ID from --iidfile; no registry publishing is
     necessary. A mutable staging tag is never passed to the scoring worker.
+    For `platform="linux/arm64"` the base digest must be the official multi-platform
+    index digest (or its arm64 manifest): an amd64-only manifest digest has no arm64
+    image in it, so the build either fails or (BuildKit only warns about a mismatched
+    base platform) yields an amd64 image. scripts/build_worker_image.py refuses the
+    latter by the built image's own inspected Os/Architecture, never the request.
     """
     if type(base_image) is not str or not re.fullmatch(_BASE, base_image):
         raise ValueError("An official node:24-bookworm-slim@sha256 digest is required")
+    if platform not in WORKER_PLATFORMS:
+        raise ValueError(f"worker platform must be one of {', '.join(WORKER_PLATFORMS)}")
     artifacts = Path(artifact_dir).resolve()
     context = Path(__file__).with_name("worker_image").resolve(strict=True)
     files = {name: hashlib.sha256((context / name).read_bytes()).hexdigest()
@@ -31,11 +42,11 @@ def worker_image_build_plan(*, base_image: str, artifact_dir: str | Path) -> dic
         "status": "planned-not-executed",
         "purpose": "Trusted Python/Node/TypeScript toolchain for the isolated coding fixtures and public coding suites",
         "base_image": base_image,
-        "platform": "linux/amd64",
+        "platform": platform,
         "typescript_version": "5.9.3",
         "context": str(context),
         "source_sha256": files,
-        "build_argv": ["docker", "build", "--platform=linux/amd64", "--pull=false", "--no-cache",
+        "build_argv": ["docker", "build", f"--platform={platform}", "--pull=false", "--no-cache",
                        "--build-arg", "BASE_IMAGE=" + base_image, "--iidfile", str(iidfile),
                        "--tag", "llmbench-worker:staged", "--file", str(context / "Dockerfile"), str(context)],
         "build_requires_network": True,

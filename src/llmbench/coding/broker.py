@@ -140,8 +140,11 @@ class HostBroker:
 
     # ---- construction helpers ---------------------------------------------------------------------------------
     @classmethod
-    def factory(cls, run_dir, config, session_lock, artifacts) -> "HostBroker":
-        broker = cls(run_dir, config, session_lock, artifacts)
+    def factory(cls, run_dir, config, session_lock, artifacts, *, attempt_id: str | None = None,
+                session_id: str | None = None) -> "HostBroker":
+        """Construct and reconcile. A runner that knows its attempt identity passes it; the ids are then checked
+        against the ledger and against the attempt labels in the run's plan, never silently preferred to them."""
+        broker = cls(run_dir, config, session_lock, artifacts, attempt_id=attempt_id, session_id=session_id)
         broker.reconcile()
         return broker
 
@@ -180,27 +183,45 @@ class HostBroker:
                 raise ValueError("broker namespace differs from the recorded ledger namespace")
         elif attempt_id is not None:
             candidate = (session_id or configured or attempt_id[:12], attempt_id, "argument")
+            planned = self._namespace_from_plan()
+            if planned is not None and planned[:2] != candidate[:2]:
+                # Two sources of one identity that disagree mean the caller has the wrong run directory or the
+                # wrong attempt; guessing which is right would admit the other attempt's requests.
+                raise ValueError("broker namespace arguments differ from the attempt labels in the run's plan")
         else:
             candidate = self._namespace_from_plan()
             if candidate is None:
                 minted = uuid.uuid4().hex
                 candidate = (session_id or configured or minted[:12], minted, "minted")
+            elif session_id is not None and session_id != candidate[0]:
+                # A session named by the caller is checked like an attempt id, never silently replaced by the plan's.
+                raise ValueError("broker namespace arguments differ from the attempt labels in the run's plan")
         if not (type(candidate[0]) is str and re.fullmatch(NAME, candidate[0])
                 and type(candidate[1]) is str and re.fullmatch(HEX32, candidate[1])):
             raise ValueError("broker namespace must be a safe session name and a 32-hex attempt id")
         return candidate
 
     def _namespace_from_plan(self) -> tuple[str, str, str] | None:
-        """The runner writes plan/compose.json before the broker stage; its labels carry the attempt identity."""
-        path = self.run_dir / "plan" / "compose.json"
-        try:
-            plan = strict_json_loads(read_bounded(path, 1_048_576).decode("utf-8"))
-            labels = plan["services"]["inference"]["labels"]
-            return (labels["llmbench.session"], labels["llmbench.attempt"], "plan")
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-            raise ValueError(f"plan/compose.json exists but its attempt labels are unreadable: {exc}") from exc
+        """The runner writes its plan before the broker stage; the plan's labels carry the attempt identity.
+
+        A container run has ``plan/compose.json`` (labels of the inference service) and it is read exactly as it
+        always was. A native run has no compose file: its llama-server launch record ``plan/native-launch.json``
+        carries the same two labels under ``labels`` (source ``native-plan``). The native record is consulted only
+        when no compose file exists, so a container run can never pick its namespace up from a stray native record.
+        A plan file that exists but cannot be read is an error, never a reason to mint a fresh namespace.
+        """
+        sources = (("compose.json", "plan", lambda plan: plan["services"]["inference"]["labels"]),
+                   ("native-launch.json", "native-plan", lambda plan: plan["labels"]))
+        for name, source, locate in sources:
+            try:
+                plan = strict_json_loads(read_bounded(self.run_dir / "plan" / name, 1_048_576).decode("utf-8"))
+                labels = locate(plan)
+                return (labels["llmbench.session"], labels["llmbench.attempt"], source)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+                raise ValueError(f"plan/{name} exists but its attempt labels are unreadable: {exc}") from exc
+        return None
 
     def _open_ledger(self) -> None:
         existing = self._ledger_files()
@@ -396,6 +417,16 @@ class HostBroker:
         if outcome["abort_campaign"]:
             return self._result(request_id, sha, "cleanup-unverified", trace=trace, cleanup_confirmed=False, abort=True,
                                 failure_reason=("worker cleanup unverified: " + "; ".join(unverified))[:1000])
+        # A case whose Docker client never started ran nothing. The private-fixture runner still totals such a case
+        # as a failed check of a "completed" sample; published as-is it would score a missing sandbox as the model's
+        # 0. The whole request is infrastructure-failed instead (nothing to clean up, so no abort). Public items
+        # already say environment-error; they carry the worker status per case and get the same named reason.
+        unlaunched = [str(case.get("case_id")) for case in sample["cases"]
+                      if "sandbox-unavailable" in (case.get("status"), case.get("worker_status"))]
+        if unlaunched:
+            return self._result(request_id, sha, "environment-error", trace=trace, cleanup_confirmed=True,
+                                failure_reason=("sandbox_unavailable: the Docker client could not be started for "
+                                                "case(s) " + ", ".join(unlaunched))[:1000])
         if sample.get("status") == "environment-error":
             reason = sample.get("failure_reason") or "public coding worker infrastructure failed"
             return self._result(request_id, sha, "environment-error", failure_reason=str(reason)[:1000],

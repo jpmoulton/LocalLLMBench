@@ -7,6 +7,13 @@ Two rules learned the hard way in this project are built in rather than left to 
 * Configurations and models are compared on the IDENTICAL item set with an exact McNemar test on the discordant
   pairs. "Pass rate among the items that finished" is never used - that is survivorship bias, because the items a
   configuration fails to finish are the hard ones.
+* A suite that could not run because the Docker sandbox was unavailable (a Mac without Colima, say) is printed as
+  ``blocked`` with its reason, never as a pass rate of zero: its rows are backfilled ``environment_error``s, not
+  answers the model got wrong, and they never enter a paired comparison. The reason comes from the session's plan
+  (``benchmark-selection.json``, when derivation already knew) or from the candidate's own evaluation record
+  (when the sandbox probe failed at run time). Generated code is never executed on the host instead.
+* A candidate with no items for the suite, or with no timed quality stage, prints ``-`` there rather than
+  dividing by zero or formatting a missing number.
 
 Usage: python scripts/coding_report.py --root <sweep directory> [--suite evalplus|aider-polyglot]
 """
@@ -18,6 +25,9 @@ import json
 import math
 import sys
 from pathlib import Path
+
+# container_eval's reason prefix for the rows and benchmark record of a suite whose sandbox was unavailable.
+SANDBOX_UNAVAILABLE = "sandbox_unavailable"
 
 
 def mcnemar_exact(b: int, c: int) -> float:
@@ -43,7 +53,8 @@ def load_candidate(directory: Path, suite: str) -> dict | None:
     if not result.is_file() or not evaluation.is_file():
         return None
     outcome = json.loads(result.read_text(encoding="utf-8"))
-    samples = json.loads(evaluation.read_text(encoding="utf-8")).get("samples") or []
+    evaluated = json.loads(evaluation.read_text(encoding="utf-8"))
+    samples = evaluated.get("samples") or []
     items = {row["task_id"]: row for row in samples if row.get("suite") == suite}
     finish: dict[str, int] = {}
     tokens = []
@@ -65,7 +76,44 @@ def load_candidate(directory: Path, suite: str) -> dict | None:
     return {"label": directory.name.split("-", 1)[1], "state": outcome.get("state"), "items": items,
             "finish": finish, "tokens": tokens, "quality_seconds": stages.get("quality"), "tps": speed,
             "vram": outcome.get("vram_used_mib_after_load"),
-            "environment_errors": sum(1 for row in items.values() if row.get("status") == "environment_error")}
+            "environment_errors": sum(1 for row in items.values() if row.get("status") == "environment_error"),
+            "runtime": outcome.get("runtime", "nvidia-container"),
+            "blocked": sandbox_blocked(evaluated, suite, items)}
+
+
+def sandbox_blocked(evaluation: dict, suite: str, items: dict) -> str | None:
+    """The reason ``suite`` could not run in this candidate because its Docker sandbox was unavailable, or None.
+
+    Evidence only: the evaluator's benchmark record for the suite says ``environment_error`` with a
+    ``sandbox_unavailable: ...`` reason, or every one of the suite's rows does. A suite with some real answers
+    is not blocked, however many environment errors it also has."""
+    for record in evaluation.get("benchmarks") or []:
+        if (isinstance(record, dict) and record.get("benchmark_id") == suite
+                and record.get("status") == "environment_error"
+                and str(record.get("reason") or "").startswith(SANDBOX_UNAVAILABLE)):
+            return str(record["reason"])
+    reasons = {str(row.get("reason") or "") for row in items.values()}
+    if items and all(row.get("status") == "environment_error" for row in items.values()) \
+            and all(reason.startswith(SANDBOX_UNAVAILABLE) for reason in reasons):
+        return sorted(reasons)[0]
+    return None
+
+
+def plan_blocked(root: Path, slug: str, suite: str) -> str | None:
+    """The reason the session's own plan blocked ``suite`` (``derive`` found no usable sandbox), or None. A plan
+    that is absent or unreadable blocks nothing: this reports the plan's words, it never infers them."""
+    try:
+        plan = json.loads((root / slug / "run" / "benchmark-selection.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for row in (plan.get("benchmarks") or []) if isinstance(plan, dict) else []:
+        if isinstance(row, dict) and row.get("benchmark_id") == suite and row.get("status") == "blocked":
+            return str(row.get("reason") or "blocked by the session plan")
+    return None
+
+
+def _cell(text: str) -> str:
+    return str(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def paired(left: dict, right: dict) -> dict:
@@ -75,20 +123,37 @@ def paired(left: dict, right: dict) -> dict:
     return {"n": len(shared), "left_only": b, "right_only": c, "p": mcnemar_exact(b, c)}
 
 
-def main() -> int:
+def collect(root: Path, suite: str) -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """``(candidates per model, plan-blocked reason per model)`` for one sweep directory."""
+    index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+    models, blocked = {}, {}
+    for slug in index:
+        candidates = [load_candidate(d, suite) for d in sorted((root / slug / "run" / "candidates").glob("*"))
+                      if d.is_dir()] if (root / slug / "run" / "candidates").is_dir() else []
+        models[slug] = [c for c in candidates if c]
+        reason = plan_blocked(root, slug, suite)
+        if reason is not None:
+            blocked[slug] = reason
+    return models, blocked
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True)
     parser.add_argument("--suite", default="evalplus", choices=("evalplus", "aider-polyglot"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     root = Path(args.root).resolve()
-    index = json.loads((root / "index.json").read_text(encoding="utf-8"))
-    models = {}
-    for slug in index:
-        candidates = [load_candidate(d, args.suite) for d in sorted((root / slug / "run" / "candidates").glob("*"))
-                      if d.is_dir()] if (root / slug / "run" / "candidates").is_dir() else []
-        models[slug] = [c for c in candidates if c]
+    models, blocked = collect(root, args.suite)
+    text = render(models, args.suite, blocked)
+    (root / f"coding-report-{args.suite}.md").write_text(text, encoding="utf-8")
+    print(text)
+    return 0
 
-    polyglot = args.suite == "aider-polyglot"
+
+def render(models: dict[str, list[dict]], suite: str, blocked: dict[str, str] | None = None) -> str:
+    """The report text. ``blocked`` maps a model to the reason its plan blocked ``suite``."""
+    blocked = blocked or {}
+    polyglot = suite == "aider-polyglot"
     title = ("Aider Polyglot, python + javascript development split, pass within two attempts" if polyglot
              else "EvalPlus MBPP+, pass@1")
     out = [f"# Coding comparison ({title})", ""]
@@ -99,12 +164,23 @@ def main() -> int:
     extra = " first try | well-formed edits | python | javascript |" if polyglot else ""
     out += [f"| Model | Candidate | pass | 95% CI |{extra} cut off at cap | env errors | median tokens | quality stage |",
             "|---|---|---|---|" + ("---|---|---|---|" if polyglot else "") + "---|---|---|---|"]
+    trailing = 9 if polyglot else 5  # cells after Model, Candidate and pass
     for slug, candidates in models.items():
         if not candidates:
-            out.append(f"| `{slug}` | *(not run)* |" + " - |" * (10 if polyglot else 6))
+            out.append(f"| `{slug}` | *(not run)* |" + (f" blocked: {_cell(blocked[slug])} |" + " - |" * trailing
+                                                         if slug in blocked else " - |" * (10 if polyglot else 6)))
         for c in candidates:
+            reason = c.get("blocked") or (blocked.get(slug) if not c["items"] else None)
+            if reason:  # the sandbox could not run the suite: no pass rate exists, not even zero
+                out.append(f"| `{slug}` | {c['label']} | blocked: {_cell(reason)} |" + " - |" * trailing)
+                continue
             rows = list(c["items"].values())
             n = len(rows)
+            quality = "-" if c["quality_seconds"] is None else f"{c['quality_seconds']:.0f} s"
+            if n == 0:  # nothing of this suite ran: no rate and no interval, never a division by zero
+                out.append(f"| `{slug}` | {c['label']} | 0/0 (no items) |" + " - |" * (trailing - 1)
+                           + f" {quality} |")
+                continue
             passed = sum(1 for row in rows if row["passed"])
             low, high = wilson(passed, n)
             tokens = sorted(c["tokens"])
@@ -118,28 +194,32 @@ def main() -> int:
                 cells = f" {first}/{n} = {first / n:.1%} | {formed}/{n} | {language('python')} | {language('javascript')} |"
             out.append(f"| `{slug}` | {c['label']} | **{passed}/{n} = {passed / n:.1%}** | {low:.0%}-{high:.0%} |{cells} "
                        f"{c['finish'].get('length', 0)} | {c['environment_errors']} | "
-                       f"{tokens[len(tokens) // 2] if tokens else '-'} | {c['quality_seconds']:.0f} s |")
+                       f"{tokens[len(tokens) // 2] if tokens else '-'} | {quality} |")
+    # Only candidates that actually answered items are paired: a blocked or empty suite has nothing to compare.
+    comparable = {slug: [c for c in candidates if c["items"] and not c.get("blocked")]
+                  for slug, candidates in models.items()}
     out += ["", "## Paired comparisons on identical items (exact McNemar)", "",
             "| Comparison | n | left only | right only | p |", "|---|---|---|---|---|"]
-    for slug, candidates in models.items():
+    for slug, candidates in comparable.items():
         by = {c["label"]: c for c in candidates}
         if "baseline" in by and "reasoning-on" in by:
             r = paired(by["baseline"], by["reasoning-on"])
             out.append(f"| `{slug}`: reasoning off vs on | {r['n']} | {r['left_only']} | {r['right_only']} | {r['p']:.3f} |")
-    slugs = [s for s, c in models.items() if any(x["label"] == "baseline" for x in c)]
+    slugs = [s for s, c in comparable.items() if any(x["label"] == "baseline" for x in c)]
     for i, left in enumerate(slugs):
         for right in slugs[i + 1:]:
-            a = next(x for x in models[left] if x["label"] == "baseline")
-            b = next(x for x in models[right] if x["label"] == "baseline")
+            a = next(x for x in comparable[left] if x["label"] == "baseline")
+            b = next(x for x in comparable[right] if x["label"] == "baseline")
             r = paired(a, b)
             out.append(f"| `{left}` vs `{right}` (reasoning off) | {r['n']} | {r['left_only']} | {r['right_only']} | "
                        f"{r['p']:.3f} |")
     out += ["", "A p-value near 1 means the two columns are indistinguishable on this item set; with a few dozen items "
                 "a true difference smaller than roughly 15-20 points will usually not reach significance.", ""]
-    text = "\n".join(out)
-    (root / f"coding-report-{args.suite}.md").write_text(text, encoding="utf-8")
-    print(text)
-    return 0
+    if blocked or any(c.get("blocked") for candidates in models.values() for c in candidates):
+        out += ["`blocked` means the Docker sandbox that runs generated code was unavailable, so the suite was not "
+                "run: it is not a pass rate of zero and it is left out of every paired comparison. Generated code is "
+                "never executed on the host instead.", ""]
+    return "\n".join(out)
 
 
 if __name__ == "__main__":

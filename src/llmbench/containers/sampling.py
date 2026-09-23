@@ -10,14 +10,14 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from ..config import GenerationSettings, RunMode, canonical_json
+from ..config import GenerationSettings, canonical_json
 from ..evaluations.selection import expected_task_rows
 from ..safety import OperationForbidden, SessionLock
 from ..store import utc_now
 from .campaign import read_indexed_artifact
-from .config import ContainerRunConfig, read_image_bundle, read_run_config
-from .runner import INGEST_MARGIN_SECONDS, ContainerRunner
-from .session import write_atomic_json, write_exclusive_json
+from .config import ContainerRunConfig, NativeBundle, read_run_config
+from .runner import INGEST_MARGIN_SECONDS
+from .session import authorize_config, read_bundle, write_atomic_json, write_exclusive_json
 
 DEFAULT_TEMPERATURES = (0.6, 0.8)
 DEFAULT_SEEDS = (42, 43, 44)
@@ -37,6 +37,8 @@ def add_sampling_commands(subparsers) -> None:
     command.add_argument("--policy", default="runtime-policy.json")
     command.add_argument("--capabilities-dir", default="artifacts/container-prep")
     command.add_argument("--image-bundle")
+    command.add_argument("--native-bundle", help="native-bundle.json from `prepare --runtime metal-native`; the "
+                                                 "config's native server pins must match (metal-native only)")
     command.add_argument("--plan-only", action="store_true", help="Persist an immutable plan without policy authorization or inference")
 
 
@@ -276,28 +278,61 @@ def _run_sampling(config: ContainerRunConfig, output: str | Path, *, temperature
     return report
 
 
+def _checked_bundle(args, config: ContainerRunConfig):
+    """The prepared bundle that pins ``config``, compared pin by pin; None when none was given.
+
+    Each runtime is pinned by its own kind of bundle (``--image-bundle`` for NVIDIA images, ``--native-bundle``
+    for a metal-native server), and the other kind is refused rather than silently not compared: an image bundle
+    has nothing to say about a native server, so comparing would find no disagreement and pass.
+    """
+    from .cli import check_image_bundle, check_native_bundle
+    image_path, native_path = args.image_bundle, getattr(args, "native_bundle", None)
+    if image_path and native_path:
+        raise ValueError("pass one bundle: --image-bundle (nvidia-container) or --native-bundle (metal-native)")
+    if not image_path and not native_path:
+        return None
+    bundle = read_bundle(native_path or image_path)
+    if native_path:
+        if not isinstance(bundle, NativeBundle):
+            raise ValueError(f"--native-bundle {native_path} is an image bundle (NVIDIA images)")
+        problems = check_native_bundle(config, bundle)
+        if problems:
+            raise ValueError("config native server differs from the prepared bundle: " + "; ".join(problems))
+        return bundle
+    if isinstance(bundle, NativeBundle):
+        raise ValueError(f"--image-bundle {image_path} is a native bundle; pass it as --native-bundle")
+    problems = check_image_bundle(config, bundle)
+    if problems:
+        raise ValueError("config images differ from the prepared bundle: " + "; ".join(problems))
+    return bundle
+
+
+def _default_runner(args):
+    """Dispatches on the config's runtime; an NVIDIA config gets exactly
+    ``ContainerRunner(capabilities_dir=..., policy_path=...)`` as before, built when its first attempt runs."""
+    from .runtime import DispatchRunner
+    return DispatchRunner(capabilities_dir=args.capabilities_dir, policy_path=args.policy)
+
+
 def main_sampling(args, *, runner_factory=None, clock=time.monotonic) -> int:
     started = clock()
     try:
         config = read_run_config(args.config)
-        bundle = read_image_bundle(args.image_bundle) if args.image_bundle else None
-        if bundle is not None:
-            from .cli import check_image_bundle
-            problems = check_image_bundle(config, bundle)
-            if problems:
-                raise ValueError("config images differ from the prepared bundle: " + "; ".join(problems))
+        bundle = _checked_bundle(args, config)
         runner = None
         if not args.plan_only:
             lock = SessionLock.read(args.policy)
-            for operation in ("container", "load", "inference"):
-                lock.check(operation, RunMode.LIVE)
-            runner = (runner_factory(args) if runner_factory else ContainerRunner(
-                capabilities_dir=args.capabilities_dir, policy_path=args.policy))
+            authorize_config(lock, config)  # the config's runtime decides; NVIDIA: container, load, inference
+            runner = runner_factory(args) if runner_factory else _default_runner(args)
+        provenance = {"policy": str(args.policy), "capabilities_dir": str(args.capabilities_dir),
+                      "image_bundle": None if bundle is None or isinstance(bundle, NativeBundle)
+                      else bundle.model_dump(mode="json")}
+        if isinstance(bundle, NativeBundle):  # a key of its own; an NVIDIA plan's provenance is unchanged
+            provenance["native_bundle"] = bundle.model_dump(mode="json")
         report = _run_sampling(config, args.output, temperatures=args.temperature, seeds=args.seed,
                                top_p=args.top_p, budget_seconds=args.budget_seconds, runner=runner,
                                plan_only=args.plan_only, clock=clock, started_clock=started,
-                               provenance={"policy": str(args.policy), "capabilities_dir": str(args.capabilities_dir),
-                                           "image_bundle": bundle.model_dump(mode="json") if bundle else None})
+                               provenance=provenance)
         print(json.dumps({"state": report["state"], "stop_reason": report["stop_reason"],
                           "attempts": len(report["attempts"]), "execution_performed": report["execution_performed"],
                           "output": str(args.output), "report": REPORT_NAME}, indent=2))

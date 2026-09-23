@@ -75,10 +75,11 @@ def _default_evaluator(config: ContainerRunConfig, context) -> dict:
     return run_evaluation(config, EvaluationContext(**fields))
 
 
-def _default_broker_factory(run_dir, config, session_lock, artifacts):
-    """The host coding broker, imported only when a run needs it."""
+def _default_broker_factory(run_dir, config, session_lock, artifacts, **namespace):
+    """The host coding broker, imported only when a run needs it. A native run passes its attempt and session
+    ids (`namespace`) because it has no Compose plan for the broker to read them from."""
     from ..coding.broker import HostBroker
-    return HostBroker.factory(run_dir, config, session_lock, artifacts)
+    return HostBroker.factory(run_dir, config, session_lock, artifacts, **namespace)
 
 
 def _default_http_factory(base_url: str, *, timeout: float):
@@ -156,13 +157,11 @@ class _Attempt:
         # Provisional grant from the stage bounds alone; the plan stage re-issues it from the measured remainder.
         self.grant = self._issue_grant(self.wall - config.bounds.cleanup_reserve_seconds
                                        - config.bounds.hash_seconds, 0.0) if self.container_mode else None
-        self.plan = build_compose_plan(config, run_dir, attempt_id=self.attempt_id, session_id=self.session_id,
-                                       grant=self.grant)
-        self.prefix = compose_prefix(self.plan.project_name, self.plan.compose_path)
+        self.plan, self.prefix = self._initial_plan()
         self.artifacts = RunArtifacts(run_dir, config.limits.max_artifact_bytes,
                                       terminal_reserve_bytes=min(262144, config.limits.max_artifact_bytes // 4))
         self.executor = runner.executor
-        self.lease = GpuLease(runner.lease_path, owner=f"container-run:{self.attempt_id}")
+        self.lease = GpuLease(runner.lease_path, owner=f"{self.LEASE_OWNER}:{self.attempt_id}")
         self.state, self.failure_stage, self.reasons, self.warnings = "completed", None, [], []
         self.deferred_reasons: list[str] = []  # secondary failure detail recorded after the primary reason
         self.stages: list[StageRecord] = []
@@ -176,6 +175,15 @@ class _Attempt:
         self.image_evidence, self.model_evidence, self.evaluation = {}, {}, None
         self.startup, self.settings, self.cleanup = {}, (), CleanupEvidence(verified=True)
         self.load_seconds = self.vram_after_load = self.ready_seconds = self.base_url = None
+
+    LEASE_OWNER = "container-run"
+    VERIFY_DETAIL = "startup log, load time and VRAM after load"
+
+    def _initial_plan(self):
+        """The inert plan built at construction: (plan, compose command prefix). The native runtime overrides it."""
+        plan = build_compose_plan(self.config, self.run_dir, attempt_id=self.attempt_id, session_id=self.session_id,
+                                  grant=self.grant)
+        return plan, compose_prefix(plan.project_name, plan.compose_path)
 
     # ---- bookkeeping -------------------------------------------------------------------------------------
     def _issue_grant(self, available: float, offset: float) -> ChildGrant:
@@ -326,8 +334,7 @@ class _Attempt:
         startup_deadline = min(self.work_deadline, self.clock() + bounds.startup_seconds)
         self._stage("start", self._start, deadline=startup_deadline)
         self._stage("ready", self._ready_from_logs if self.container_mode else self._ready, deadline=startup_deadline)
-        self._stage("verify", self._verify, bound=bounds.verify_seconds,
-                    detail="startup log, load time and VRAM after load")
+        self._stage("verify", self._verify, bound=bounds.verify_seconds, detail=self.VERIFY_DETAIL)
         if self.config.broker is not None:
             self._stage("broker", self._broker, bound=bounds.verify_seconds,
                         detail="host coding broker: spool directories and worker reconciliation")
@@ -545,6 +552,10 @@ class _Attempt:
         self.artifacts.write_json("verify.json", {"startup": self.startup, "ready_seconds": self.ready_seconds,
                                                   "telemetry": sample})
 
+    def _evaluation_context_extras(self) -> dict:
+        """Extra evaluation-context fields a runtime supplies (the native runtime: why coding cannot execute)."""
+        return {}
+
     def _broker(self) -> None:
         if self.container_mode:
             for name in ("requests", "results"):
@@ -563,7 +574,8 @@ class _Attempt:
                                   policy_path=self.runner.policy_path,
                                   artifacts=self.artifacts.scoped("evaluator"),  # One shared byte budget.
                                   coding_hook=self.runner.coding_hook,
-                                  coding_client=self.broker.direct_client() if self.broker is not None else None)
+                                  coding_client=self.broker.direct_client() if self.broker is not None else None,
+                                  **self._evaluation_context_extras())
         context.artifacts_dir.mkdir(parents=True, exist_ok=True)
         error = "evaluator did not return a dictionary"
         try:

@@ -178,3 +178,81 @@ def test_seed_group_never_averages_only_surviving_seeds(failed_seed_attempted):
     assert summaries[0]["measured_seeds"] == [42]
     assert summaries[0]["attempted_seeds"] == ([42, 43] if failed_seed_attempted else [42])
     assert summaries[1]["attempted_seeds"] == [] and summaries[1]["measured_seeds"] == []
+
+
+def _native_config_and_bundle(tmp_path):
+    from llmbench.containers.session import native_overlay
+    from test_containers_session import make_native_bundle
+    bundle = make_native_bundle()
+    config = tmp_path / "native-config.json"
+    config.write_text(json.dumps(native_overlay(json.loads(EXAMPLE.read_text(encoding="utf-8")), bundle)),
+                      encoding="utf-8")
+    path = tmp_path / "native-bundle.json"
+    path.write_text(bundle.model_dump_json(), encoding="utf-8")
+    return config, path
+
+
+def _sample_args(tmp_path, config, *, output="out", **overrides):
+    values = dict(config=str(config), output=str(tmp_path / output), temperature=[0.8], seed=[42], top_p=0.95,
+                  budget_seconds=10000.0, policy=str(tmp_path / "policy.json"), capabilities_dir="caps",
+                  image_bundle=None, native_bundle=None, plan_only=False)
+    return SimpleNamespace(**{**values, **overrides})
+
+
+def test_native_sampling_is_pinned_by_its_bundle_and_authorized_for_its_runtime(tmp_path, capsys):
+    from llmbench.containers.sampling import main_sampling
+    from test_containers_session import make_native_bundle
+    config, bundle = _native_config_and_bundle(tmp_path)
+    assert main_sampling(_sample_args(tmp_path, config, native_bundle=str(bundle), plan_only=True)) == 0
+    provenance = json.loads((tmp_path / "out" / "sampling-plan.json").read_text())["provenance"]
+    assert provenance["image_bundle"] is None and provenance["native_bundle"]["native_server"]["executable_sha256"] \
+        == "d" * 64
+    capsys.readouterr()
+    rebuilt = tmp_path / "rebuilt.json"
+    rebuilt.write_text(make_native_bundle(executable_sha256="0" * 64).model_dump_json(), encoding="utf-8")
+    for overrides, message in (({"native_bundle": str(rebuilt)}, "native_server.executable_sha256"),
+                               ({"image_bundle": str(bundle)}, "is a native bundle"),
+                               ({"image_bundle": str(bundle), "native_bundle": str(bundle)}, "pass one bundle")):
+        assert main_sampling(_sample_args(tmp_path, config, output="refused", plan_only=True, **overrides)) == 2
+        assert message in capsys.readouterr().err and not (tmp_path / "refused").exists()
+    # A live run needs native permission; the NVIDIA policy is refused before any runner or output exists.
+    (tmp_path / "policy.json").write_text(json.dumps({"allow_model_operations": True, "allow_inference": True,
+                                                      "allow_container_execution": True}), encoding="utf-8")
+    assert main_sampling(_sample_args(tmp_path, config, output="denied"),
+                         runner_factory=lambda args: pytest.fail("no runner without permission")) == 2
+    assert "native forbidden" in capsys.readouterr().err and not (tmp_path / "denied").exists()
+    (tmp_path / "policy.json").write_text(json.dumps({"allow_model_operations": True, "allow_inference": True,
+                                                      "allow_native_execution": True}), encoding="utf-8")
+    clock = Clock()
+    runner = Runner(clock, [("completed", True), ("completed", True)])
+    assert main_sampling(_sample_args(tmp_path, config, output="ran"), runner_factory=lambda args: runner,
+                         clock=clock) == 3  # fake results carry no evaluation: completed-with-unmeasured-attempts
+    assert [call[0].runtime for call in runner.calls] == ["metal-native", "metal-native"]
+
+
+def test_the_default_sampling_runner_dispatches_on_the_configs_runtime(tmp_path):
+    from llmbench.containers.runtime import DispatchRunner
+    from llmbench.containers.sampling import _default_runner
+    runner = _default_runner(SimpleNamespace(capabilities_dir="caps", policy="p.json"))
+    assert isinstance(runner, DispatchRunner) and runner.built == ()
+    assert (runner.capabilities_dir, runner.policy_path, runner.policy) == ("caps", "p.json", None)
+
+
+def test_nvidia_sampling_provenance_and_bundle_check_are_unchanged(tmp_path, capsys):
+    from llmbench.containers.sampling import main_sampling
+    from test_containers_session import make_bundle
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    bundle = make_bundle(raw["inference_image"]["image_id"].split(":")[1])
+    raw["inference_image"] = json.loads(bundle.inference.model_dump_json())
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(raw), encoding="utf-8")
+    path = tmp_path / "image-bundle.json"
+    path.write_text(bundle.model_dump_json(), encoding="utf-8")
+    assert main_sampling(_sample_args(tmp_path, config, image_bundle=str(path), plan_only=True)) == 0
+    provenance = json.loads((tmp_path / "out" / "sampling-plan.json").read_text())["provenance"]
+    assert set(provenance) == {"policy", "capabilities_dir", "image_bundle"}
+    assert provenance["image_bundle"]["inference"]["image_id"] == bundle.inference.image_id
+    other = tmp_path / "other.json"
+    other.write_text(make_bundle("2" * 64).model_dump_json(), encoding="utf-8")
+    assert main_sampling(_sample_args(tmp_path, config, output="x", image_bundle=str(other), plan_only=True)) == 2
+    assert "config images differ from the prepared bundle" in capsys.readouterr().err

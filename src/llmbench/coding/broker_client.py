@@ -4,7 +4,8 @@ Both clients submit ``CodingJobRequest`` files atomically and only ever accept a
 ``CodingJobResult`` whose ``request_sha256`` matches the content they submitted. Malformed, oversize or
 linked result files are ignored until the deadline; a well-formed result for other content is an integrity
 error. ``DirectClient`` drives ``HostBroker.tick`` itself, so host-process mode uses the identical
-validate-and-execute path through the private spool under the run directory.
+validate-and-execute path through the private spool under the run directory. ``UnavailableClient`` is what a
+host-process evaluation without a broker hands out instead of ``None``: it refuses every call.
 """
 
 from __future__ import annotations
@@ -34,6 +35,31 @@ EXECUTE_MARGIN_SECONDS = 120.0  # container start, result copy and verified remo
 
 class BrokerAborted(RuntimeError):
     """The ticked broker reports a campaign abort while a request is pending: no result will ever follow."""
+
+
+class ExecutionUnavailable(RuntimeError):
+    """No isolated worker is reachable from this evaluator; generated code runs in the worker or nowhere."""
+
+
+class UnavailableClient:
+    """Stand-in client for a host-process evaluation that has no broker: every operation refuses, loudly.
+
+    The coding hook reads ``client=None`` as "inside the evaluator container" and opens ``SpoolClient`` on
+    ``/spool/...``. On the host that path is not a broker's spool: requests would land in a directory nobody
+    validates (or another process owns) and the hook would wait out its whole budget for results that cannot
+    come. Handing the hook this object instead makes the first call (``namespace()``) fail with the reason, so the
+    coding rows stay in the denominator as harness errors and nothing is ever written or executed.
+    """
+
+    def __init__(self, reason: str, *, clock=time.monotonic) -> None:
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("an unavailable client needs the reason execution is unavailable")
+        self.reason, self.clock = reason, clock
+
+    def _refuse(self, *args: Any, **kwargs: Any) -> Any:
+        raise ExecutionUnavailable(self.reason)
+
+    namespace = submit = execute = poll = wait = _refuse
 
 
 class SpoolClient:

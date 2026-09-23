@@ -2,7 +2,8 @@
 
 The implementation prepares exact argv and ownership cleanup; no daemon is probed
 implicitly. Executors must bound timeout and combined output bytes. No host-code
-execution fallback is provided.
+execution fallback is provided. ``probe_docker_sandbox`` is the one explicit,
+read-only question "could a worker run here now?", asked with two fixed argv.
 """
 
 from __future__ import annotations
@@ -16,16 +17,24 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import Field
 
 from ..config import RunMode, StrictModel
-from ..safety import SessionLock
+from ..safety import OperationForbidden, SessionLock
 
 
 # Published atomically (write .pending, then rename) by the trusted drivers.
 RESULT_PATH = "/tmp/llmbench-result.json"
+# The sandbox probe's whole Docker vocabulary: the daemon's own platform, and one local image's identity and
+# platform by its content-addressed id. Both are reads; neither pulls, creates or starts anything.
+SERVER_PLATFORM_ARGV = ("docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}")
+IMAGE_PLATFORM_ARGV = ("docker", "image", "inspect", "--format", "{{.Id}} {{.Os}}/{{.Architecture}}")
+PROBE_TIMEOUT_SECONDS = 10
+PROBE_OUTPUT_BYTES = 4096
+_LOCAL_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+_OS_ARCH = re.compile(r"[a-z0-9]+/[a-z0-9_]+")
 
 
 class SandboxLimits(StrictModel):
@@ -56,6 +65,9 @@ class WorkerResult:
     result_read_stderr: bytes = b""
     result_read_attempts: int = 0
     result_read_truncated: bool = False
+    # False only when the Docker client itself was never spawned (CLI absent, or the spawn raised OSError): then
+    # no daemon was asked anything, so no container can exist. Every result from a process that ran keeps True.
+    launched: bool = True
 
 
 class BoundedExecutor(Protocol):
@@ -144,6 +156,11 @@ class BoundedProcessExecutor:
         elif (len(argv) == 5 and argv[1:4] == ("inspect", "--format", "{{.State.Running}}")
               and re.fullmatch(name_pattern, argv[4])):
             return
+        elif argv == SERVER_PLATFORM_ARGV:
+            return
+        elif len(argv) == 6 and argv[:5] == IMAGE_PLATFORM_ARGV and _LOCAL_IMAGE_ID.fullmatch(argv[5]):
+            # Only a content-addressed local id: a name or tag could resolve to a different image tomorrow.
+            return
         else:
             raise ValueError("Docker subcommand is outside the bounded worker vocabulary")
 
@@ -157,7 +174,7 @@ class BoundedProcessExecutor:
         if self.popen_factory is subprocess.Popen:
             executable = shutil.which("docker")
             if not executable:
-                return WorkerResult("environment-error", None, stderr=b"Docker CLI was not found")
+                return WorkerResult("environment-error", None, stderr=b"Docker CLI was not found", launched=False)
         kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                       shell=False, close_fds=True, bufsize=0)
         if os.name == "nt":
@@ -165,7 +182,8 @@ class BoundedProcessExecutor:
         try:
             process = self.popen_factory((executable, *argv[1:]), **kwargs)
         except OSError as exc:
-            return WorkerResult("environment-error", None, stderr=str(exc).encode("utf-8")[:max_output_bytes])
+            return WorkerResult("environment-error", None, stderr=str(exc).encode("utf-8")[:max_output_bytes],
+                                launched=False)
         chunks = [bytearray(), bytearray()]
         mutex, exceeded, read_error = threading.Lock(), threading.Event(), threading.Event()
 
@@ -291,11 +309,21 @@ class DockerWorker:
         read_status, read_code, read_stdout, read_stderr = None, None, b"", b""
         read_attempts, read_truncated = 0, False
         cleanup_confirmed, cleanup_error = False, None
+        never_launched = False
         try:
             deadline = time.monotonic() + job.limits.timeout_seconds
             result = self.executor.run(job.argv, timeout_seconds=min(10, job.limits.timeout_seconds) if job.collect_result
                                        else job.limits.timeout_seconds,
                                        max_output_bytes=job.limits.max_output_bytes)
+            if result.launched is False and result.returncode is None:
+                # The Docker client was never spawned, so no daemon ever received this `run`: a container of this
+                # fresh random name cannot exist, and there is nothing to remove or to query (the same missing CLI
+                # would make both fail, which today reads as "unverified" and aborts the whole campaign). This is
+                # unavailable infrastructure, reported as such. A client that did start and then lost the daemon
+                # keeps the full cleanup path below: that container's state is genuinely unknown.
+                never_launched = True
+                result = WorkerResult("sandbox-unavailable", None, b"", result.stderr[:job.limits.max_output_bytes],
+                                      launched=False)
             if len(result.stdout) + len(result.stderr) > job.limits.max_output_bytes:
                 result = WorkerResult("output-limit", result.returncode)
             if job.collect_result and result.status == "completed" and result.returncode == 0:
@@ -350,28 +378,151 @@ class DockerWorker:
                 elif logs.status == "output-limit":
                     result = WorkerResult("output-limit", result.returncode, logs.stdout, logs.stderr)
         finally:
-            # This exact random name is owned by the job. Never use docker prune/kill-all.
-            try:
-                self.session_lock.check("container", self.mode)
-                self.executor.run(("docker", "rm", "-f", job.name), timeout_seconds=10, max_output_bytes=4096)
-                # Removal may race auto-removal or return NotFound. Successful
-                # exact absence query is confirmation; an unavailable daemon is not.
-                absent = self.executor.run(("docker", "ps", "--all", "--filter", f"name=^/{job.name}$",
-                                            "--format", "{{.ID}}"), timeout_seconds=10, max_output_bytes=4096)
-                cleanup_confirmed = (absent.status == "completed" and absent.returncode == 0
-                                     and not absent.stdout.strip())
-                if not cleanup_confirmed:
-                    cleanup_error = "Owned container absence could not be verified"
-            except Exception as exc:
-                # Retain a collected result and diagnostics when cleanup itself
-                # fails. The caller persists them and aborts the entire campaign.
-                cleanup_error = type(exc).__name__ + ": " + str(exc)
+            if never_launched:
+                cleanup_confirmed = True  # proven by construction above: nothing was ever created
+            else:
+                # This exact random name is owned by the job. Never use docker prune/kill-all.
+                try:
+                    self.session_lock.check("container", self.mode)
+                    self.executor.run(("docker", "rm", "-f", job.name), timeout_seconds=10, max_output_bytes=4096)
+                    # Removal may race auto-removal or return NotFound. Successful
+                    # exact absence query is confirmation; an unavailable daemon is not.
+                    absent = self.executor.run(("docker", "ps", "--all", "--filter", f"name=^/{job.name}$",
+                                                "--format", "{{.ID}}"), timeout_seconds=10, max_output_bytes=4096)
+                    cleanup_confirmed = (absent.status == "completed" and absent.returncode == 0
+                                         and not absent.stdout.strip())
+                    if not cleanup_confirmed:
+                        cleanup_error = "Owned container absence could not be verified"
+                except Exception as exc:
+                    # Retain a collected result and diagnostics when cleanup itself
+                    # fails. The caller persists them and aborts the entire campaign.
+                    cleanup_error = type(exc).__name__ + ": " + str(exc)
         return WorkerResult(result.status, result.returncode, result.stdout, result.stderr,
                             cleanup_confirmed, result_bytes, cleanup_error,
                             result_read_status=read_status, result_read_returncode=read_code,
                             result_read_stdout=read_stdout, result_read_stderr=read_stderr,
-                            result_read_attempts=read_attempts, result_read_truncated=read_truncated)
+                            result_read_attempts=read_attempts, result_read_truncated=read_truncated,
+                            launched=not never_launched)
 
     def check_inference_authorized(self) -> None:
         """An outer coding agent must pass this independently before requesting a model."""
         self.session_lock.check("inference", self.mode)
+
+
+def _detail(result: WorkerResult) -> str:
+    """The Docker client's own words, bounded and on one line, for a blocked reason."""
+    text = (result.stderr.strip() or result.stdout.strip()).decode("utf-8", "replace")
+    return " ".join(text.split())[:300] or "no output"
+
+
+def _pinned_worker_image(image_ref: Any) -> tuple[str | None, str | None]:
+    """(local image id, pinned platform) of a worker ``ImageRef``, of a bare ``sha256:`` id, or ``(None, None)``."""
+    if image_ref is None:
+        return None, None
+    if isinstance(image_ref, str):
+        image_id, platform = image_ref, None
+    else:
+        if getattr(image_ref, "role", "worker") != "worker":
+            raise ValueError("the sandbox probe checks the sandbox worker image, not an inference or evaluator image")
+        image_id, platform = getattr(image_ref, "image_id", None), getattr(image_ref, "platform", None)
+    if type(image_id) is not str or not _LOCAL_IMAGE_ID.fullmatch(image_id):
+        raise ValueError("image_ref must be a worker ImageRef or a local sha256:<64 hex> image id")
+    return image_id, platform
+
+
+def inspect_local_image(executor: BoundedExecutor, image_id: str, *,
+                        timeout_seconds: int = PROBE_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """One exact ``docker image inspect`` of a LOCAL image by its content-addressed id; never pulls.
+
+    Returns ``{"present", "image_id", "platform", "detail", "status", "returncode", "launched"}``. ``present`` is
+    True only when the daemon answered for this very id with a readable ``os/arch``; the inspected platform is
+    what is recorded, never the one a caller intended to build. The client's status/exit/launch are returned so a
+    caller can tell "no such image" from "the daemon did not answer" from "no Docker client at all".
+    """
+    if type(image_id) is not str or not _LOCAL_IMAGE_ID.fullmatch(image_id):
+        raise ValueError("a local sha256:<64 hex> image id is required")
+    result = executor.run((*IMAGE_PLATFORM_ARGV, image_id), timeout_seconds=timeout_seconds,
+                          max_output_bytes=PROBE_OUTPUT_BYTES)
+    found = {"present": False, "image_id": None, "platform": None, "detail": None, "status": result.status,
+             "returncode": result.returncode, "launched": result.launched}
+    if result.status != "completed" or result.returncode != 0:
+        return {**found, "detail": _detail(result)}
+    fields = result.stdout.decode("utf-8", "replace").split()
+    if len(fields) != 2 or not _LOCAL_IMAGE_ID.fullmatch(fields[0]) or not _OS_ARCH.fullmatch(fields[1]):
+        return {**found, "detail": f"unreadable image inspection: {_detail(result)!r}"}
+    if fields[0] != image_id:
+        return {**found, "detail": f"the daemon answered for {fields[0]}, not {image_id}"}
+    return {**found, "present": True, "image_id": fields[0], "platform": fields[1]}
+
+
+def probe_docker_sandbox(*, session_lock: SessionLock, image_ref: Any = None,
+                         executor: BoundedExecutor | None = None) -> dict[str, Any]:
+    """Could a coding worker run here, now? ``{"status": "available" | "blocked", "reason", "blocked_by",
+    "docker_cli", "server_os_arch", "image_id", "image_platform"}``.
+
+    Generated code only ever runs inside the owned worker container, so where no worker can start the coding suites
+    are recorded as blocked (never run on the host instead). The probe is read-only by construction: at most the two
+    fixed reads ``SERVER_PLATFORM_ARGV`` and ``IMAGE_PLATFORM_ARGV + (id,)`` through the bounded executor (both
+    allowlisted there and nowhere else); it pulls, builds, creates and starts nothing, and never starts a daemon
+    (Colima or Docker Desktop stay as the user left them). Checks run in this order and the first failure is the
+    ``blocked_by`` value, with the client's own words in ``reason``:
+
+    1. ``policy``: the session lock allows container execution; checked before any process is spawned, so a policy
+       that forbids containers never even reaches the Docker client.
+    2. ``docker_cli``: ``docker`` resolves on PATH (for the real executor) and the client actually spawned.
+    3. ``daemon``: ``docker version`` answered with the server's ``os/arch`` within the bound.
+    4. ``worker_image``: a pinned worker image was given (None is blocked: the broker cannot run without one); the
+       daemon holds exactly that id; its inspected platform is the pinned one; and it is the daemon's own
+       ``os/arch``. A foreign-architecture worker is blocked rather than emulated: without binfmt emulation every
+       case would exit "exec format error" and read as a failed solution, and with it the per-case limits, set for
+       native execution, would time out correct answers. Either way a harness defect would score as a model 0.
+
+    "available" therefore means all four were observed just now, not assumed. An environment that says no is a
+    result, never an exception; only a malformed ``image_ref`` (a programming error) raises ``ValueError``.
+    ``docker_cli`` records where PATH resolves ``docker`` on this host even when an executor is injected.
+    """
+    image_id, pinned_platform = _pinned_worker_image(image_ref)
+    report: dict[str, Any] = {"status": "blocked", "reason": None, "blocked_by": None,
+                              "docker_cli": shutil.which("docker"), "server_os_arch": None, "image_id": None,
+                              "image_platform": None}
+
+    def blocked(check: str, reason: str) -> dict[str, Any]:
+        return {**report, "blocked_by": check, "reason": reason}
+
+    try:
+        session_lock.check("container", RunMode.LIVE)
+    except OperationForbidden as exc:
+        return blocked("policy", f"the session policy forbids container execution: {exc}")
+    if executor is None:
+        if report["docker_cli"] is None:
+            return blocked("docker_cli", "the Docker CLI was not found on PATH")
+        executor = BoundedProcessExecutor(session_lock=session_lock, mode=RunMode.LIVE)
+    server = executor.run(SERVER_PLATFORM_ARGV, timeout_seconds=PROBE_TIMEOUT_SECONDS,
+                          max_output_bytes=PROBE_OUTPUT_BYTES)
+    if server.launched is False:
+        return blocked("docker_cli", f"the Docker CLI could not be started: {_detail(server)}")
+    if server.status != "completed" or server.returncode != 0:
+        return blocked("daemon", f"the Docker daemon is unreachable ({server.status}, exit {server.returncode}): "
+                                 f"{_detail(server)}")
+    platform = server.stdout.decode("utf-8", "replace").strip()
+    if not _OS_ARCH.fullmatch(platform):
+        return blocked("daemon", f"the Docker daemon reported no server os/arch: {_detail(server)!r}")
+    report["server_os_arch"] = platform
+    if image_id is None:
+        return blocked("worker_image", "no pinned sandbox worker image is configured")
+    image = inspect_local_image(executor, image_id)
+    if image["launched"] is False:
+        return blocked("docker_cli", f"the Docker CLI could not be started: {image['detail']}")
+    if image["status"] != "completed":
+        return blocked("daemon", f"the Docker daemon did not answer the worker image inspection ({image['status']}): "
+                                 f"{image['detail']}")
+    if not image["present"]:
+        return blocked("worker_image", f"the pinned worker image {image_id} is not present locally "
+                                       f"(exit {image['returncode']}): {image['detail']}")
+    report.update(image_id=image["image_id"], image_platform=image["platform"])
+    if pinned_platform is not None and image["platform"] != pinned_platform:
+        return blocked("worker_image", f"the worker image is {image['platform']}, not its pinned {pinned_platform}")
+    if image["platform"] != platform:
+        return blocked("worker_image", f"the {image['platform']} worker image cannot run natively on the {platform} "
+                                       "Docker daemon; build the worker for the daemon's platform")
+    return {**report, "status": "available"}

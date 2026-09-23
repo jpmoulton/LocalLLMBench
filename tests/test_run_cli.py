@@ -1,4 +1,5 @@
 import json
+import os
 import runpy
 import subprocess
 from pathlib import Path
@@ -264,8 +265,16 @@ def test_candidate_image_bundle_mismatch_exits_two(capsys, tmp_path):
 
 
 def test_default_runner_is_constructed_inertly(tmp_path):
-    runner = cli._default_runner(SimpleNamespace(capabilities_dir=str(tmp_path), policy=str(tmp_path / "p.json")))
+    # The candidate runner dispatches on the config's runtime and builds nothing until a candidate arrives; the
+    # NVIDIA delegate it then builds is today's inert ContainerRunner, unchanged.
+    from llmbench.containers.config import read_run_config
+    from llmbench.containers.runner import ContainerRunner
+    dispatch = cli._default_runner(SimpleNamespace(capabilities_dir=str(tmp_path), policy=str(tmp_path / "p.json")))
+    assert dispatch.synthetic is False and dispatch.built == ()
+    runner = dispatch.runner_for(read_run_config(EXAMPLE))
+    assert type(runner) is ContainerRunner and dispatch.built == ("nvidia-container",)
     assert runner.synthetic is False and runner.executor is None and runner.policy_path == tmp_path / "p.json"
+    assert runner.capabilities_dir == tmp_path and runner.policy is None
 
 
 def test_run_py_is_a_thin_shim(capsys, monkeypatch):
@@ -576,3 +585,486 @@ def test_host_preflight_still_rejects_wrong_installed_registry_pin():
     host = ContainerRunConfig.model_validate_json(json.dumps(raw))
     with pytest.raises(ValueError, match="does not match the installed benchmark registry"):
         _default_registry_validator(host)
+
+
+# ---- runtimes: metal-native beside nvidia-container (the NVIDIA command lines above are unchanged) ---------------
+
+METAL_VERSION = ("version: 0.4.1-dev (build 11011, commit aa39d7a3e)\n"
+                 "built with AppleClang 21.0.0.21000101 for Darwin arm64\n")
+NATIVE_EXECUTABLE = "/Users/example/llama-b11011/llama-server"
+
+
+def metal_help() -> str:
+    """The b11011 macOS build's --help: the CUDA capture plus `--rpc SERVERS` (that build has GGML_RPC=ON)."""
+    lines = (DATA / "llama-server-help-b11011.txt").read_text(encoding="utf-8").splitlines(keepends=True)
+    at = next(index for index, line in enumerate(lines) if line.startswith("--list-devices")) + 1
+    rpc = ["--rpc SERVERS                           comma separated list of RPC servers (host:port)\n",
+           "                                        (env: LLAMA_ARG_RPC)\n"]
+    return "".join(lines[:at] + rpc + lines[at:])
+
+
+def metal_help_sha256() -> str:
+    from llmbench.containers.capabilities import help_sha256
+    return help_sha256(metal_help())
+
+
+@pytest.fixture
+def native_prep(tmp_path):
+    directory = tmp_path / "native-prep"
+    directory.mkdir()
+    (directory / "llama-server-help.txt").write_text(metal_help(), encoding="utf-8")
+    (directory / "llama-server-version.txt").write_text(METAL_VERSION, encoding="utf-8")
+    return directory
+
+
+def write_native_config(directory, name="native.json", **options):
+    from test_runtime_registry import native_raw
+    path = directory / name
+    path.write_text(json.dumps(native_raw(**options)), encoding="utf-8")
+    return path
+
+
+def native_bundle_for(config, *, worker=None, sandbox=None, libraries=None, **server_changes):
+    from llmbench.containers.config import NativeBundle
+    server = {**config.native_server.model_dump(mode="json"), **server_changes}
+    return NativeBundle.model_validate_json(json.dumps({
+        "prepared_utc": "2026-09-23T00:00:00+00:00", "native_server": server, "libraries": libraries or {},
+        "worker": worker, "help_sha256": server["help_sha256"], "registry_digest": "1" * 64,
+        "host": {"machine": "arm64", "chip": "Apple M1"},
+        "sandbox": sandbox or {"status": "blocked", "reason": "docker CLI not found"}}))
+
+
+def write_bundle(directory, name, bundle):
+    path = directory / name
+    path.write_text(bundle.model_dump_json(), encoding="utf-8")
+    return path
+
+
+def without_endpoint(argv) -> list[str]:
+    """An argv minus the four flags whose values legitimately differ between runtimes (and between configs)."""
+    items, tokens = [], iter(argv)
+    for token in tokens:
+        if token in ("--model", "--host", "--port", "--alias"):
+            next(tokens)
+            continue
+        items.append(token)
+    return items
+
+
+def test_validate_reports_a_native_configs_runtime_and_refuses_what_metal_cannot_honour(capsys, tmp_path):
+    from llmbench.containers.config import read_run_config
+    assert cli.main(["validate", "--config", str(EXAMPLE)]) == 0
+    assert list(output_of(capsys)) == ["valid", "label", "fingerprint", "alias", "execution_performed"]  # unchanged
+    path = write_native_config(tmp_path)
+    assert cli.main(["validate", "--config", str(path)]) == 0
+    data = output_of(capsys)
+    config = read_run_config(path)
+    assert data["valid"] is True and data["execution_performed"] is False and data["runtime"] == "metal-native"
+    assert data["fingerprint"] == config.fingerprint() and data["alias"] == config.alias()
+    assert data["required_operations"] == ["native", "load", "inference"] and data["unsupported_settings"] == []
+    assert [note.split(" ", 1)[0] for note in data["not_enforced_settings"]] == [
+        "limits.inference_memory_mib", "limits.inference_cpus", "limits.max_foreign_vram_mib"]
+    assert cli.main(["validate", "--config", str(path), "--runtime", "metal-native"]) == 0
+    capsys.readouterr()
+    # --runtime on a config command only confirms the config's own runtime.
+    for config_path, runtime in ((path, "nvidia-container"), (EXAMPLE, "metal-native")):
+        assert cli.main(["validate", "--config", str(config_path), "--runtime", runtime]) == 2
+        assert "disagrees with the config" in capsys.readouterr().err
+    second_gpu = write_native_config(tmp_path, "second-gpu.json", limits={"gpu_device_id": "1"})
+    assert cli.main(["validate", "--config", str(second_gpu)]) == 2
+    data = output_of(capsys)
+    assert data["valid"] is False and "MTL0" in data["unsupported_settings"][0]
+
+
+def test_capabilities_default_directory_follows_the_runtime_and_checks_the_native_pin(capsys, tmp_path, prep,
+                                                                                     native_prep, monkeypatch):
+    from llmbench.containers.config import read_run_config
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "artifacts").mkdir()
+    prep.rename(tmp_path / "artifacts" / "container-prep")
+    native_prep.rename(tmp_path / "artifacts" / "native-prep")
+    assert cli.main(["capabilities"]) == 0
+    nvidia = output_of(capsys)
+    assert list(nvidia) == ["flags", "help_sha256", "version", "build", "allowed_flags_missing",
+                            "execution_performed"]  # the NVIDIA default and output are unchanged
+    assert nvidia["help_sha256"] == read_run_config(EXAMPLE).help_sha256
+    assert cli.main(["capabilities", "--runtime", "metal-native"]) == 0
+    metal = output_of(capsys)
+    assert metal["runtime"] == "metal-native" and metal["capabilities_dir"] == "artifacts/native-prep"
+    assert metal["help_sha256"] == metal_help_sha256() != nvidia["help_sha256"]
+    assert metal["flags"] == nvidia["flags"] + 1 and metal["build"] == "b11011-aa39d7a3e"
+    assert metal["allowed_flags_missing"] == []
+    pinned = write_native_config(tmp_path, help_sha256=metal_help_sha256())
+    assert cli.main(["capabilities", "--config", str(pinned)]) == 0  # the config's runtime picks the directory
+    data = output_of(capsys)
+    assert data["help_sha256_matches"] is True and data["findings"] == [] and data["unsupported_settings"] == []
+    # The CUDA capture is not this server's help, and the native pin says so.
+    assert cli.main(["capabilities", "--config", str(pinned), "--capabilities-dir", "artifacts/container-prep"]) == 2
+    assert output_of(capsys)["help_sha256_matches"] is False
+    assert cli.main(["capabilities", "--config", str(EXAMPLE)]) == 0
+    assert output_of(capsys)["help_sha256_matches"] is True
+    assert cli.main(["capabilities", "--config", str(pinned), "--runtime", "nvidia-container"]) == 2
+    assert "disagrees" in capsys.readouterr().err
+
+
+def test_plan_for_a_native_config_is_the_loopback_argv_with_identical_settings_and_no_compose(capsys, tmp_path,
+                                                                                             prep, native_prep,
+                                                                                             monkeypatch):
+    from llmbench.containers.config import read_run_config
+    from llmbench.containers.plan import build_server_argv
+    monkeypatch.chdir(tmp_path)
+    path = write_native_config(tmp_path, help_sha256=metal_help_sha256())
+    before = sorted(item.name for item in tmp_path.iterdir())
+    assert cli.main(["plan", "--config", str(path), "--capabilities-dir", str(native_prep)]) == 0
+    data = output_of(capsys)
+    config = read_run_config(path)
+    assert "compose" not in data and data["execution_performed"] is False and data["runtime"] == "metal-native"
+    assert data["executable"] == NATIVE_EXECUTABLE and data["fingerprint"] == config.fingerprint()
+    argv = data["server_argv"]
+    assert argv[:6] == ["--model", config.model.host_path, "--host", "127.0.0.1", "--port", "0"]
+    assert argv[argv.index("--alias") + 1] == config.alias()
+    # Every setting flag is the one the NVIDIA container gets for the same engine settings.
+    assert without_endpoint(argv) == without_endpoint(build_server_argv(read_run_config(EXAMPLE)))
+    assert data["required_operations"] == ["native", "load", "inference"] and len(data["not_enforced_settings"]) == 3
+    assert sorted(item.name for item in tmp_path.iterdir()) == before  # pure: nothing written
+    # The saved help must be this server's own, exactly as for NVIDIA.
+    assert cli.main(["plan", "--config", str(path), "--capabilities-dir", str(prep)]) == 2
+    assert "help_sha256" in capsys.readouterr().err
+    second_gpu = write_native_config(tmp_path, "second-gpu.json", help_sha256=metal_help_sha256(),
+                                     limits={"gpu_device_id": "1"})
+    assert cli.main(["plan", "--config", str(second_gpu), "--capabilities-dir", str(native_prep)]) == 2
+    assert "MTL0" in output_of(capsys)["unsupported_settings"][0]
+
+
+CANDIDATE_KEYS = ["state", "synthetic", "attempt_id", "failure_stage", "failure_reasons", "warnings",
+                  "cleanup_verified", "abort_campaign", "elapsed_seconds", "effective_settings_verified",
+                  "actual_context_verified", "minimum_native_tps", "samples_total", "reports", "output"]
+
+
+def test_candidate_dispatches_a_native_config_and_pins_it_to_its_own_bundle_kind(capsys, tmp_path):
+    from llmbench.containers.config import read_run_config
+    path = write_native_config(tmp_path)
+    config = read_run_config(path)
+    memory = {"kind": "apple-unified", "server_phys_footprint_mib": 1905}
+    seen = []
+
+    class Runner:
+        def run(self, config, output, *, remaining_budget_seconds=None):
+            seen.append(("run", config.runtime, output))
+            return SimpleNamespace(
+                state="completed", synthetic=True, attempt_id="a" * 32, failure_stage=None, failure_reasons=(),
+                warnings=(), cleanup=SimpleNamespace(verified=True), abort_campaign=False, elapsed_seconds=1.0,
+                effective_settings_verified=True, actual_context_verified=True, speed={}, samples_total=0,
+                model_dump=lambda mode: {"reports": {}, **({"memory": memory} if config.runtime != "nvidia-container"
+                                                             else {})})
+
+    def factory(args):
+        seen.append(("args", args))
+        return Runner()
+
+    def runs():
+        return sum(1 for row in seen if row[0] == "run")
+    arguments = ["candidate", "--config", str(path), "--output", str(tmp_path / "out")]
+    matching = write_bundle(tmp_path, "native-bundle.json", native_bundle_for(config))
+    assert cli.main([*arguments, "--native-bundle", str(matching)], runner_factory=factory) == 0
+    data = output_of(capsys)
+    assert list(data) == [*CANDIDATE_KEYS, "runtime", "memory"]
+    assert data["runtime"] == "metal-native" and data["memory"] == memory
+    args = seen[0][1]
+    assert args.capabilities_dir == "artifacts/native-prep" and args.native_bundle == str(matching)
+    assert seen[1] == ("run", "metal-native", str(tmp_path / "out"))
+    # Each identity pin must be the prepared one; a refusal happens before any runner exists.
+    for field, value in (("executable_sha256", "1" * 64), ("libraries_sha256", "2" * 64),
+                         ("build_info", "b11012-0123456"), ("help_sha256", "3" * 64)):
+        bundle = write_bundle(tmp_path, f"{field}.json", native_bundle_for(config, **{field: value}))
+        assert cli.main([*arguments, "--native-bundle", str(bundle)], runner_factory=factory) == 2
+        assert f"native_server.{field}" in capsys.readouterr().err
+    # Where the executable lives on this host, and its display source, are not identity.
+    moved = write_bundle(tmp_path, "moved.json", native_bundle_for(config, executable="/opt/llama/llama-server",
+                                                                   source="rebuilt elsewhere"))
+    assert cli.main([*arguments, "--native-bundle", str(moved)], runner_factory=factory) == 0
+    capsys.readouterr()
+    # A worker image the config names must be the bundle's.
+    worker = {"role": "worker", "reference": "sha256:" + "4" * 64, "image_id": "sha256:" + "4" * 64,
+              "platform": "linux/arm64", "entrypoint": ["/usr/local/bin/llmbench-worker"]}
+    with_worker = write_native_config(tmp_path, "with-worker.json", worker_image=worker)
+    assert cli.main(["candidate", "--config", str(with_worker), "--output", str(tmp_path / "w"), "--native-bundle",
+                     str(matching)], runner_factory=factory) == 2
+    assert "worker: the bundle carries no worker image" in capsys.readouterr().err
+    assert runs() == 2
+    # Each runtime is pinned only by its own bundle kind: the other kind is refused, never silently not compared.
+    image_bundle = write_bundle(tmp_path, "image-bundle.json", bundle_for(read_run_config(EXAMPLE)))
+    assert cli.main([*arguments, "--image-bundle", str(image_bundle)], runner_factory=factory) == 2
+    assert "--native-bundle" in capsys.readouterr().err
+    assert cli.main(["candidate", "--config", str(EXAMPLE), "--output", str(tmp_path / "n"), "--native-bundle",
+                     str(matching)], runner_factory=factory) == 2
+    assert "use --image-bundle" in capsys.readouterr().err
+    # A capabilities directory means nothing to the native runner, so naming one is refused rather than ignored.
+    assert cli.main([*arguments, "--capabilities-dir", "artifacts/native-prep"], runner_factory=factory) == 2
+    assert "does not apply to a metal-native candidate" in capsys.readouterr().err
+    unsupported = write_native_config(tmp_path, "second-gpu.json", limits={"gpu_device_id": "1"})
+    assert cli.main(["candidate", "--config", str(unsupported), "--output", str(tmp_path / "u")],
+                    runner_factory=factory) == 2
+    err = capsys.readouterr().err
+    assert "cannot honour" in err and "MTL0" in err
+    assert cli.main([*arguments, "--runtime", "nvidia-container"], runner_factory=factory) == 2
+    assert runs() == 2
+    # The NVIDIA candidate output keeps exactly its keys, and its default capabilities directory.
+    assert cli.main(["candidate", "--config", str(EXAMPLE), "--output", str(tmp_path / "nv")],
+                    runner_factory=factory) == 0
+    assert list(output_of(capsys)) == CANDIDATE_KEYS
+    assert seen[-2][1].capabilities_dir == "artifacts/container-prep" and seen[-2][1].native_bundle is None
+
+
+def test_bundle_checks_never_compare_across_runtimes():
+    from llmbench.containers.config import read_run_config
+    from test_runtime_registry import native_config
+    nvidia, native = read_run_config(EXAMPLE), native_config()
+    image, pinned = bundle_for(nvidia), native_bundle_for(native)
+    assert cli.check_image_bundle(nvidia, image) == [] == cli.check_bundle(nvidia, image)
+    assert cli.check_native_bundle(native, pinned) == [] == cli.check_bundle(native, pinned)
+    # An image bundle has nothing to compare for a native config; that is a problem, not a pass (sampling and the
+    # prepared sweep call check_image_bundle).
+    [problem] = cli.check_image_bundle(native, image)
+    assert problem.startswith("runtime: the config runs metal-native") and "native-bundle.json" in problem
+    assert cli.check_bundle(nvidia, pinned) == [
+        "runtime: the config runs nvidia-container; a native bundle pins only metal-native candidates"]
+
+
+def test_prepare_native_is_gated_by_the_native_policy_and_keeps_the_nvidia_command_line(capsys, tmp_path,
+                                                                                         monkeypatch):
+    import sys
+    import types
+    from llmbench.containers.config import read_run_config
+    from test_runtime_registry import native_config
+    worker = {"role": "worker", "reference": "sha256:" + "4" * 64, "image_id": "sha256:" + "4" * 64,
+              "platform": "linux/arm64", "entrypoint": ["/usr/local/bin/llmbench-worker"]}
+    bundle = native_bundle_for(native_config(), worker=worker, sandbox={"status": "available", "reason": None})
+    seen = []
+
+    def preparer(args):
+        seen.append(args)
+        return bundle
+    output = tmp_path / "native-prep"
+    base = ["prepare", "--runtime", "metal-native", "--llama-server", NATIVE_EXECUTABLE, "--output", str(output)]
+    assert cli.main(base, preparer=preparer) == 0
+    assert output_of(capsys) == {
+        "execution_performed": True, "runtime": "metal-native", "output": str(output),
+        "executable": NATIVE_EXECUTABLE, "native_server": "e" * 64, "libraries_sha256": "f" * 64,
+        "build_info": "b11011-aa39d7a3e", "worker": "sha256:" + "4" * 64, "worker_platform": "linux/arm64",
+        "sandbox": "available", "sandbox_reason": None, "help_sha256": "a" * 64, "registry_digest": "1" * 64,
+        "prepared_utc": "2026-09-23T00:00:00+00:00"}
+    assert seen[0].llama_server == NATIVE_EXECUTABLE and seen[0].inference is None and seen[0].worker_iidfile is None
+    # Requiredness follows the runtime, and a flag of the other runtime is refused, both the argparse way.
+    for argv in (["prepare", "--runtime", "metal-native", "--output", str(output)],
+                 [*base, "--inference", INFERENCE_REF], [*base, "--evaluator-base", BASE_REF],
+                 [*base, "--wheel", "localllmbench.whl"], [*base, "--lock", "requirements.linux.lock"],
+                 ["prepare", "--inference", INFERENCE_REF, "--evaluator-base", BASE_REF, "--llama-server",
+                  NATIVE_EXECUTABLE, "--output", str(output)],
+                 ["prepare", "--runtime", "nvidia-container", "--inference", INFERENCE_REF, "--output", str(output)],
+                 ["prepare", "--evaluator-base", BASE_REF, "--output", str(output)]):
+        with pytest.raises(SystemExit) as refused:
+            cli.main(argv, preparer=preparer)
+        assert refused.value.code == 2
+    assert "the following arguments are required: --inference" in capsys.readouterr().err
+    assert len(seen) == 1
+    # A preparer that hands back an NVIDIA bundle for a native prepare is refused, not summarised.
+    assert cli.main(base, preparer=lambda args: bundle_for(read_run_config(EXAMPLE))) == 2
+    assert "not a NativeBundle" in capsys.readouterr().err
+    # The default preparer checks the native permission before native_prep (which runs the executable) is used.
+    calls = []
+
+    def prepare_native(executable, output, *, session_lock, worker_iidfile=None, **options):
+        calls.append((executable, output, session_lock, worker_iidfile, options))
+        return bundle
+    fake = types.ModuleType("llmbench.containers.native_prep")
+    fake.prepare_native = prepare_native
+    monkeypatch.setitem(sys.modules, "llmbench.containers.native_prep", fake)
+    container_only = tmp_path / "container-policy.json"
+    container_only.write_text(json.dumps({"allow_container_execution": True, "allow_model_operations": True,
+                                          "allow_inference": True}), encoding="utf-8")
+    assert cli.main([*base, "--policy", str(container_only)]) == 2
+    assert "native forbidden" in capsys.readouterr().err and calls == [] and not output.exists()
+    native_policy = tmp_path / "native-policy.json"
+    native_policy.write_text(json.dumps({"allow_native_execution": True}), encoding="utf-8")
+    assert cli.main([*base, "--policy", str(native_policy), "--worker-iidfile", "worker-image.id"]) == 0
+    assert output_of(capsys)["worker"] == "sha256:" + "4" * 64
+    [(executable, destination, lock, iidfile, options)] = calls
+    assert executable == Path(NATIVE_EXECUTABLE) and destination == output and iidfile == "worker-image.id"
+    assert lock.allow_native_execution is True and lock.allow_container_execution is False and options == {}
+
+
+def test_tune_forwards_the_native_runtime_to_the_plan_and_the_session(capsys, tmp_path, monkeypatch):
+    from llmbench.containers import derive, session as session_module
+    from llmbench.containers.config import read_native_bundle
+    from test_runtime_registry import native_config
+    plans, tunes = [], []
+
+    def fake_plan(model, **options):
+        plans.append(options)
+        return {"dataset_root_source": "none", "dataset_root": None}
+
+    def fake_tune(args, **options):
+        tunes.append(args)
+        return 0
+    monkeypatch.setattr(derive, "benchmark_plan_for_model", fake_plan)
+    monkeypatch.setattr(derive, "benchmark_plan_lines", lambda plan: ["plan line"])
+    monkeypatch.setattr(session_module, "main_tune", fake_tune)
+    bundle_path = write_bundle(tmp_path, "native-bundle.json", native_bundle_for(native_config()))
+    common = ["tune", "--model", str(tmp_path / "weights"), "--output", str(tmp_path / "s"), "--base-config",
+              str(EXAMPLE)]
+    assert cli.main([*common, "--runtime", "metal-native", "--native-bundle", str(bundle_path)]) == 0
+    err = capsys.readouterr().err
+    assert ("llmbench tune: runtime metal-native: llama-server eeeeeeeeeeee (b11011-aa39d7a3e); coding sandbox "
+            "blocked (docker CLI not found)") in err and "llmbench tune: plan line" in err
+    # The plan sees the bundle exactly as the derivation will; the session reads both flags from args.
+    assert plans[0]["native_bundle"] == read_native_bundle(bundle_path)
+    assert tunes[0].runtime == "metal-native" and tunes[0].native_bundle == str(bundle_path)
+    # NVIDIA: the plan gets exactly the arguments it always did, and the session sees no runtime.
+    assert cli.main(common) == 0
+    assert set(plans[1]) == {"base", "budget_seconds", "context_floor", "context_ceiling", "dataset_root"}
+    assert tunes[1].runtime is None and tunes[1].native_bundle is None
+    assert "runtime metal-native" not in capsys.readouterr().err
+    # Both flags are explicit and refused, before any plan or session, when they contradict each other.
+    for extra, message in ((["--runtime", "metal-native"], "requires --native-bundle"),
+                           (["--native-bundle", str(bundle_path)], "add --runtime metal-native"),
+                           (["--runtime", "nvidia-container", "--native-bundle", str(bundle_path)], "add --runtime"),
+                           (["--runtime", "metal-native", "--native-bundle", str(bundle_path), "--image-bundle",
+                             "image-bundle.json"], "--image-bundle pins container images"),
+                           (["--runtime", "metal-native", "--native-bundle", str(tmp_path / "absent.json")],
+                            "absent.json")):
+        assert cli.main([*common, *extra]) == 2
+        assert message in capsys.readouterr().err
+    assert len(plans) == 2 and len(tunes) == 2
+    # A --config session already states its runtime and pins, like --context-floor and --dataset-root.
+    for extra in (["--runtime", "metal-native"], ["--runtime", "nvidia-container"], ["--native-bundle",
+                                                                                    str(bundle_path)]):
+        assert cli.main(["tune", "--config", str(tmp_path / "session.json"), "--output", str(tmp_path / "s2"),
+                         *extra]) == 2
+        assert "--runtime/--native-bundle" in capsys.readouterr().err
+    assert len(tunes) == 2
+
+
+def test_doctor_reports_static_runtime_facts_without_running_anything(capsys, tmp_path, monkeypatch,
+                                                                     isolated_gpu_lock):
+    import platform
+    import shutil
+    from llmbench.containers.config import RUNTIMES
+    looked_up = []
+    monkeypatch.setattr(shutil, "which", lambda name, *args, **kwargs: looked_up.append(name))
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"allow_native_execution": True}), encoding="utf-8")
+    doctor = ["doctor", "--policy", str(policy)]
+    assert cli.main(doctor) == 0
+    data = output_of(capsys)
+    facts = data["runtime"]
+    assert data["server_contacted"] is False and data["model_operations_performed"] is False
+    assert facts["execution_performed"] is False and facts["native_bundle"] is None
+    assert data["session_policy"]["allow_native_execution"] is True
+    assert facts["system"] == platform.system() and facts["machine"] == platform.machine()
+    assert facts["docker_cli"] is None and looked_up == ["docker"]
+    if hasattr(os, "sysconf"):
+        assert type(facts["memory_total_bytes"]) is int and facts["memory_total_bytes"] > 0
+    lease = isolated_gpu_lock / "llmbench-gpu-resource.lock"
+    assert facts["lease"] == {"path": str(lease), "exists": False, "holder": None}
+    assert list(facts["runtimes"]) == list(RUNTIMES)
+    assert facts["runtimes"]["metal-native"]["memory_kind"] == "apple-unified"
+    # A held lease is named, with the native advice when a native run holds it.
+    lease.write_text(json.dumps({"pid": os.getpid(), "owner": "native-run:abc", "runtime": "metal-native",
+                                 "server_pid": os.getpid()}), encoding="utf-8")
+    assert cli.main(doctor) == 0
+    facts = output_of(capsys)["runtime"]
+    assert facts["lease"]["exists"] is True and f"its llama-server is pid {os.getpid()}" in facts["lease"]["holder"]
+    assert lease.exists()  # doctor describes a lock; it never removes one
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a native server is pinned by a POSIX absolute path; metal-native is "
+                                            "macOS-only")
+def test_doctor_checks_a_native_bundle_by_the_runners_own_rule_without_running_it(capsys, tmp_path,
+                                                                                  isolated_gpu_lock):
+    import hashlib
+    from llmbench.config import canonical_json
+    from llmbench.containers.native_prep import hash_native_server
+    from test_runtime_registry import native_config
+
+    def sha(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+    install = tmp_path / "llama-b11011"
+    install.mkdir()
+    executable = install / "llama-server"
+    executable.write_bytes(b"\xcf\xfa\xed\xfe llama-server b11011")
+    (install / "libggml-metal.0.dylib").write_bytes(b"metal backend")
+    (install / "libllama.0.dylib").write_bytes(b"llama")
+    (install / "libllama.dylib").symlink_to("libllama.0.dylib")  # a release's soname link, inside the directory
+    (install / "llama-cli").write_bytes(b"not a library, never part of the pin")
+    libraries = {"libggml-metal.0.dylib": sha(b"metal backend"), "libllama.0.dylib": sha(b"llama"),
+                 "libllama.dylib": sha(b"llama")}
+    libraries_sha256 = sha(canonical_json(libraries).encode("utf-8"))
+    bundle = native_bundle_for(native_config(), executable=str(executable),
+                               executable_sha256=sha(executable.read_bytes()), libraries=libraries,
+                               libraries_sha256=libraries_sha256)
+    bundle_path = write_bundle(tmp_path, "native-bundle.json", bundle)
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"allow_native_execution": True}), encoding="utf-8")
+    doctor = ["doctor", "--policy", str(policy)]
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert state["executable_exists"] is True and state["executable_sha256_matches"] is True
+    assert state["libraries"] == {"libggml-metal.0.dylib": "matches", "libllama.0.dylib": "matches",
+                                  "libllama.dylib": "matches"}
+    assert state["libraries_match"] is True and state["sandbox"] == "blocked"
+    # The set digest is the native runner's own admission comparison, computed by the same rule.
+    assert state["libraries_sha256_observed"] == libraries_sha256 == hash_native_server(executable)["libraries_sha256"]
+    assert state["libraries_sha256_matches"] is True
+    # A rebuilt Metal backend is a different server even when the executable is unchanged.
+    (install / "libggml-metal.0.dylib").write_bytes(b"another metal backend")
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    facts = output_of(capsys)["runtime"]
+    assert facts["native_bundle"]["executable_sha256_matches"] is True
+    assert facts["native_bundle"]["libraries"]["libggml-metal.0.dylib"] == "differs"
+    assert facts["native_bundle"]["libraries_match"] is False
+    assert facts["native_bundle"]["libraries_sha256_matches"] is False
+    # A library added beside the server changes what dyld can load and what the runner pins: it is never
+    # overlooked just because the bundle did not list it.
+    (install / "libggml-metal.0.dylib").write_bytes(b"metal backend")
+    (install / "libggml-blas.0.dylib").write_bytes(b"planted")
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert state["libraries"] == {"libggml-blas.0.dylib": "not in the bundle", "libggml-metal.0.dylib": "matches",
+                                  "libllama.0.dylib": "matches", "libllama.dylib": "matches"}
+    assert state["libraries_match"] is False and state["libraries_sha256_matches"] is False
+    assert state["libraries_sha256_observed"] == hash_native_server(executable)["libraries_sha256"]
+    (install / "libggml-blas.0.dylib").unlink()
+    # A library link may point only inside the directory, as the runner requires; elsewhere it is not followed.
+    outside = tmp_path / "outside.dylib"
+    outside.write_bytes(b"llama")
+    (install / "libllama.0.dylib").unlink()
+    (install / "libllama.0.dylib").symlink_to(outside)
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert "outside the executable's directory" in state["libraries"]["libllama.0.dylib"]
+    assert state["libraries_match"] is False and state["libraries_sha256_matches"] is None
+    (install / "libllama.0.dylib").unlink()
+    (install / "libllama.0.dylib").write_bytes(b"llama")
+    # The runner pins a regular executable, never a link that could be repointed; the same bytes behind a link
+    # are reported, not matched.
+    real = install / "llama-server.real"
+    executable.rename(real)
+    executable.symlink_to(real)
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert state["executable_sha256_matches"] is None and "never a link" in state["executable_problem"]
+    executable.unlink()
+    real.unlink()
+    assert cli.main([*doctor, "--native-bundle", str(bundle_path)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert state["executable_exists"] is False and state["executable_sha256_matches"] is None
+    assert state["executable_problem"] == "missing"
+    # A library name that is not a plain file name is never opened.
+    escaping = write_bundle(tmp_path, "escaping.json", native_bundle_for(
+        native_config(), executable=str(executable), libraries={"../outside.dylib": "0" * 64}))
+    assert cli.main([*doctor, "--native-bundle", str(escaping)]) == 0
+    state = output_of(capsys)["runtime"]["native_bundle"]
+    assert state["libraries"]["../outside.dylib"] == "invalid name; not read"
+    assert state["libraries_match"] is False
+    assert cli.main([*doctor, "--native-bundle", str(tmp_path / "absent.json")]) == 2

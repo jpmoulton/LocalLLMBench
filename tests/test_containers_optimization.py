@@ -75,3 +75,44 @@ def test_screening_is_nested_and_tiny_budget_refused_before_work(tmp_path):
         "generation": session.base.generation.model_copy(update={"temperature": 0.6})})})
     with pytest.raises(ValueError, match="use sample"):
         optimization_plan(stochastic)
+
+
+def test_optimize_authorizes_the_sessions_own_runtime_and_dispatches_its_runner(tmp_path):
+    """A native session needs native permission, not container permission, and each stage's runner dispatches on
+    the candidates' runtime; an NVIDIA policy is refused before the output directory exists."""
+    from llmbench.containers.optimization import optimize
+    from llmbench.containers.runtime import DispatchRunner
+    from llmbench.containers.session import ContainerSessionConfig, policy_for
+    from llmbench.safety import OperationForbidden
+    from test_containers_session import make_native_bundle, native_session
+    bundle_path = tmp_path / "native-bundle.json"
+    bundle_path.write_text(make_native_bundle().model_dump_json(), encoding="utf-8")
+    raw = json.loads(native_session(tmp_path / "s", budgets={"wall_seconds": 14400}).model_dump_json())
+    raw["image_bundle"] = str(bundle_path)
+    session = ContainerSessionConfig.model_validate_json(json.dumps(raw))
+    policies = {}
+    for name, grants in (("nvidia", {"allow_container_execution": True}), ("mac", {"allow_native_execution": True})):
+        policies[name] = tmp_path / f"{name}.json"
+        policies[name].write_text(json.dumps({"allow_model_operations": True, "allow_inference": True, **grants}),
+                                  encoding="utf-8")
+    with pytest.raises(OperationForbidden, match="native"):
+        optimize(session, tmp_path / "refused", policy_path=policies["nvidia"], max_combinations=0,
+                 tune_fn=lambda *a, **k: pytest.fail("no stage may start"))
+    assert not (tmp_path / "refused").exists()
+    stages = []
+
+    def fake_tune(stage, output, *, runner, session_lock, bundle, bundle_path):
+        stages.append({"stage": stage, "runner": runner, "bundle": bundle, "bundle_path": bundle_path})
+        return {"stop_reason": "complete", "summary": {"abort_campaign": False},
+                "report": {"rows": [], "recommendation": None}, "campaign": {"results": []}}
+    report = optimize(session, tmp_path / "out", policy_path=policies["mac"], capabilities_dir="caps",
+                      max_combinations=0, tune_fn=fake_tune)
+    assert report["state"] == "completed"
+    assert [item["stage"].session_id.rsplit("-", 1)[-1] for item in stages] == ["screen", "confirm"]
+    for item in stages:
+        runner = item["runner"]
+        assert isinstance(runner, DispatchRunner) and runner.built == ()
+        assert (runner.capabilities_dir, runner.policy_path) == ("caps", policies["mac"])
+        assert runner.policy == policy_for(item["stage"])
+        assert item["bundle"].native_server.executable_sha256 == "d" * 64 and item["bundle_path"] == str(bundle_path)
+        assert item["stage"].base.runtime == "metal-native"

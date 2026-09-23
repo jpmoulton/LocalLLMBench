@@ -389,3 +389,147 @@ def test_result_coercion_is_not_accepted_as_terminal_evidence(prepared):
     write(path / "result.json", result)
     with pytest.raises(ValueError):
         sweep.terminal(entry, 0)
+
+
+# ---- metal-native runtime -------------------------------------------------------------------------------------
+
+NVIDIA_IDENTITY_KEYS = {"plan_sha256", "bundle_sha256", "runtime_sha256", "source_snapshot_sha256", "configs"}
+NVIDIA_TERMINAL_KEYS = {"status", "returncode", "result_state", "result_sha256", "cleanup_verified", "attempt_id",
+                        "failure_reasons"}
+
+
+@pytest.fixture
+def native_prepared(prepared):
+    """The same two-entry plan, for the metal-native runtime: a native config pinned by a native bundle."""
+    from llmbench.containers.session import native_overlay
+    from test_containers_session import make_native_bundle
+    path, plan = prepared
+    base = path.parent
+    config = json.loads((base / "config.json").read_text())
+    write(base / "native-config.json", native_overlay(config, make_native_bundle()))
+    write(base / "native-bundle.json", json.loads(make_native_bundle().model_dump_json()))
+    plan = {**{key: value for key, value in plan.items() if key != "image_bundle"},
+            "inference_runtime": "metal-native", "native_bundle": "native-bundle.json",
+            "entries": [{**entry, "config": "native-config.json"} for entry in plan["entries"]]}
+    write(path, plan)
+    return path, plan
+
+
+def native_result(entry, *, attempted=True, server_exit="signal=SIGTERM", remaining=(), state="completed"):
+    return ContainerRunResult(
+        session_id="session", attempt_id="attempt", config_fingerprint=entry["config_fingerprint"],
+        project_name="llmbench-attempt", state=state, synthetic=False, started_utc="start", finished_utc="finish",
+        elapsed_seconds=1, budget_charged_seconds=1, runtime="metal-native",
+        cleanup={"attempted": attempted, "verified": True, "server_exit": server_exit,
+                 "processes_remaining": remaining},
+        abort_campaign=False, failure_reasons=() if state == "completed" else ("rejected at admission",))
+
+
+class NativeProcess(FakeProcess):
+    def wait(self, timeout):
+        self.waits.append(timeout)
+        self.output.mkdir()
+        write(self.output / "result.json", native_result(self.entry).model_dump(mode="json"))
+        self.done = True
+        return 0
+
+
+def test_a_native_plan_is_pinned_by_its_native_bundle_and_launches_with_it(native_prepared):
+    plan = sweep.read_plan(native_prepared[0])
+    assert plan["inference_runtime"] == "metal-native" and plan["image_bundle"] is None
+    assert plan["identity"]["inference_runtime"] == "metal-native"
+    argv = sweep.candidate_command(plan, plan["entries"][0])
+    assert argv[argv.index("--native-bundle") + 1] == plan["native_bundle"] and "--image-bundle" not in argv
+    children = []
+    assert sweep.run_plan(plan, process_guard=lambda: None,
+                          popen=lambda argv, **kwargs: NativeProcess(argv, children, **kwargs)) == 0
+    saved = state(native_prepared)["entries"]
+    assert [item["status"] for item in saved.values()] == ["completed", "completed"]
+    assert {item["server_exit"] for item in saved.values()} == {"signal=SIGTERM"}
+    assert all("--native-bundle" in child.argv for child in children)
+
+
+def test_the_check_report_names_the_runtime_only_for_a_native_plan(prepared, monkeypatch, capsys):
+    """``--check`` prints exactly the keys it always printed for an NVIDIA plan; a native plan adds its runtime."""
+    monkeypatch.setattr(sweep, "run_plan", lambda *a, **k: pytest.fail("must not launch"))
+    assert sweep.main(["--plan", str(prepared[0])]) == 0
+    assert set(json.loads(capsys.readouterr().out)) == {"mode", "plan_id", "entries", "total_candidate_budget_seconds",
+                                                        "identity", "metadata", "min_free_disk_gib"}
+    from llmbench.containers.session import native_overlay
+    from test_containers_session import make_native_bundle
+    base, plan = prepared[0].parent, json.loads(prepared[0].read_text())
+    write(base / "native-config.json", native_overlay(json.loads((base / "config.json").read_text()),
+                                                      make_native_bundle()))
+    write(base / "native-bundle.json", json.loads(make_native_bundle().model_dump_json()))
+    write(prepared[0], {**{key: value for key, value in plan.items() if key != "image_bundle"},
+                        "inference_runtime": "metal-native", "native_bundle": "native-bundle.json",
+                        "entries": [{**entry, "config": "native-config.json"} for entry in plan["entries"]]})
+    assert sweep.main(["--plan", str(prepared[0])]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["inference_runtime"] == "metal-native" and report["identity"]["inference_runtime"] == "metal-native"
+    assert not (base / ".sweep-test-sweep").exists()
+
+
+def test_an_nvidia_plan_keeps_its_identity_argv_and_terminal_keys(prepared):
+    plan = sweep.read_plan(prepared[0])
+    assert set(plan["identity"]) == NVIDIA_IDENTITY_KEYS and plan["inference_runtime"] == "nvidia-container"
+    argv = sweep.candidate_command(plan, plan["entries"][0])
+    assert argv[-2:] == ["--image-bundle", plan["image_bundle"]] and "--native-bundle" not in argv
+    entry = plan["entries"][0]
+    Path(entry["output"]).mkdir()
+    write(Path(entry["output"]) / "result.json", result_for(entry).model_dump(mode="json"))
+    assert set(sweep.terminal(entry, 0)) == NVIDIA_TERMINAL_KEYS
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"image_bundle": "bundle.json"}, "takes no image_bundle"),
+    ({"native_bundle": None}, "requires native_bundle"),
+    ({"inference_runtime": "rocm-container"}, "inference_runtime must be one of"),
+])
+def test_a_native_plan_takes_exactly_its_own_bundle(native_prepared, change, message):
+    plan = {**native_prepared[1], **change}
+    plan = {key: value for key, value in plan.items() if value is not None}
+    write(native_prepared[0], plan)
+    with pytest.raises(ValueError, match=message):
+        sweep.read_plan(native_prepared[0])
+
+
+def test_configs_must_run_the_plans_runtime_and_match_its_pins(prepared, native_prepared):
+    path, plan = native_prepared
+    write(path, {**plan, "entries": [{**entry, "config": "config.json"} for entry in plan["entries"]]})
+    with pytest.raises(ValueError, match="runs nvidia-container but the plan's inference_runtime is metal-native"):
+        sweep.read_plan(path)
+    nvidia = {key: value for key, value in plan.items() if key not in ("inference_runtime", "native_bundle")}
+    write(path, {**nvidia, "image_bundle": "bundle.json"})  # the native config under an NVIDIA plan
+    with pytest.raises(ValueError, match="runs metal-native but the plan's inference_runtime is nvidia-container"):
+        sweep.read_plan(path)
+    write(path, {**nvidia, "image_bundle": "bundle.json", "native_bundle": "native-bundle.json"})
+    with pytest.raises(ValueError, match="takes no native_bundle"):
+        sweep.read_plan(path)
+    from test_containers_session import make_native_bundle
+    write(path, plan)
+    write(path.parent / "native-bundle.json",
+          json.loads(make_native_bundle(libraries_sha256="9" * 64).model_dump_json()))  # a rebuilt llama-server
+    with pytest.raises(ValueError, match="native bundle mismatch: native_server.libraries_sha256"):
+        sweep.read_plan(path)
+
+
+def test_native_terminal_evidence_must_prove_the_server_stopped(native_prepared):
+    entry = sweep.read_plan(native_prepared[0])["entries"][0]
+    output = Path(entry["output"])
+    output.mkdir()
+
+    def judged(**change):
+        write(output / "result.json", native_result(entry, **change).model_dump(mode="json"))
+        return sweep.terminal(entry, 0 if change.get("state", "completed") == "completed" else 3)
+
+    accepted = judged()
+    assert accepted["status"] == "completed" and accepted["server_exit"] == "signal=SIGTERM"
+    assert accepted["runtime"] == "metal-native"
+    with pytest.raises(ValueError, match="cleanup is uncertain"):  # an owned server process is still there
+        judged(remaining=("pid:4242",))
+    with pytest.raises(ValueError, match="how its llama-server exited"):  # started, but its exit is unproven
+        judged(server_exit=None)
+    # Refused at admission: no server was ever started, so there is no exit to record.
+    rejected = judged(attempted=False, server_exit=None, state="rejected")
+    assert rejected["status"] == "failed" and rejected["server_exit"] is None

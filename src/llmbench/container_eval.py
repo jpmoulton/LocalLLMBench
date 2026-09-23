@@ -3,7 +3,9 @@
 Order: attach+readback -> count-route check -> overflow probe -> warmups (labelled, charged)
 -> speed repetitions -> Inspect selections -> coding -> public benchmarks. The host runner owns
 the server's lifecycle; this module only attaches to it. Every selected task stays in the
-denominator on error or timeout.
+denominator on error or timeout. A host runner without a usable Docker sandbox says so through
+``execution_unavailable_reason``: the suites that execute generated code are then never started and
+their tasks are recorded, before attach, as ``environment_error`` naming that reason.
 """
 
 from __future__ import annotations
@@ -49,6 +51,10 @@ class EvaluationContext:
     grant_seconds: float | None = None  # the typed child grant this deadline was derived from, if any
     sleep: Callable[[float], None] = time.sleep
     dataset_root: str | Path = BENCHMARK_DATASET_ROOT  # where the evaluator image baked the pinned corpora
+    # Set by a host runner whose sandbox probe found no usable Docker worker (e.g. a Mac without Colima). The
+    # execution suites (every registry entry that requires the coding broker) are then never started: no coding
+    # hook call, no adapter run, one environment_error row per declared task naming this reason. None = no claim.
+    execution_unavailable_reason: str | None = None
 
 
 def wait_ready(backend_or_transport: Any, *, deadline: float, clock: Callable[[], float] = time.monotonic,
@@ -568,6 +574,51 @@ def _coding_hook(ctx: EvaluationContext, config: Any) -> Any:
     return run_coding_benchmarks
 
 
+def _coding_client(ctx: EvaluationContext) -> Any:
+    """The ``client`` the coding hook is handed.
+
+    ``None`` means "resolve the evaluator container's /spool client", so it is passed only on the container path.
+    On the host a missing broker client becomes a client that refuses every call: an injected hook that fell back
+    to ``/spool`` would write requests where no broker reads them and wait out the budget.
+    """
+    if ctx.coding_client is not None or ctx.allow_remote:
+        return ctx.coding_client
+    from .coding.broker_client import UnavailableClient
+    return UnavailableClient("host-process evaluation has no coding broker client; the container /spool is not "
+                             "a broker here and generated code is never executed on the host")
+
+
+def _execution_block(ctx: EvaluationContext, config: Any, registry: Any,
+                     expected_rows: list[dict[str, Any]]) -> tuple[frozenset[str], list[dict[str, Any]],
+                                                                    list[dict[str, Any]]]:
+    """(blocked suite ids, their benchmark records, their backfilled rows) for ``execution_unavailable_reason``.
+
+    The execution suites are read off the registry (every entry that requires the coding broker), so a future
+    code-executing suite is blocked with the others instead of silently running without its worker. The decision is
+    made before the server is contacted and recorded at once, so every later exit path (attach failure, timeout,
+    abort) keeps the named reason instead of the generic "quality stage did not run".
+    """
+    reason = ctx.execution_unavailable_reason
+    if reason is None:
+        return frozenset(), [], []
+    if type(reason) is not str or not reason.strip():
+        raise ValueError("execution_unavailable_reason must be None or a nonempty string")
+    from .registry import BROKER
+    execution = {entry.benchmark_id for entry in registry.entries if BROKER in entry.requires}
+    blocked = frozenset(_suite_of(selection) for selection in config.benchmarks) & execution
+    text = "sandbox_unavailable: " + " ".join(reason.split())[:500]
+    records = []
+    for selection in config.benchmarks:
+        if _suite_of(selection) in blocked:
+            declared = len(selection.task_ids)
+            records.append({"benchmark_id": _suite_of(selection), "revision": selection.revision,
+                            "split": selection.split, "declared": declared, "produced": 0,
+                            "status": "environment_error", "reason": text, "problems": [], "backfilled": declared,
+                            "execution_client": False})
+    rows = _missing_rows([row for row in expected_rows if row.get("suite") in blocked], [], "environment_error", text)
+    return blocked, records, rows
+
+
 def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any = None) -> dict[str, Any]:
     lock = ctx.session_lock or SessionLock.read(ctx.policy_path)
     lock.check("inference", RunMode.LIVE)  # before registry work, clients, discovery or artifacts
@@ -603,12 +654,15 @@ def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any 
     from .evaluations.selection import build_selected_cases, expected_task_rows
     from .measurement import build_speed_input
 
-    artifacts = ctx.artifacts or _default_artifacts(ctx.artifacts_dir, config.limits.max_artifact_bytes)
     expected_rows = expected_task_rows(config.benchmarks)
-    result: dict[str, Any] = {"samples": [], "speed_observations": [], "readback": None, "count_route": None,
-                              "overflow_probe": None, "actual_context_verified": False, "abort_reason": None,
-                              "errors": [], "warmups": [], "native_timings": [], "tokenizer_verified": False,
-                              "inspect_logs": [], "stages": [], "benchmarks": []}
+    # Validated before any artifact exists: a malformed claim refuses the run instead of being half-applied.
+    blocked, blocked_records, blocked_rows = _execution_block(ctx, config, registry, expected_rows)
+    artifacts = ctx.artifacts or _default_artifacts(ctx.artifacts_dir, config.limits.max_artifact_bytes)
+    result: dict[str, Any] = {"samples": list(blocked_rows), "speed_observations": [], "readback": None,
+                              "count_route": None, "overflow_probe": None, "actual_context_verified": False,
+                              "abort_reason": None, "errors": [], "warmups": [], "native_timings": [],
+                              "tokenizer_verified": False, "inspect_logs": [], "stages": [],
+                              "benchmarks": list(blocked_records)}
     passthrough = (OperationDenied, OperationForbidden, KeyboardInterrupt, SystemExit)
     request_timeout = float(config.bounds.request_timeout_seconds)
 
@@ -820,7 +874,8 @@ def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any 
                     result["inspect_logs"] = output["logs"]
                 if evidence.abort_reason:
                     result["abort_reason"] = evidence.abort_reason
-            coding_hook = _coding_hook(ctx, config)
+            # A blocked sandbox means the hook is never called: its rows were recorded before attach.
+            coding_hook = None if "coding" in blocked else _coding_hook(ctx, config)
             if coding_hook is not None and not result["abort_reason"]:
                 # LIVE-007: the coding stage owns its raw sink. Handing it the quality callback published the
                 # first coding request into a trace file whose ``with`` block had already closed, and the run
@@ -840,13 +895,15 @@ def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any 
                         n_ctx_slot=n_ctx, save=save_coding,
                         overflow_policy="reject-overflow-no-shift" if overflow_passed else "unknown")
                     rows = coding_hook(config, _Guarded(coding_evidence, check), remaining, artifacts, lock,
-                                       client=ctx.coding_client)
+                                       client=_coding_client(ctx))
                     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
                         raise TypeError("the coding hook must return a list of sample dictionaries")
                     result["samples"].extend(rows)
                     if coding_evidence.abort_reason:
                         result["abort_reason"] = coding_evidence.abort_reason
-            if namespaced and not result["abort_reason"]:
+            # A blocked execution suite's adapter is never run (its rows and record exist since before attach).
+            runnable = [(selection, entry) for selection, entry in namespaced if entry.benchmark_id not in blocked]
+            if runnable and not result["abort_reason"]:
                 # LIVE-007 again, in a third stage: every public benchmark gets its OWN trace sink and
                 # its OWN completion callback, both opened here. Nothing below may publish through the
                 # quality or coding sinks - those ``with`` blocks have already closed.
@@ -855,7 +912,7 @@ def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any 
                                 "tokenizer_id": tokenizer_id, "template_id": template_id,
                                 "tokenizer_verified": result["tokenizer_verified"]}
                     worker_client = _execution_client(ctx)
-                    for selection, entry in namespaced:
+                    for selection, entry in runnable:
                         _run_one_benchmark(selection, entry, adapters.get(entry.benchmark_id), result,
                                            ctx=ctx, artifacts=artifacts, backend=backend, alias=alias,
                                            lock=lock, n_ctx=n_ctx, overflow_passed=overflow_passed,

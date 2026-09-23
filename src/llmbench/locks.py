@@ -48,11 +48,56 @@ def process_alive(pid: int) -> bool | None:
     return True
 
 
+def _native_holder(holder: dict) -> tuple[bool, int | None]:
+    """Whether the holder is a metal-native run, and the llama-server pid it recorded (None when it recorded none).
+
+    A native run's leftover is a host process, not a container, so pointing at ``docker ps`` would send the reader
+    to the wrong place. The holder says so itself: ``runtime: "metal-native"``, or the ``native-run:`` owner the
+    native runner's lease is written with. Lock files written before runtimes existed carry neither and are
+    described exactly as before.
+    """
+    owner = holder.get("owner")
+    native = holder.get("runtime") == "metal-native" or (isinstance(owner, str) and owner.startswith("native-run:"))
+    server = holder.get("server_pid")
+    return native, server if native and type(server) is int and server > 0 else None
+
+
+def _native_leftover(server_pid: int | None) -> str:
+    """What to check before deleting a stale native lock: the llama-server it started, by pid when recorded."""
+    if server_pid is None:
+        return ("Check that no llama-server it started is still running (`pgrep -fl llama-server`), then delete "
+                "the file")
+    alive = process_alive(server_pid)
+    if alive is False:
+        return (f"Its llama-server, pid {server_pid}, is gone too (`ps -p {server_pid}` confirms it); delete the "
+                "file")
+    if alive:
+        return (f"Its llama-server pid {server_pid} still exists (a reused pid can belong to an unrelated process): "
+                f"check it with `ps -p {server_pid}` and stop it only if it is that llama-server, then delete the file")
+    return f"Check that its llama-server, pid {server_pid}, is gone (`ps -p {server_pid}`), then delete the file"
+
+
+MAX_HOLDER_BYTES = 4096
+
+
+def _read_holder(target: Path) -> bytes:
+    """The first ``MAX_HOLDER_BYTES`` of a lock file, and never more.
+
+    A lock lives in the shared temp directory and ``doctor`` describes it whenever it exists, so whatever sits at
+    that path is read bounded and non-blocking: a FIFO reads as empty instead of hanging, and a link to
+    ``/dev/zero`` or a huge file costs one bounded read, not all of it."""
+    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        return os.read(descriptor, MAX_HOLDER_BYTES)
+    finally:
+        os.close(descriptor)
+
+
 def describe_lock(path: str | Path) -> str:
     """One sentence for an error message: the holder, whether it is still running, and what to do about it."""
     target = Path(path)
     try:
-        holder = json.loads(target.read_bytes()[:4096].decode("utf-8"))
+        holder = json.loads(_read_holder(target).decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         holder = None
     if not isinstance(holder, dict) or type(holder.get("pid")) is not int:
@@ -61,9 +106,13 @@ def describe_lock(path: str | Path) -> str:
     pid, alive = holder["pid"], process_alive(holder["pid"])
     who = f"pid {pid}" + (f" ({holder['owner']})" if isinstance(holder.get("owner"), str) else "")
     since = f", created {holder['created']}" if isinstance(holder.get("created"), str) else ""
+    native, server_pid = _native_holder(holder)
     if alive is False:
-        return (f"{target} is held by {who}{since}, which is no longer running: the lock is stale. Check that no "
-                f"container was left behind (`docker ps -a --filter name=llmbench-`), then delete the file")
+        leftover = (_native_leftover(server_pid) if native else
+                    "Check that no container was left behind (`docker ps -a --filter name=llmbench-`), then delete "
+                    "the file")
+        return f"{target} is held by {who}{since}, which is no longer running: the lock is stale. {leftover}"
     state = "is still running" if alive else "could not be checked"
+    server = f"; its llama-server is pid {server_pid}" if server_pid is not None else ""
     return (f"{target} is held by {who}{since}, which {state} (a reused pid can belong to an unrelated process); "
-            "one GPU workload runs at a time - wait for it, or stop that run first")
+            f"one GPU workload runs at a time - wait for it, or stop that run first{server}")

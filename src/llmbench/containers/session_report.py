@@ -3,29 +3,66 @@
 Built only from the Store (attempt states, sealed evidence, samples, copied container results) and the
 controller's analysed campaign dictionary. Nothing here loads a model or changes a server. All model and
 runtime text is escaped before it reaches HTML.
+
+Two runtimes can produce the rows (``config.RUNTIMES``), and their memory numbers are different physical
+quantities: an NVIDIA container's ``VRAM MiB`` is the card's dedicated memory in use after load, while a
+``metal-native`` server shares ONE pool with the CPU and every other application on an Apple Silicon Mac. The
+unified-memory columns are therefore separate columns, appended after the NVIDIA ones and never merged into
+``VRAM MiB``: they print ``-`` on an NVIDIA row, ``VRAM MiB`` prints ``-`` on a Metal row, and
+``UNIFIED_MEMORY_NOTE`` says what each one measures whenever a Metal row is present.
 """
 
 from __future__ import annotations
 
 import html
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
 
 from ..config import ExperimentManifest, canonical_json
-from .config import kv_placement_reading
+from .config import DEFAULT_RUNTIME, RUNTIMES, kv_placement_reading
 
 CATEGORIES = ("coding", "tools", "retrieval")
+# The runtime and unified-memory columns are APPENDED: every existing column keeps its name and position, so a
+# reader (or a script) indexing the NVIDIA table finds exactly what it found before runtimes existed.
 COLUMNS = ("label", "quantization", "ctx", "input_requested", "input_actual", "kv", "kv_placement", "gpu_layers",
            "flash_attn", "speculation", "reasoning", "batch_ubatch", "state", "tps_min", "tps_median", "tps_max",
            "prefill_tps", "ttft_s", "load_s", "vram_mib", "tools", "retrieval", "coding",
            "first_attempt_vs_repaired", "context_verified", "settings_verified", "eligibility_reasons", "holdout",
-           "artifact_dir")
+           "artifact_dir", "runtime", "server_footprint_mib", "metal_mib", "swap_growth_mib", "power")
 HEADERS = ("Label", "Quant", "Ctx allocation", "Input requested", "Input measured", "K/V", "KV placement",
            "GPU layers", "Flash", "Spec", "Reasoning", "Batch/ubatch", "State", "tok/s min", "tok/s median",
            "tok/s max", "Prefill tok/s", "TTFT s", "Load s", "VRAM MiB", "Tools", "Retrieval", "Coding",
-           "First/repaired", "Context ok", "Settings ok", "Eligibility reasons", "Holdout", "Artifact dir")
+           "First/repaired", "Context ok", "Settings ok", "Eligibility reasons", "Holdout", "Artifact dir",
+           "Runtime", "Server footprint MiB (unified)", "Metal buffers MiB", "Swap growth MiB", "Power")
+NATIVE_RUNTIME = "metal-native"
+UNIFIED_KIND = "apple-unified"
+MIB = 1024 * 1024
+# Columns read from a metal-native result's `memory` block. "-" on every NVIDIA row: those numbers do not exist
+# for a container, and a VRAM figure is never copied into them (nor they into `VRAM MiB`).
+UNIFIED_COLUMNS = ("server_footprint_mib", "metal_mib", "swap_growth_mib", "power")
+# macOS kern.memorystatus_vm_pressure_level values (libdispatch levels); any other value is printed as a number.
+PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
+# The Coding (and First/repaired) cell of a Metal row whose own sandbox probe found no usable Docker worker. Its
+# coding rows are backfilled `environment_error`s that the denominator rule scores 0.0; printed as a score, that
+# zero would read as a model that cannot code when it is a harness that could not run the code.
+SANDBOX_BLOCKED = "blocked (sandbox unavailable)"
+UNIFIED_MEMORY_NOTE = (
+    "Apple Silicon (`metal-native` rows): memory is ONE physical pool shared by the CPU, the GPU and every other "
+    "application. `KV placement` `gpu`/`ram` there means Metal buffers versus CPU buffers in that same memory, not "
+    "two memories, and a RAM-offloaded configuration is bounded by the host, not by `limits.inference_memory_mib` "
+    "(a Docker cgroup limit a host process does not have). `Server footprint MiB (unified)` is the llama-server "
+    "process's phys_footprint after load (what Activity Monitor calls Memory), which INCLUDES its Metal "
+    "allocations; `Metal buffers MiB` is the model, KV, compute and recurrent buffers the server logged on the "
+    "Metal device. Swap is host-wide and includes other applications, so `Swap growth MiB` (from the admission "
+    "sample taken before the load, or the watchdog's first sample when that one had no swap reading, to the "
+    "highest sample during evaluation) may not be the server's doing. "
+    "`Power` is the power source when the model had loaded; a Mac on battery may run slower than on AC. "
+    "`VRAM MiB` is NVIDIA-only and reads `-` on these rows: a unified-memory footprint is never VRAM and is "
+    f"never compared with it. `Coding` reads `{SANDBOX_BLOCKED}` when the candidate's Docker sandbox probe "
+    "failed: its code-executing rows were backfilled as environment errors, not answered.")
 # Whole-token columns: "-" when nothing was measured, never a formatted float and never a silent zero.
 TOKEN_COLUMNS = ("input_requested", "input_actual")
 # An "Input measured" cell that the analysis did not verify carries this marker, so a fallback count can never be
@@ -247,6 +284,100 @@ def _coding_text(samples: list[dict]) -> str:
     return f"{first} first-attempt / {max(0, passed - first)} repaired / {len(coding)} attempted"
 
 
+def _real(value) -> float | None:
+    """A finite number, or None. Booleans are not numbers here, and neither is a string that looks like one: a
+    report never parses a figure out of text."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _mib_from_bytes(value) -> float | None:
+    number = _real(value)
+    return None if number is None else round(number / MIB, 1)
+
+
+def power_text(power) -> str | None:
+    """A `pmset -g batt` reading as a short label: ``battery 73%``, ``battery`` (no percentage), ``AC``, or the
+    source label pmset printed for anything else (a UPS). None when the sample carried no reading, never a guess:
+    an unreadable power source is not "AC"."""
+    if not isinstance(power, dict):
+        return None
+    source, percent = power.get("power_source"), power.get("battery_percent")
+    if source == "battery":
+        return f"battery {percent}%" if type(percent) is int else "battery"
+    if source == "ac":
+        return "AC"
+    label = power.get("power_source_label")
+    return str(label) if isinstance(label, str) and label.strip() else None
+
+
+def pressure_text(level) -> str | None:
+    if isinstance(level, bool) or not isinstance(level, int):
+        return None
+    return f"{level} ({PRESSURE_LEVELS[level]})" if level in PRESSURE_LEVELS else str(level)
+
+
+def unified_memory_evidence(memory) -> dict:
+    """The unified-memory figures of a metal-native result's ``memory`` block, each labelled for what it is.
+
+    Reads the block ``native.NativeRunner`` seals (kind ``apple-unified``): ``after_load`` (one labelled sample
+    taken once the model had loaded), ``server_log`` (the Metal buffers and working-set budget the server printed)
+    and ``during_evaluation`` (the memory watchdog's summary). Every value is None when that part was never
+    measured -- a run that failed before the load has no footprint, and a run whose watchdog never started has no
+    swap growth -- and a block of any other kind (an NVIDIA result carries none) yields only Nones. Nothing is
+    derived from anything else: a missing footprint is not estimated from the Metal buffers, and a missing swap
+    growth is not zero.
+    """
+    fields = {"server_footprint_mib": None, "server_rss_mib": None, "server_footprint_peak_mib": None,
+              "metal_mib": None, "metal_budget_mib": None, "host_available_mib": None,
+              "min_host_available_mib": None, "swap_used_mib": None, "swap_growth_mib": None,
+              "pressure_level": None, "max_pressure_level": None, "power": None, "watchdog_violations": None,
+              "coding_sandbox_status": None, "coding_sandbox_reason": None}
+    if not isinstance(memory, dict) or memory.get("kind") != UNIFIED_KIND:
+        return fields
+    after, log, during, sandbox = (memory.get(key) if isinstance(memory.get(key), dict) else {}
+                                   for key in ("after_load", "server_log", "during_evaluation", "coding_sandbox"))
+    violations = during.get("violations")
+    fields.update(
+        server_footprint_mib=_real(after.get("server_phys_footprint_mib")),
+        server_rss_mib=_real(after.get("server_rss_mib")),
+        server_footprint_peak_mib=_mib_from_bytes(during.get("peak_phys_footprint_bytes")),
+        metal_mib=_real(log.get("metal_resident_mib")), metal_budget_mib=_real(log.get("metal_budget_mib")),
+        host_available_mib=_real(after.get("host_memory_available_mib")),
+        min_host_available_mib=_mib_from_bytes(during.get("min_available_bytes")),
+        swap_used_mib=_real(after.get("swap_used_mib")),
+        swap_growth_mib=_mib_from_bytes(during.get("swap_growth_bytes")),
+        pressure_level=after.get("memory_pressure_level") if type(after.get("memory_pressure_level")) is int
+        else None,
+        max_pressure_level=during.get("max_pressure_level") if type(during.get("max_pressure_level")) is int
+        else None,
+        power=power_text(after.get("power")),
+        watchdog_violations=None if not isinstance(violations, (list, tuple)) else [
+            str(item.get("reason") or item.get("kind") or "unexplained violation") for item in violations
+            if isinstance(item, dict)],
+        coding_sandbox_status=sandbox.get("status") if isinstance(sandbox.get("status"), str) else None,
+        coding_sandbox_reason=sandbox.get("reason") if isinstance(sandbox.get("reason"), str) else None)
+    return fields
+
+
+def attempt_runtime(result: dict, manifest: ExperimentManifest) -> str:
+    """What served the attempt, from evidence first.
+
+    A result the attempt produced says so itself: a metal-native result carries ``"runtime": "metal-native"``,
+    and a container result omits the key, which is exactly how the default runtime is serialised. An attempt that
+    produced no result (cancelled before the runner wrote one) falls back to the manifest it was pinned by, whose
+    ``runtime_revision`` carries ``session.METAL_REVISION_PREFIX`` for a Metal candidate. A value outside
+    ``RUNTIMES`` is printed as unknown, never mapped to the default.
+    """
+    if result:
+        runtime = result.get("runtime", DEFAULT_RUNTIME)
+        return runtime if runtime in RUNTIMES else f"unknown ({runtime})"
+    from .session import METAL_REVISION_PREFIX
+    metal = manifest.backend.runtime_revision.startswith(METAL_REVISION_PREFIX)
+    return NATIVE_RUNTIME if metal else DEFAULT_RUNTIME
+
+
 def attempt_row(store, attempt: dict, analysis_row: dict | None) -> dict:
     """One report row for one Store attempt, including failed, rejected, timeout and holdout attempts."""
     record = store.results(attempt["id"])
@@ -287,6 +418,15 @@ def attempt_row(store, attempt: dict, analysis_row: dict | None) -> dict:
     settings_ok = (analysis_row or evidence or {}).get("effective_settings_verified") is True
     accounting = (analysis_row or {}).get("context_accounting") or {}
     measured_min, measured_max, fill_verified = _measured_input_tokens(record["samples"], accounting)
+    runtime = attempt_runtime(result, manifest)
+    # Only a Metal row reads the unified-memory block; an NVIDIA row keeps "-" there whatever its result holds.
+    unified = unified_memory_evidence(result.get("memory")) if runtime == NATIVE_RUNTIME else None
+    memory_columns = {column: (unified or {}).get(column) for column in UNIFIED_COLUMNS}
+    # ...and a Metal row never carries a VRAM figure, whatever its result holds: there is no dedicated VRAM to
+    # have measured, so a stray number there would be something else printed under the NVIDIA heading.
+    vram = None if runtime == NATIVE_RUNTIME else result.get("vram_used_mib_after_load")
+    blocked = unified is not None and unified["coding_sandbox_status"] not in (None, "available")
+    failed = not str(state).startswith("completed")
     return {"attempt_id": attempt["id"], "parent_id": attempt.get("parent_id"), "split": "holdout" if holdout_attempt
             else "development", "label": label, "quantization": manifest.model.quantization,
             # Allocation and measured fill stand side by side: the allocation reserves output capacity above the
@@ -299,19 +439,21 @@ def attempt_row(store, attempt: dict, analysis_row: dict | None) -> dict:
             "reasoning": backend.reasoning or "engine-default",
             "batch_ubatch": f"{backend.batch_size}/{backend.ubatch_size if backend.ubatch_size else '-'}",
             "state": state, **_speed_columns(evidence.get("speed", {})),
-            "load_s": result.get("load_seconds"), "vram_mib": result.get("vram_used_mib_after_load"),
-            "tools": _quality_text(evidence.get("quality", {}), "tools", failed=not str(state).startswith("completed")),
-            "retrieval": _quality_text(evidence.get("quality", {}), "retrieval",
-                                       failed=not str(state).startswith("completed")),
-            "coding": _quality_text(evidence.get("quality", {}), "coding", failed=not str(state).startswith("completed")),
-            "first_attempt_vs_repaired": _coding_text(record["samples"]), "context_verified": context_ok,
+            "load_s": result.get("load_seconds"), "vram_mib": vram,
+            "tools": _quality_text(evidence.get("quality", {}), "tools", failed=failed),
+            "retrieval": _quality_text(evidence.get("quality", {}), "retrieval", failed=failed),
+            "coding": SANDBOX_BLOCKED if blocked else _quality_text(evidence.get("quality", {}), "coding",
+                                                                    failed=failed),
+            "first_attempt_vs_repaired": SANDBOX_BLOCKED if blocked else _coding_text(record["samples"]),
+            "context_verified": context_ok,
             "settings_verified": settings_ok, "eligibility_reasons": list(reasons), "holdout": holdout,
             "holdout_validated_categories": _category_list(holdout_block, "validated_categories"),
             "holdout_uncovered_categories": _category_list(holdout_block, "uncovered_categories"),
             "artifact_dir": run_dir, "candidate_report": candidate_report,
             "warnings": warnings, "manifest_hash": manifest.fingerprint(), "synthetic": attempt.get("synthetic"),
             "comparison_family": (analysis_row or {}).get("comparison_family"),
-            "template_check": raw.get("template_check")}
+            "template_check": raw.get("template_check"), "runtime": runtime, **memory_columns,
+            "unified_memory": unified}
 
 
 def _screening_candidates(results: list[dict]) -> list[dict]:
@@ -528,8 +670,27 @@ def _row_values(row: dict) -> list[str]:
             value = "-"  # nothing measured; never a zero that reads like a measurement
         elif column == "input_actual" and row.get("input_fill_verified") is not True:
             value = f"{value} {UNVERIFIED_FILL}"  # a fallback count must never render like a verified measurement
+        elif column in UNIFIED_COLUMNS:  # "-" on an NVIDIA row and for anything a Metal row did not measure
+            value = "-" if value is None else (_number(value, 1) if _real(value) is not None else value)
         values.append(_cell(value))
     return values
+
+
+def has_native_rows(report: dict) -> bool:
+    """Whether any row ran on the metal-native runtime; decides the banner and the unified-memory note, so a
+    report of NVIDIA rows reads exactly as it did before runtimes existed."""
+    return any(isinstance(row, dict) and row.get("runtime") == NATIVE_RUNTIME for row in report.get("rows") or [])
+
+
+def _banner(report: dict, *, html_text: bool = False) -> str:
+    if report["synthetic"]:
+        return "SYNTHETIC HARNESS TEST - no model performance measured."
+    if has_native_rows(report):
+        return ("Measured llama.cpp native (Metal) session; one row per attempt, failures included." if html_text
+                else "Measured llama.cpp native (Metal) session. Every attempt is listed; failures stay in the "
+                     "table.")
+    return ("Measured llama.cpp container session; one row per attempt, failures included." if html_text
+            else "Measured llama.cpp container session. Every attempt is listed; failures stay in the table.")
 
 
 def _target_line(label: str, span: dict, key: str) -> str:
@@ -561,8 +722,7 @@ def _context_range_lines(report: dict) -> list[str]:
 
 
 def session_markdown(report: dict) -> str:
-    banner = ("**SYNTHETIC HARNESS TEST - no model performance measured.**" if report["synthetic"] else
-              "Measured llama.cpp container session. Every attempt is listed; failures stay in the table.")
+    banner = f"**{_banner(report)}**" if report["synthetic"] else _banner(report)
     budget, rec = report["budget"], report["recommendation"]
     lines = [f"# Tuning session `{report['session_id']}`", "", banner, "",
              f"Campaign `{report['campaign_identity']}`; stop reason **{budget['stop_reason']}**; "
@@ -604,6 +764,7 @@ def session_markdown(report: dict) -> str:
     lines += [f"- candidate `{_cell(attempt)}`: `{_cell(path)}`" for attempt, path in report["candidate_reports"].items()]
     lines += ["", "Context capacity, filled prompt tokens and tested usable context are different measurements.",
               CONTEXT_CLAIM_NOTE, FILL_VERIFIED_NOTE, OFFLOAD_NOTE,
+              *([UNIFIED_MEMORY_NOTE] if has_native_rows(report) else []),
               "Scores keep every failed, timed-out or rejected task in the denominator.", ""]
     return "\n".join(lines)
 
@@ -626,6 +787,7 @@ def session_html(report: dict) -> str:
             ("Input targets dropped for the candidate cap when the tiers were derived", "dropped_input_targets"),
             ("Declared input targets the candidate cap cut out of the schedule (never measured)",
              "unscheduled_input_targets"))) + "</ul>")
+    unified_html = f"<p>{esc(UNIFIED_MEMORY_NOTE)}</p>" if has_native_rows(report) else ""
     data = html.escape(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     return f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Tuning session {esc(report['session_id'])}</title>
@@ -634,10 +796,9 @@ table{{border-collapse:collapse;font-size:13px}} th,td{{border:1px solid #2a3642
 th{{background:#17222c;position:sticky;top:0}} pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#17222c;padding:16px}}
 input{{padding:8px;width:95%;background:#fff;color:#111}} .wrap{{overflow-x:auto}}</style>
 <h1>Tuning session {esc(report['session_id'])}</h1>
-<p>{esc('SYNTHETIC HARNESS TEST - no model performance measured.' if report['synthetic'] else
-         'Measured llama.cpp container session; one row per attempt, failures included.')}</p>
+<p>{esc(_banner(report, html_text=True))}</p>
 <h2>Recommendation</h2><ul>{rec}</ul><p>{esc(report['recommendation']['preset_note'])}</p>
-<p>{esc(CONTEXT_CLAIM_NOTE)}</p><p>{esc(FILL_VERIFIED_NOTE)}</p><p>{esc(OFFLOAD_NOTE)}</p>{range_html}
+<p>{esc(CONTEXT_CLAIM_NOTE)}</p><p>{esc(FILL_VERIFIED_NOTE)}</p><p>{esc(OFFLOAD_NOTE)}</p>{unified_html}{range_html}
 <h2>Every attempt</h2><div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>
 <h2>Budget</h2><p>{esc(json.dumps(report['budget'], default=str))}</p>
 <h2>Reproduction</h2><ul>{''.join(f'<li><code>{esc(item)}</code></li>' for item in report['reproduction'])}</ul>
@@ -663,4 +824,5 @@ def write_session_report(report: dict, reports_dir: str | Path) -> dict[str, str
 __all__ = ["attempt_row", "recommendation", "build_session_report", "session_markdown", "session_html",
            "write_session_report", "COLUMNS", "HEADERS", "CONTEXT_CLAIM_NOTE", "FILL_VERIFIED_NOTE",
            "NO_MEASURED_FILL", "UNVERIFIED_FILL", "OFFLOAD_NOTE", "NOT_OBSERVED", "NOT_COVERED", "UNEXPLAINED",
-           "SCOPE_UNKNOWN", "SCOPE_UNKNOWN_SUFFIX", "Any"]
+           "SCOPE_UNKNOWN", "SCOPE_UNKNOWN_SUFFIX", "UNIFIED_MEMORY_NOTE", "UNIFIED_COLUMNS", "SANDBOX_BLOCKED",
+           "attempt_runtime", "unified_memory_evidence", "power_text", "pressure_text", "has_native_rows", "Any"]

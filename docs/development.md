@@ -17,6 +17,11 @@ needs a GPU is a script under `scripts/`, refuses to run without `runtime-policy
 src/llmbench/
   containers/        the product: config, plan (Compose + server argv), runner, session (tune/resume), derive
                      (model -> search space + benchmark plan), proposals, readback (settings evidence), reports, cli
+    runtime.py       the runtime registry: permissions, refused / unenforced settings, DispatchRunner per config
+    native.py        the metal-native runner: the container stage machine with a host llama-server process
+    native_prep.py   `prepare --runtime metal-native`: hash, Mach-O linkage proof, capability capture, native bundle
+  apple.py           Apple Silicon unified-memory telemetry (phys_footprint, vm_stat, swap, pressure, ioreg GPU,
+                     pmset power), the admission check and the memory watchdog
   container_eval.py  the evaluator: speed probes, local fixtures, public benchmark dispatch
   backends/          llama.cpp server adapter, bounded HTTP/SSE transport, speed-probe bridge
   benchmarks/        bfcl, ruler (+ ruler_tasks/), evalplus, aider_polyglot: one adapter each, one shared contract
@@ -24,9 +29,30 @@ src/llmbench/
   evaluations/       local tool / retrieval fixtures, strict tool-call capture, Inspect tasks
   analysis.py, search.py, controller.py, store.py, reports.py   campaign loop, eligibility, SQLite evidence, reports
   registry.py        which benchmarks exist, what each needs (dataset, broker), which options each accepts
-scripts/             dataset staging, image build, multi-model sweeps, reports, calibration, server diagnostics
+scripts/             dataset staging, image build, the macOS llama.cpp installer, multi-model sweeps, reports,
+                     calibration, server diagnostics
 examples/            candidate and session configs (examples/candidate.json is the packaged tune template)
 ```
+
+## What is tested live and what only against fakes
+
+The two runtimes are covered differently, and a change should say which kind of evidence it has:
+
+* **`nvidia-container`** was exercised live end to end (RTX 5090, Windows 11, Docker Desktop on WSL2); the unit
+  suite runs it against a fake Docker executor and recorded CUDA fixtures. Its configs, fingerprints, Compose
+  goldens, `result.json`, candidate, cross-model and coding reports must stay byte-identical when the native
+  runtime changes (the session table only gains appended columns): the native fields are omitted from every
+  serialisation at their defaults, and tests pin that.
+* **`metal-native`** is unit-tested against fakes (a scripted server process, telemetry and evaluator) and against
+  real captures from an Apple M1 running llama.cpp `b11011`: the Metal startup logs, `/props` and `/slots`
+  (`tests/data/*metal*`) and the `sysctl`, `vm_stat`, `ioreg`, `pmset` outputs (`tests/data/apple-*.txt`). Two
+  things in `pytest` are real on purpose: darwin-only reads of the test process's own `phys_footprint`, and a
+  harmless Python child standing in for `llama-server` so process groups, signals and the proof of absence are
+  tested for real (POSIX only). No test starts `llama-server`, Metal, Docker or Colima.
+<!-- TODO(lead): record which metal-native paths have been exercised live (prepare, tune, sweep, coding sandbox). -->
+
+When a real run disagrees with a fixture, capture the new output into `tests/data/` (with machine-specific paths
+replaced) and fix the parser against it; do not edit a capture to fit the parser.
 
 ## Conventions that matter
 
@@ -37,7 +63,10 @@ examples/            candidate and session configs (examples/candidate.json is t
   Compose fixture).
 * **Fail closed, and say why.** A refusal names its reason; a missing dataset is a recorded skip, not a crash and
   not a silent omission.
-* **Never turn a harness failure into a score.** Rows that did not really run are `environment_error`.
+* **Never turn a harness failure into a score.** Rows that did not really run are `environment_error`, and a
+  suite the sandbox could not run is reported as `blocked`, never as a zero.
+* **Label memory by what it measures.** VRAM (NVIDIA) and unified memory (Apple Silicon) are different physical
+  quantities; they never share a column, a minimum or a comparison.
 * Do not edit `src/` while a session is running: the source hash is part of `resume`'s identity check.
 
 ## Adding a benchmark

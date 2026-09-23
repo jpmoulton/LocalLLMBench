@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: System :: Benchmark",
 ]
-dependencies = ["pydantic>=2.10,<3", "httpx>=0.27,<1"]
+dependencies = ["pydantic>=2.10,<3", "httpx>=0.27,<1", "psutil>=5.9,<8"]  # psutil: host and process memory telemetry
 
 [project.optional-dependencies]
 eval = ["inspect-ai>=0.3,<1"]                      # the local tool-calling and retrieval fixtures

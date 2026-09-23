@@ -564,3 +564,132 @@ def test_coding_benchmark_is_derived_only_when_the_base_carries_a_broker(tmp_pat
     assert "coding" in {item.benchmark_id for item in session.base.benchmarks} and session.base.broker is not None
     plain = derive_session_config(path, base=read_run_config(EXAMPLE), hasher=counting_hasher([]))
     assert "coding" not in {item.benchmark_id for item in plain.base.benchmarks}
+
+
+# ---- metal-native runtime -------------------------------------------------------------------------------------
+
+NVIDIA_PLAN_KEYS = {"power", "dataset_root", "dataset_root_source", "dataset_root_reason", "datasets_present",
+                    "broker_configured", "candidate_wall_seconds", "wall_allowance_seconds", "wall_planned_seconds",
+                    "offered", "selected", "skipped", "benchmarks", "selections"}
+"""Every key an NVIDIA plan (benchmark-selection.json) has ever had; the runtime keys are added only when known."""
+BLOCKED = "the Docker sandbox is unavailable (docker CLI not found); generated code is never executed on the host"
+
+
+def test_a_native_bundle_derives_a_metal_session_at_rulers_shortest_length_with_code_suites_blocked(tmp_path):
+    """No sandbox: EvalPlus, Aider Polyglot and the private coding fixtures are planned as blocked with the reason,
+    never selected, and the template's broker goes with them; BFCL and RULER still run, planned 3x slower."""
+    from llmbench.containers.config import NativeLimits
+    from test_containers_session import make_native_bundle
+    bundle = make_native_bundle()  # records the prepare-time probe: blocked, docker CLI not found
+    root = stage_datasets(tmp_path / "datasets", evalplus=True, aider=True)
+    (path,) = write_models(tmp_path / "w", ("Q4_K_M",))
+    session = derive_session_config(path, base=broker_base(), hasher=counting_hasher([]), dataset_root=root,
+                                    native_bundle=bundle, image_bundle="prep/native-bundle.json")
+    base = session.base
+    assert base.runtime == "metal-native" and base.inference_image is None and base.evaluator.mode == "host-process"
+    assert base.native_server == bundle.native_server and base.native_limits == NativeLimits()
+    assert base.broker is None  # nothing selected needs it, so no container permission is demanded for it
+    assert session.image_bundle == "prep/native-bundle.json" and session.planning_slowdown == 3.0
+    assert session.model_dump(mode="json")["planning_slowdown"] == 3.0  # recorded, so the plan says what it assumed
+    # RULER's shortest standard length is the whole default search: one tier holding 4096 input tokens.
+    assert session.search.ctx_tiers == (4864,) and base.engine.ctx_size == 4864
+    assert (session.search.context_floor, session.search.context_ceiling) == (4096, 4096)
+    assert base.requested_input_tokens == 4096
+    selected = {item.benchmark_id: item for item in base.benchmarks}
+    assert {"bfcl", "ruler"} <= set(selected)
+    assert not {"coding", "evalplus", "aider-polyglot"} & set(selected)
+    assert selected["ruler"].options["lengths"] == (4096,)
+    plan = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root, native_bundle=bundle)
+    assert plan["runtime"] == "metal-native" and plan["planning_slowdown"] == 3.0
+    assert plan["sandbox"] == {"available": False, "reason": "docker CLI not found"}
+    assert plan["blocked"] == ["evalplus", "aider-polyglot", "coding"] and plan["broker_configured"] is False
+    for benchmark_id in plan["blocked"]:
+        assert rows_of(plan)[benchmark_id] | {"notes": []} == {
+            "benchmark_id": benchmark_id, "status": "blocked", "reason": BLOCKED, "items": 0,
+            "estimated_seconds": 0.0, "options": None, "notes": []}
+    lines = benchmark_plan_lines(plan)
+    assert any(line.startswith("coding sandbox: unavailable (docker CLI not found)") for line in lines)
+    assert f"  evalplus: blocked - {BLOCKED}" in lines and f"  coding: blocked - {BLOCKED}" in lines
+    assert any("3x the NVIDIA-measured cost" in line for line in lines)
+    # The printed plan is the derived one, and each selected estimate is exactly 3x the NVIDIA plan's for the
+    # same items (the NVIDIA 8192 baseline tier also bounds RULER at 4096).
+    derived = [{"benchmark_id": item.benchmark_id, "task_ids": list(item.task_ids)} for item in base.benchmarks
+               if item.benchmark_id in PUBLIC_BENCHMARK_ORDER]
+    assert derived == [{"benchmark_id": row["benchmark_id"], "task_ids": row["task_ids"]}
+                       for row in plan["selections"]]
+    cuda = benchmark_plan_for_model(path, base=read_run_config(EXAMPLE), dataset_root=root)
+    for benchmark_id in ("bfcl", "ruler"):
+        assert rows_of(cuda)[benchmark_id]["items"] == rows_of(plan)[benchmark_id]["items"]
+        assert rows_of(plan)[benchmark_id]["estimated_seconds"] == pytest.approx(
+            3 * rows_of(cuda)[benchmark_id]["estimated_seconds"], abs=0.2)
+    written = tmp_path / "session-config.json"
+    written.write_text(json.dumps(session.model_dump(mode="json")), encoding="utf-8")
+    assert read_session_config(written) == session
+    assert [item.label() for item in deterministic_schedule(session)][0] == "baseline"
+
+
+def test_an_available_sandbox_keeps_the_broker_suites_and_the_bundle_worker(tmp_path):
+    from llmbench.containers.config import ImageRef
+    from test_containers_session import ARM64_WORKER, make_native_bundle
+    bundle = make_native_bundle(sandbox={"status": "available", "reason": None, "server_os_arch": "linux/arm64"},
+                                worker=ARM64_WORKER)
+    root = stage_datasets(tmp_path / "datasets", bfcl=False, ruler=False, evalplus=True)
+    (path,) = write_models(tmp_path / "w", ("Q4_K_M",))
+    session = derive_session_config(path, base=broker_base(), hasher=counting_hasher([]), dataset_root=root,
+                                    native_bundle=bundle)
+    assert session.base.broker is not None and session.base.worker_image == ImageRef.model_validate_json(json.dumps(ARM64_WORKER))
+    selected = {item.benchmark_id for item in session.base.benchmarks}
+    assert {"coding", "evalplus"} <= selected
+    plan = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root, native_bundle=bundle)
+    assert plan["sandbox"] == {"available": True, "reason": None} and plan["blocked"] == []
+    assert rows_of(plan)["evalplus"]["estimated_seconds"] == 3 * EVALPLUS_ITEM_LIMIT * 10.0  # 3x 10 s per item
+    assert "blocked" not in {row["status"] for row in plan["benchmarks"]}
+
+
+def test_nvidia_derivation_is_unchanged_unless_a_sandbox_verdict_is_given(tmp_path):
+    """No native bundle and no sandbox verdict: exactly the derivation and the plan keys there always were."""
+    from test_containers_session import make_native_bundle
+    root = stage_datasets(tmp_path / "datasets", evalplus=True, aider=True)
+    (path,) = write_models(tmp_path / "w", ("Q4_K_M",))
+    plan = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root)
+    assert set(plan) == NVIDIA_PLAN_KEYS and plan["selected"] == list(PUBLIC_BENCHMARK_ORDER)
+    session = derive_session_config(path, base=broker_base(), hasher=counting_hasher([]), dataset_root=root)
+    dumped = session.model_dump(mode="json")
+    assert "planning_slowdown" not in dumped and "runtime" not in dumped["base"]
+    assert "native_server" not in dumped["base"] and dumped["base"]["inference_image"] is not None
+    assert session.base.broker is not None and session.search.ctx_tiers == DEFAULT_CTX_TIERS
+    # An explicit verdict applies to NVIDIA too: the broker suites are blocked with the given reason.
+    blocked = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root, sandbox_available=False,
+                                       sandbox_reason="colima is stopped")
+    assert blocked["blocked"] == ["evalplus", "aider-polyglot", "coding"] and "planning_slowdown" not in blocked
+    assert rows_of(blocked)["evalplus"]["reason"].startswith("the Docker sandbox is unavailable (colima is stopped)")
+    unblocked = derive_session_config(path, base=broker_base(), hasher=counting_hasher([]), dataset_root=root,
+                                      sandbox_available=False)
+    assert unblocked.base.broker is None and unblocked.base.runtime == "nvidia-container"
+    assert not {"coding", "evalplus", "aider-polyglot"} & {item.benchmark_id for item in unblocked.base.benchmarks}
+    # A bundle that recorded no probe never shows the sandbox working, so it is planned unavailable; a probe the
+    # caller ran now outranks the verdict recorded at prepare time.
+    unprobed = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root,
+                                        native_bundle=make_native_bundle(sandbox={}))
+    assert unprobed["sandbox"] == {"available": False, "reason": "the native bundle records no sandbox probe"}
+    overruled = benchmark_plan_for_model(path, base=broker_base(), dataset_root=root, native_bundle=make_native_bundle(),
+                                         sandbox_available=True)
+    assert overruled["blocked"] == [] and overruled["sandbox"] == {"available": True, "reason": None}
+    with pytest.raises(ValueError, match="two different servers"):
+        derive_session_config(path, base=broker_base(), hasher=counting_hasher([]), native_bundle=make_native_bundle(),
+                              inference_image=read_run_config(EXAMPLE).inference_image)
+
+
+def test_a_native_session_honours_an_explicit_range_and_caps_its_default_by_the_training_context(tmp_path):
+    from test_containers_session import make_native_bundle
+    bundle = make_native_bundle()
+    base = read_run_config(EXAMPLE)
+    (path,) = write_models(tmp_path / "w", ("Q4_K_M",))
+    ranged = dict(context_floor=2048, context_ceiling=8000)
+    native = derive_session_config(path, base=base, hasher=counting_hasher([]), native_bundle=bundle, **ranged)
+    cuda = derive_session_config(path, base=base, hasher=counting_hasher([]), **ranged)
+    assert native.search == cuda.search  # same range, same reserves: the same allocations on either runtime
+    (small,) = write_models(tmp_path / "small", ("Q4_K_M",), n_ctx_train=4096, nextn=0)
+    capped = derive_session_config(small, base=base, hasher=counting_hasher([]), native_bundle=bundle)
+    assert (capped.search.context_floor, capped.search.context_ceiling) == (3328, 3328)  # 4096 - 768 reserved
+    assert capped.search.ctx_tiers == (4096,) and capped.search.context_n_ctx_train == 4096

@@ -1,4 +1,9 @@
-"""Bounded screening, measured serving interactions, then a larger finalist comparison."""
+"""Bounded screening, measured serving interactions, then a larger finalist comparison.
+
+Runtime-agnostic: every stage is a ``session.tune`` of a derived stage session, so the candidates' own runtime
+(NVIDIA container or metal-native) decides which runner serves them (``runtime.DispatchRunner``) and which
+``runtime-policy.json`` permissions the whole optimization needs (``session.authorize_session``).
+"""
 from __future__ import annotations
 
 import itertools
@@ -8,11 +13,10 @@ import sys
 import time
 from pathlib import Path
 
-from ..config import RunMode, canonical_json
+from ..config import canonical_json
 from ..safety import OperationForbidden, SessionLock
-from .config import read_image_bundle
 from .proposals import (FAMILY_AXES, Proposal, apply, deterministic_schedule, load_proposal_file)
-from .session import (ContainerSessionConfig, policy_for, read_session_config, tune,
+from .session import (ContainerSessionConfig, authorize_session, policy_for, read_bundle, read_session_config, tune,
                       write_atomic_json, write_exclusive_json)
 
 
@@ -145,13 +149,13 @@ def optimize(session, output, *, screen_items=8, finalists=2, max_combinations=4
     plan = optimization_plan(session, screen_items=screen_items, finalists=finalists,
                              max_combinations=max_combinations, budget_seconds=budget_seconds)
     lock = SessionLock.read(policy_path)
-    for operation in ("container", "load", "inference"):
-        lock.check(operation, RunMode.LIVE)
+    # Either kind of bundle; read before the output exists so a policy refusal still leaves nothing behind.
+    bundle = read_bundle(session.image_bundle) if session.image_bundle else None
+    authorize_session(lock, session, bundle)  # NVIDIA: exactly container, load, inference, as before
     root = Path(output).resolve()
     root.mkdir(parents=True, exist_ok=False)
     write_exclusive_json(root / "optimization-plan.json", plan)
     write_exclusive_json(root / "input-session.json", session.model_dump(mode="json"))
-    bundle = read_image_bundle(session.image_bundle) if session.image_bundle else None
     started = clock()
     report: dict = {"schema_version": 1, "state": "running", "stages": {}, "plan": plan,
                     "recommendation": None, "automatic_deployment_performed": False}
@@ -164,10 +168,10 @@ def optimize(session, output, *, screen_items=8, finalists=2, max_combinations=4
         stage = _stage_session(base, root, name, candidates, min(remaining, allowance),
                                confirmation=confirmation)
         write_exclusive_json(Path(stage.proposal_file), [p.model_dump(mode="json") for p in candidates])
-        if runner_factory is None:
-            from .runner import ContainerRunner
-            runner = ContainerRunner(capabilities_dir=capabilities_dir, policy_path=policy_path,
-                                     policy=policy_for(stage))
+        if runner_factory is None:  # an NVIDIA candidate still gets exactly ContainerRunner(<these three>)
+            from .runtime import DispatchRunner
+            runner = DispatchRunner(capabilities_dir=capabilities_dir, policy_path=policy_path,
+                                    policy=policy_for(stage))
         else:
             runner = runner_factory(stage)
         print(f"optimize: {name}: {len(candidates)} candidates, "

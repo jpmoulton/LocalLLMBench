@@ -72,6 +72,9 @@ can rank anything.
 Also learned the hard way: stopping a sweep by killing its wrapper leaves the GPU container running. Stop the
 session itself, and check `docker ps` afterwards.
 
+<!-- TODO(lead): add the metal-native lessons from the live Mac runs here, in the same form (what happened, and the
+guard that now exists). Only real incidents belong in this file; none have been recorded for this runtime yet. -->
+
 ## Things that are easy to get wrong about the hardware
 
 * A quantization named in a filename may not be what the header declares. NVFP4 GGUFs store weights in a tensor

@@ -1,15 +1,23 @@
 """Effective-setting evidence from the llama-server startup log (build b11011 wording) and API readback.
 
 A missing line is never treated as a default. Argv acceptance alone stays `argv-accepted`.
+
+`parse_startup_log` reads the settings every runtime shares: a Metal build prints the same `llama_context`,
+`load_tensors`, `llama_kv_cache` and `system_info` lines as the CUDA image, so one parser verifies both.
+`parse_native_startup` and `parse_memory_breakdown` add what only matters on a unified-memory host -- which
+devices the build saw, how much Metal may hold, and how much it does hold -- without changing a byte of what
+`parse_startup_log` returns for a container run.
 """
 
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 
 from .config import LlamaCppSettings, SettingEvidence
 
 PARSER_VERSION = "llama-server-startup-v1"
+NATIVE_PARSER_VERSION = "llama-server-native-startup-v1"
 VERIFIED = frozenset({"verified-api", "verified-log", "verified-behavior"})
 # Memory, scheduling, context and speculation controls that change what is measured. `fit` has no b11011
 # log line and no /props field; it is verified from behaviour instead, see `_fit`.
@@ -43,7 +51,27 @@ _FIRST = {  # key -> (pattern, converters); the first match is the target contex
 _KV_CACHE = re.compile(r"llama_kv_cache: size =\s*" + _MIB + r" \(\s*(\d+) cells,\s*(\d+) layers,[^)]*\), "
                        r"K \((\w+)\):\s*" + _MIB + r", V \((\w+)\):\s*" + _MIB)
 _KV_BUFFER = re.compile(r"llama_kv_cache:\s+(\S+) KV buffer size =\s*" + _MIB)
+_MODEL_BUFFER = re.compile(r"load_tensors:\s+(\S+) model buffer size =\s*" + _MIB)
+_RS_BUFFER = re.compile(r"llama_memory_recurrent:\s+(\S+) RS buffer size =\s*" + _MIB)
+_COMPUTE_BUFFER = re.compile(r"sched_reserve:\s+(\S+) compute buffer size =\s*" + _MIB)
+_CONTEXT = re.compile(r"llama_context: constructing llama_context")
 _STAMP = r"^(\d+)\.(\d{2})\.(\d{3})\.(\d{3}) "
+# `common_param:   - MTL0    : Apple M1 (5461 MiB, 5460 MiB free)`, one line per device under `device_info:`.
+_DEVICE_LINE = re.compile(r"common_param:\s+- (\S+)\s+: (.*) \((\d+) MiB, (\d+) MiB free\)\s*$")
+# `llama_prepare_model_devices: using device MTL0 (Apple M1) (unknown id) - 5460 MiB free`; the CUDA image
+# prints its PCI bus id where Metal prints `unknown id`.
+_MODEL_DEVICE = re.compile(r"llama_prepare_model_devices: using device (\S+) \((.*)\) \(([^()]*)\) - "
+                           r"(\d+) MiB free")
+# `common_memory_breakdown_print` at exit. A device row is `total = free + (self = model + context + compute) +
+# unaccounted`; the Host row and other host buffer types have no total/free/unaccounted. Spaces only, never
+# `\s`, so a pattern cannot run across into the next log line.
+_BREAKDOWN = "common_memory_breakdown_print: "
+_BREAKDOWN_HEADER = re.compile(_BREAKDOWN + r"\| memory breakdown \[MiB\]")
+_BREAKDOWN_DEVICE = re.compile(_BREAKDOWN + r"\| *- (.+?) *\| *(\d+) *= *(\d+) *\+ *"
+                               r"\( *(\d+) *= *(\d+) *\+ *(\d+) *\+ *(\d+) *\) *\+ *(-?\d+) *\|")
+_BREAKDOWN_HOST = re.compile(_BREAKDOWN + r"\| *- (.+?) *\| *(\d+) *= *(\d+) *\+ *(\d+) *\+ *(\d+) *\|")
+_DEVICE_COLUMNS = ("total", "free", "self", "model", "context", "compute", "unaccounted")
+_HOST_COLUMNS = ("self", "model", "context", "compute")
 
 
 def _host_buffer(device: str) -> bool:
@@ -51,9 +79,16 @@ def _host_buffer(device: str) -> bool:
 
     The host allocators print as `CPU` and `CPU_Mapped`; a backend's pinned host pool prints as `CUDA_Host`
     (the same live log shows `CUDA_Host model buffer size` for weights that stayed in system RAM). Everything
-    else -- `CUDA0`, `ROCm0`, `Vulkan0`, `SYCL0`, `Metal` -- is a device.
+    else -- `CUDA0`, `ROCm0`, `Vulkan0`, `SYCL0`, and on Metal `MTL0` (`MTL0_Mapped` for mapped weights) -- is
+    a device. On Apple Silicon both sides are the same physical memory: "device" there means a buffer in
+    Metal's working set, never separate VRAM (`tests/data/startup-b11011-metal-qwen3-1.7b.log`).
     """
     return device.startswith("CPU") or device.endswith("_Host")
+
+
+def _metal_buffer(device: str) -> bool:
+    """Whether a device name is Metal's: b11011 registers the Apple GPU as `MTL0` (live `--list-devices`)."""
+    return device.startswith("MTL")
 
 
 def _kv_placement(buffers: list[dict]) -> dict:
@@ -108,7 +143,7 @@ def parse_startup_log(text: str) -> dict:
         end = first_size.start() if first_size else len(text)
         target = [row for row, match in zip(found["kv_buffers"], buffers) if match.start() < end]
         found["kv_placement"] = _kv_placement(target or found["kv_buffers"])
-    models = re.findall(r"load_tensors:\s+(\S+) model buffer size =\s*" + _MIB, text)
+    models = _MODEL_BUFFER.findall(text)
     if models:
         found["model_buffers"] = [{"device": device, "mib": float(size)} for device, size in models]
     recurrent = re.search(r"llama_memory_recurrent: size =\s*" + _MIB, text)
@@ -132,6 +167,169 @@ def parse_startup_log(text: str) -> dict:
         found["model_loaded_seconds"] = (int(loaded[1]) * 60 + int(loaded[2]) + int(loaded[3]) / 1e3
                                          + int(loaded[4]) / 1e6)
     return found
+
+
+def _device_info(text: str) -> list[dict]:
+    """The devices the build enumerated, from the `device_info:` block that opens every b11011 log.
+
+    Only the lines directly under the FIRST `device_info:` header are read, so a device line quoted anywhere
+    else (a second server's log appended to the same file, say) is never taken for this server's hardware.
+    """
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if "common_param: device_info:" in line), None)
+    devices: list[dict] = []
+    for line in lines[start + 1:] if start is not None else ():
+        match = _DEVICE_LINE.search(line)
+        if not match:
+            break
+        devices.append({"name": match[1], "description": match[2], "total_mib": int(match[3]),
+                        "free_mib": int(match[4])})
+    return devices
+
+
+def _system_info(rest: str) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """Backends and their feature flags from the `| NAME : KEY = VALUE | KEY = VALUE | NAME : ...` tail.
+
+    llama.cpp prints `NAME : ` before each backend's features and nothing between backends, so a backend with
+    no features runs straight into the next (`MTL : CPU : NEON = 1`); every leading `NAME : ` is a backend.
+    """
+    backends: list[str] = []
+    features: dict[str, dict[str, str]] = {}
+    current = None
+    for piece in rest.split("|"):
+        piece = piece.strip()
+        while prefix := re.match(r"(\w+) :(?: |$)", piece):
+            current = prefix[1]
+            if current not in features:
+                backends.append(current)
+                features[current] = {}
+            piece = piece[prefix.end():].lstrip()
+        feature = re.fullmatch(r"(\w+) = (.*)", piece)
+        if feature and current is not None:
+            features[current][feature[1]] = feature[2]
+    return backends, features
+
+
+def _compute_buffers(text: str) -> list[dict]:
+    """The compute buffers each llama_context holds once loading is done: its LAST reservation, not every line.
+
+    `sched_reserve` re-reserves a context whose graph changed and prints the whole new allocation, which
+    replaces the old one -- the live MTP log reserves its draft context twice (`graph nodes = 50`, then `= 56`
+    once speculative decoding attaches), each time printing `CUDA0 compute buffer size = 196.02 MiB`. Summing
+    every line would count that memory twice. A line belongs to the context most recently constructed before
+    it and to the reservation most recently opened before it; each context keeps its latest reservation.
+    """
+    contexts = [match.start() for match in _CONTEXT.finditer(text)]
+    reservations = [match.start() for match in re.finditer(r"sched_reserve: reserving", text)]
+    lines = [(max(bisect_right(contexts, match.start()) - 1, 0), bisect_right(reservations, match.start()),
+              {"device": match[1], "mib": float(match[2])}) for match in _COMPUTE_BUFFER.finditer(text)]
+    latest: dict[int, int] = {}
+    for context, reservation, _ in lines:
+        latest[context] = max(latest.get(context, reservation), reservation)
+    return [{**row, "context": context} for context, reservation, row in lines if reservation == latest[context]]
+
+
+def parse_native_startup(text: str) -> dict:
+    """Unified-memory facts from a llama-server startup log: which devices exist and what Metal holds.
+
+    The settings a candidate requested are read by `parse_startup_log`, from the same lines on every runtime.
+    This reads what only a unified-memory host needs, and like that parser it never fills a missing line
+    with a default -- an absent key means the log did not say:
+
+    * `devices` -- every device under `device_info:` with its total and free MiB at startup. For `MTL0` the
+      total is Metal's recommended working-set size (5461 MiB on an 8 GB M1), which is `metal_budget_mib`
+      when the log lists exactly one Metal device. It is a budget carved from host memory, not VRAM.
+    * `model_device` -- the one device `llama_prepare_model_devices` placed the model on (`model_devices`
+      lists every such line, so a multi-device placement is visible rather than truncated to its first).
+    * `system_info_backends` / `system_info_features` -- the `system_info` backends in order (`["MTL",
+      "CPU"]`), and `metal_embed_library` when a Metal backend is listed: True only when it printed
+      `EMBED_LIBRARY = 1`, since a backend's printed feature list is complete.
+    * `model_buffers`, `kv_buffers`, `recurrent_buffers`, `compute_buffers` -- every `{device, mib}` line;
+      compute buffers keep only each context's latest reservation, see `_compute_buffers`.
+    * `metal_device` -- what `ggml_metal_init: found device:` named.
+    * `resident_by_device`, `host_resident_mib`, `metal_resident_mib` -- model + KV + recurrent + compute
+      MiB per device, then summed over host (`_host_buffer`) and Metal (`MTL*`, which includes the
+      `MTL0_Mapped` weights of `--load-mode mmap`) devices. They are written only when model buffers were
+      printed and EVERY llama_context the log constructed has its compute reservation, which every completed
+      load does: a log cut off before a context's `sched_reserve` -- the target's, or a draft context's after
+      its KV cache was already allocated -- would otherwise under-report residency as if it were the whole.
+      Context output buffers are left out, as llama.cpp's `llama_context::memory_breakdown` leaves them out.
+      For a single-context run the sums therefore reconcile with `parse_memory_breakdown` (host: the `Host` row
+      plus any other host-side buffer-type row such as `CPU_REPACK`); llama-server prints that table for its
+      target context only, so a draft context's KV and compute appear here and not there.
+      `metal_resident_mib` is written only when the log shows a Metal device.
+    * `offloaded_layers` / `total_layers` -- as in `parse_startup_log`.
+    """
+    found: dict = {"parser_version": NATIVE_PARSER_VERSION}
+    devices = _device_info(text)
+    if devices:
+        found["devices"] = devices
+    placed = [{"name": match[1], "description": match[2], "device_id": match[3], "free_mib": int(match[4])}
+              for match in _MODEL_DEVICE.finditer(text)]
+    if placed:
+        found["model_devices"] = placed
+        if len(placed) == 1:
+            found["model_device"] = placed[0]
+    info = re.search(r"system_info: [^|\n]*\|(.*)$", text, re.MULTILINE)
+    if info:
+        found["system_info_backends"], found["system_info_features"] = _system_info(info[1])
+        if "MTL" in found["system_info_features"]:
+            found["metal_embed_library"] = found["system_info_features"]["MTL"].get("EMBED_LIBRARY") == "1"
+    metal = re.search(r"ggml_metal_init: found device: (.+?)\s*$", text, re.MULTILINE)
+    if metal:
+        found["metal_device"] = metal[1]
+    metal_devices = [item for item in devices if _metal_buffer(item["name"])]
+    if len(metal_devices) == 1:
+        found["metal_budget_mib"] = metal_devices[0]["total_mib"]
+    for key, pattern in (("model_buffers", _MODEL_BUFFER), ("kv_buffers", _KV_BUFFER),
+                         ("recurrent_buffers", _RS_BUFFER)):
+        rows = [{"device": match[1], "mib": float(match[2])} for match in pattern.finditer(text)]
+        if rows:
+            found[key] = rows
+    compute = _compute_buffers(text)
+    if compute:
+        found["compute_buffers"] = compute
+    constructed = range(len(_CONTEXT.findall(text)))
+    if "model_buffers" in found and constructed and {row["context"] for row in compute} == set(constructed):
+        per_device: dict[str, float] = {}
+        for key in ("model_buffers", "kv_buffers", "recurrent_buffers", "compute_buffers"):
+            for row in found.get(key, ()):
+                per_device[row["device"]] = per_device.get(row["device"], 0.0) + row["mib"]
+        found["resident_by_device"] = {device: round(mib, 3) for device, mib in per_device.items()}
+        found["host_resident_mib"] = round(sum(mib for device, mib in per_device.items()
+                                               if _host_buffer(device)), 3)
+        if metal_devices or metal or any(_metal_buffer(device) for device in per_device):
+            found["metal_resident_mib"] = round(sum(mib for device, mib in per_device.items()
+                                                    if _metal_buffer(device)), 3)
+    offloaded = re.search(_FIRST["offloaded"][0], text)
+    if offloaded:
+        found["offloaded_layers"], found["total_layers"] = int(offloaded[1]), int(offloaded[2])
+    return found
+
+
+def parse_memory_breakdown(text: str) -> list[dict]:
+    """The `common_memory_breakdown_print` table llama-server prints as it exits, one dict per row.
+
+    A device row carries `total = free + (self = model + context + compute) + unaccounted` (MiB, truncated by
+    llama.cpp, so a row's parts can sum one below its total; `unaccounted` is signed, and Metal clamps `free`
+    at 0 once allocations pass the working-set size, so an over-committed MTL0 row prints it negative); the
+    `Host` row and each buffer type that is neither host nor a model device (`CPU_REPACK`) carry only
+    `self = model + context + compute`, and their `total`, `free` and `unaccounted` are None rather than zero.
+    The table covers the one llama_context llama-server passes it, the target's: never a draft context. `device` is the row's first word (`MTL0`, `Host`), `description` its parenthesised name or None,
+    and `table` counts the tables printed before it, so a log with more than one never merges their rows. A row
+    in neither shape is left out: this reads what llama.cpp printed, it does not reconstruct what it meant.
+    """
+    headers = [match.start() for match in _BREAKDOWN_HEADER.finditer(text)]
+    parsed = [(match, _DEVICE_COLUMNS) for match in _BREAKDOWN_DEVICE.finditer(text)]
+    parsed += [(match, _HOST_COLUMNS) for match in _BREAKDOWN_HOST.finditer(text)]
+    rows = []
+    for match, columns in sorted(parsed, key=lambda item: item[0].start()):
+        values = dict(zip(columns, (int(item) for item in match.groups()[1:])))
+        name = re.fullmatch(r"(\S+)(?: \((.*)\))?", match[1])
+        rows.append({"device": name[1] if name else match[1], "description": name[2] if name else None,
+                     **{column: values.get(column) for column in _DEVICE_COLUMNS},
+                     "table": max(bisect_right(headers, match.start()) - 1, 0)})
+    return rows
 
 
 def _compare(control, requested, effective, status, source, *, equal=None) -> SettingEvidence:

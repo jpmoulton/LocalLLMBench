@@ -5,6 +5,13 @@ A session is a frozen search space, a holdout plan and budgets around a ``Contai
 runs the shared campaign controller with the container executor and writes reports. ``resume`` rebuilds the
 identical manifests, honours the persisted deadline (downtime is never refunded) and continues. Import is
 inert; nothing here talks to Docker or a model.
+
+The runtime that serves the candidates (``nvidia-container`` or ``metal-native``, see ``config.RUNTIMES``) is a
+property of the candidate configs, not of the session machinery: the same ledger, campaign and reports drive
+both. What differs is which prepared bundle pins the server (``image-bundle.json`` or ``native-bundle.json``,
+told apart by ``read_bundle``), which permissions a run needs (``runtime.required_operations``) and which runner
+executes it (``runtime.DispatchRunner``). A session that names no runtime is exactly the NVIDIA session it was
+before runtimes existed.
 """
 
 from __future__ import annotations
@@ -19,13 +26,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, model_serializer, model_validator
 
 from ..config import (BackendSettings, CampaignPolicy, ExperimentManifest, ModelArtifact, RunMode,
                       StrictModel, TaskSelection, canonical_json)
 from ..safety import OperationForbidden, SessionLock
-from .config import (NAME, CacheType, ContainerRunConfig, LlamaCppSettings, ModelAsset,
-                     read_image_bundle)
+from .config import (NAME, RUNTIMES, CacheType, ContainerRunConfig, ImageBundle, LlamaCppSettings, ModelAsset,
+                     NativeBundle, NativeLimits, read_image_bundle)
 
 DEFAULT_CAPABILITIES = "artifacts/container-prep"
 DEFAULT_BASE_CONFIG = str(Path(__file__).with_name("data") / "base-candidate.json")
@@ -41,6 +48,14 @@ MIN_CONTEXT_INPUT_TOKENS = 512  # the engine's smallest ctx_size; a usable-input
 MAPPED_ENGINE_FIELDS = frozenset({"engine", "ctx_size", "n_gpu_layers", "cache_type_k", "cache_type_v", "kv_offload",
                                   "flash_attn", "spec_type", "parallel", "batch_size", "ubatch_size", "threads",
                                   "reasoning"})
+NVIDIA_OPERATIONS = ("container", "load", "inference")
+"""What an NVIDIA container session has always needed from ``runtime-policy.json``. The runtime registry
+(``runtime.required_operations``) returns exactly this tuple for an NVIDIA config; it is spelled out here only
+for the one check that runs before any config exists (``main_tune --model`` authorizes before hashing GGUFs)."""
+DEFAULT_PLANNING_SLOWDOWN = 1.0
+METAL_REVISION_PREFIX = "metal:"
+"""Prefixed to a metal-native candidate's ``runtime_revision`` so a CUDA and a Metal result of the same llama.cpp
+commit are never the same backend to the controller's comparison rules."""
 
 
 class SessionBudgets(StrictModel):
@@ -207,6 +222,19 @@ class ContainerSessionConfig(StrictModel):
     proposal_mode: Literal["deterministic", "file"] = "deterministic"
     proposal_file: str | None = Field(default=None, min_length=1)
     policy: CampaignPolicy = Field(default_factory=_default_policy)
+    planning_slowdown: float = Field(default=DEFAULT_PLANNING_SLOWDOWN, gt=0, le=100)
+    """The factor derivation multiplied every per-item public-benchmark cost estimate by when it chose what fits
+    a candidate's wall (``derive.PLANNING_SLOWDOWN``): 1.0 for the NVIDIA host the estimates were measured on, more
+    for a slower runtime. Frozen here so the record says what the selection was sized for; nothing at run time
+    reads it, because the adapters' own budget probes still govern what actually runs. Left out of the JSON at its
+    default, so an NVIDIA ``session-config.json`` (and the sha256 its ledger pins) is byte-identical to before."""
+
+    @model_serializer(mode="wrap")
+    def _omit_default_slowdown(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("planning_slowdown") == DEFAULT_PLANNING_SLOWDOWN:
+            data.pop("planning_slowdown")
+        return data
 
     @model_validator(mode="after")
     def coherent(self) -> "ContainerSessionConfig":
@@ -336,11 +364,80 @@ def _read_bounded(path: str | Path, limit: int = MAX_JSON_BYTES) -> str:
 
 
 def image_ids(bundle) -> dict[str, str | None] | None:
-    """The image IDs a bundle pins (inference, evaluator, worker); None when the session runs without a bundle."""
+    """What a bundle pins, as the ledger's ``image_ids``; None when the session runs without a bundle.
+
+    An ``ImageBundle`` pins image IDs (inference, evaluator, worker), exactly as before native runtimes existed. A
+    ``NativeBundle`` pins the llama-server executable and its libraries by SHA-256 instead, plus the optional
+    sandbox worker image. The ledger key keeps its old name so no schema 1 ledger changes shape; the two kinds of
+    value have disjoint keys, so a bundle of the other kind can never compare equal on ``resume``.
+    """
     if bundle is None:
         return None
-    return {"inference": bundle.inference.image_id, "evaluator": bundle.evaluator.image_id,
-            "worker": bundle.worker.image_id if bundle.worker is not None else None}
+    worker = bundle.worker.image_id if bundle.worker is not None else None
+    if isinstance(bundle, NativeBundle):
+        return {"native_server": bundle.native_server.executable_sha256,
+                "libraries": bundle.native_server.libraries_sha256, "worker": worker}
+    return {"inference": bundle.inference.image_id, "evaluator": bundle.evaluator.image_id, "worker": worker}
+
+
+def read_bundle(path: str | Path) -> ImageBundle | NativeBundle:
+    """Either prepared bundle, told apart by what the file declares rather than by what it is called.
+
+    ``llmbench prepare`` writes ``image-bundle.json`` (NVIDIA images); ``prepare --runtime metal-native`` writes
+    ``native-bundle.json``, which declares ``"runtime": "metal-native"`` and a ``native_server``. Each is a strict
+    model that refuses the other's keys, so a file that is neither (or a hybrid of both) fails validation instead
+    of being read as the wrong kind. Bounded like every other JSON this module reads.
+    """
+    text = _read_bounded(path)
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"{path} is not a JSON bundle: {exc}") from exc
+    if isinstance(raw, dict) and (raw.get("runtime") == "metal-native" or "native_server" in raw):
+        return NativeBundle.model_validate_json(text)
+    return ImageBundle.model_validate_json(text)
+
+
+def native_overlay(raw: dict, bundle: NativeBundle) -> dict:
+    """In place: a candidate's JSON rewritten to be served by ``bundle``'s pinned native server. Returns ``raw``.
+
+    Sets the runtime, the server reference and the watchdog limits, and removes the inference image (a native
+    candidate runs none; the config validator refuses one). The config's own ``native_limits`` are kept when it
+    has them, so limits a session was tuned under survive a moved bundle; otherwise the documented defaults
+    apply, which the config then records. The sandbox worker image comes from the bundle when it pins one. The
+    evaluator is left as the config states it: a container evaluator cannot reach a host server, and the config
+    validator names that conflict instead of this function quietly changing what was asked for.
+    """
+    raw["runtime"] = "metal-native"
+    raw["native_server"] = bundle.native_server.model_dump(mode="json")
+    raw["native_limits"] = raw.get("native_limits") or NativeLimits().model_dump(mode="json")
+    raw.pop("inference_image", None)
+    if bundle.worker is not None:
+        raw["worker_image"] = bundle.worker.model_dump(mode="json")
+    return raw
+
+
+def _overlay_bundle(raw: dict, bundle) -> dict:
+    """In place: the images or native server ``bundle`` pins, laid over a candidate's JSON. Returns ``raw``."""
+    if isinstance(bundle, NativeBundle):
+        return native_overlay(raw, bundle)
+    if raw.get("runtime", "nvidia-container") != "nvidia-container":
+        raise ValueError(f"an image bundle pins a CUDA inference image, but this session runs the {raw['runtime']} "
+                         "runtime; pass the native-bundle.json it was prepared with instead")
+    raw["inference_image"] = bundle.inference.model_dump(mode="json")
+    if raw["evaluator"]["mode"] == "container":
+        raw["evaluator"]["image"] = bundle.evaluator.model_dump(mode="json")
+    if bundle.worker is not None:
+        raw["worker_image"] = bundle.worker.model_dump(mode="json")
+    return raw
+
+
+def bundled_base(session: "ContainerSessionConfig", bundle) -> ContainerRunConfig:
+    """The session's base candidate as the bundle will actually serve it (the base itself without a bundle)."""
+    if bundle is None:
+        return session.base
+    raw = _overlay_bundle(session.base.model_dump(mode="json"), bundle)
+    return ContainerRunConfig.model_validate_json(canonical_json(raw))
 
 
 def _file_sha256(path: Path) -> str:
@@ -367,7 +464,8 @@ def holdout_selections(session: ContainerSessionConfig) -> tuple[TaskSelection, 
 
 def run_config_for(session: ContainerSessionConfig, bundle, proposal, *, benchmarks=None,
                    baseline=None) -> ContainerRunConfig:
-    """Candidate configuration for a proposal; images come from the bundle, labels from the proposal."""
+    """Candidate configuration for a proposal; images (or the native server) come from the bundle, labels from
+    the proposal. See ``_overlay_bundle`` for what each kind of bundle lays over the candidate."""
     from .proposals import apply
     if proposal.family == "baseline":
         base = session.base
@@ -380,11 +478,7 @@ def run_config_for(session: ContainerSessionConfig, bundle, proposal, *, benchma
                benchmarks=[item.model_dump(mode="json") for item in (benchmarks or session.base.benchmarks)])
     raw["bounds"]["candidate_wall_seconds"] = session.budgets.candidate_wall_seconds
     if bundle is not None:
-        raw["inference_image"] = bundle.inference.model_dump(mode="json")
-        if raw["evaluator"]["mode"] == "container":
-            raw["evaluator"]["image"] = bundle.evaluator.model_dump(mode="json")
-        if bundle.worker is not None:
-            raw["worker_image"] = bundle.worker.model_dump(mode="json")
+        _overlay_bundle(raw, bundle)
     return ContainerRunConfig.model_validate_json(canonical_json(raw))
 
 
@@ -420,13 +514,25 @@ def _task_selection(selection) -> TaskSelection:
 
 def to_manifest(config: ContainerRunConfig, *, template_hash: str, scorer_revision: str, environment_hash: str,
                 block_count: int | None = None) -> ExperimentManifest:
-    """Controller manifest for a container candidate; unmapped engine fields hash into runtime_revision."""
-    engine, asset, image = config.engine, config.model, config.inference_image
-    if not image.build_info:
-        raise ValueError("inference image build_info is required for runtime_revision")
+    """Controller manifest for a candidate; unmapped engine fields hash into runtime_revision.
+
+    ``runtime_revision`` is ``<build_info>+<sha12 of the unmapped engine fields>`` for an NVIDIA candidate, as it
+    always was. A metal-native candidate's is prefixed ``metal:``: the Metal and CUDA backends of one llama.cpp
+    commit are different kernels on different hardware, and the controller treats equal ``BackendSettings`` as the
+    same backend. The prefix, rather than a new ``BackendSettings`` field, keeps every NVIDIA manifest fingerprint
+    byte-identical.
+    """
+    engine, asset = config.engine, config.model
+    if config.runtime == "metal-native":
+        build, prefix = config.native_server.build_info, METAL_REVISION_PREFIX
+    else:
+        image = config.inference_image
+        if not image.build_info:
+            raise ValueError("inference image build_info is required for runtime_revision")
+        build, prefix = image.build_info, ""
     unmapped = {key: value for key, value in engine.model_dump(mode="json").items()
                 if key not in MAPPED_ENGINE_FIELDS}
-    revision = f"{image.build_info}+{hashlib.sha256(canonical_json(unmapped).encode()).hexdigest()[:12]}"
+    revision = f"{prefix}{build}+{hashlib.sha256(canonical_json(unmapped).encode()).hexdigest()[:12]}"
     if engine.n_gpu_layers == "all":
         offload = 1.0
     elif engine.n_gpu_layers == 0:
@@ -559,21 +665,53 @@ def _epoch(utc: str) -> float:
     return datetime.fromisoformat(utc).timestamp()
 
 
-def _authorize(lock: SessionLock) -> None:
-    for operation in ("container", "load", "inference"):
+def _authorize(lock: SessionLock, operations: tuple[str, ...] = NVIDIA_OPERATIONS) -> None:
+    for operation in operations:
         lock.check(operation, RunMode.LIVE)
+
+
+def required_operations_for(config: ContainerRunConfig) -> tuple[str, ...]:
+    """The ``runtime-policy.json`` operations running ``config`` needs, from the runtime registry.
+
+    One source of truth (``runtime.required_operations``): the NVIDIA tuple is exactly ``NVIDIA_OPERATIONS``;
+    a metal-native config needs ``native`` instead of ``container``, plus ``container`` again only when it
+    carries a coding broker (whose sandbox workers are containers). Imported lazily so importing this module
+    stays inert.
+    """
+    from .runtime import required_operations
+    return tuple(required_operations(config))
+
+
+def authorize_config(lock: SessionLock, config: ContainerRunConfig) -> None:
+    """Refuse a single candidate (``sample``, ``candidate``) this policy does not allow for its runtime."""
+    _authorize(lock, required_operations_for(config))
+
+
+def authorize_session(lock: SessionLock, session: ContainerSessionConfig, bundle=None) -> None:
+    """Refuse, before anything is written or started, a session this policy does not allow.
+
+    Checked for the session's base candidate and, when a bundle is given, for the base as that bundle will serve
+    it: a native bundle laid over a session turns its candidates into host processes, and the permission that
+    matters is the one for what will actually run, not for what the session file was first written for.
+    """
+    _authorize(lock, required_operations_for(session.base))
+    if bundle is not None:
+        _authorize(lock, required_operations_for(bundled_base(session, bundle)))
 
 
 # ---- orchestration ------------------------------------------------------------------------------------------
 
 def _tune_bundle(bundle, bundle_path) -> tuple[Any, str | None]:
-    """The effective bundle for tune: read from ``bundle_path`` (recorded in the ledger) or given in memory."""
+    """The effective bundle for tune: read from ``bundle_path`` (recorded in the ledger) or given in memory.
+
+    Either kind of bundle (``read_bundle``); the ledger keeps its ``image_bundle`` key for both."""
     if bundle_path is None:
         return bundle, None
     path = Path(bundle_path).resolve()
-    loaded = read_image_bundle(path)
+    loaded = read_bundle(path)
     if bundle is not None and image_ids(bundle) != image_ids(loaded):
-        raise ValueError(f"the given image bundle and {path} pin different image IDs")
+        raise ValueError(f"the given bundle and {path} pin different images or native servers "
+                         f"({image_ids(bundle)} != {image_ids(loaded)})")
     return loaded, str(path)
 
 
@@ -612,19 +750,21 @@ def tune(session: ContainerSessionConfig, output: str | Path, *, runner, session
          proposals=None) -> dict:
     """Start a new session in ``output``: exclusive ledger, campaign, reports. Setup time is charged.
 
-    ``bundle_path`` (the effective ``--image-bundle``) is read here and pinned in the ledger with its image IDs so
-    ``resume`` rebuilds the identical candidates; an in-memory ``bundle`` alone pins the IDs but no path.
+    ``bundle_path`` (the effective ``--image-bundle``, or the native bundle of a metal-native session) is read here
+    and pinned in the ledger with what it pins so ``resume`` rebuilds the identical candidates; an in-memory
+    ``bundle`` alone pins the IDs but no path.
     ``started_wall``/``started_clock`` let the caller charge work done before this call (GGUF hashing and
     session derivation in ``main_tune``) to the session wall and the durable campaign checkpoint.
     """
     from ..provenance import environment_record
     from ..registry import builtin_registry
     from .proposals import deterministic_schedule, load_proposal_file
-    _authorize(session_lock)
+    _authorize(session_lock, required_operations_for(session.base))
     _refuse_while_gpu_locked()
     started_wall = wall() if started_wall is None else started_wall
     started_clock = clock() if started_clock is None else started_clock
     bundle, bundle_location = _tune_bundle(bundle, bundle_path)
+    authorize_session(session_lock, session, bundle)  # what the bundle will actually run, before anything is written
     root = Path(output).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if (root / LEDGER_NAME).exists():
@@ -665,20 +805,30 @@ def tune(session: ContainerSessionConfig, output: str | Path, *, runner, session
 
 
 def _resume_bundle(ledger: dict, bundle):
-    """The bundle tune pinned: the ledger path, or an explicit bundle carrying the same image IDs."""
+    """The bundle tune pinned: the ledger path, or an explicit bundle carrying the same pins.
+
+    For a native session the pins are the executable and library digests (``image_ids``), so a rebuilt or
+    upgraded llama-server is refused exactly like a different inference image, and a moved one is accepted."""
     pinned = ledger["image_ids"]
     if pinned is None:
         if bundle is not None:
             raise ValueError("this session ran without an image bundle; an image bundle on resume would change "
                              "the inference image, start a new session instead")
         return None
+    native = "native_server" in pinned
     if bundle is None:
         path = ledger["image_bundle"]
         if not path or not Path(path).is_file():
+            if native:  # `resume --image-bundle` reads either kind (`read_bundle`); resume has no --native-bundle
+                raise ValueError(f"the native bundle recorded at tune ({path!r}) is missing; pass the moved "
+                                 f"native-bundle.json as --image-bundle with the same pins {pinned} to continue")
             raise ValueError(f"the image bundle recorded at tune ({path!r}) is missing; pass --image-bundle with "
                              f"the same image IDs {pinned} to continue")
-        bundle = read_image_bundle(path)
+        bundle = read_bundle(path)
     if image_ids(bundle) != pinned:
+        if native:
+            raise ValueError(f"bundle pins {image_ids(bundle)} differ from the ledger's native server pins {pinned}; "
+                             "resume refuses to change the llama-server, start a new session instead")
         raise ValueError(f"image bundle image IDs {image_ids(bundle)} differ from the ledger {pinned}; resume "
                          "refuses to change images, start a new session instead")
     return bundle
@@ -695,11 +845,11 @@ def resume(output: str | Path, *, runner, session_lock: SessionLock, bundle=None
     from ..provenance import environment_record
     from ..registry import builtin_registry
     from .proposals import Proposal, deterministic_schedule
-    _authorize(session_lock)
     root = Path(output).resolve()
     ledger = read_ledger(root)
     config_path = root / SESSION_CONFIG_NAME
     session = read_session_config(config_path)
+    _authorize(session_lock, required_operations_for(session.base))  # the runtime is the session's; read first
     if session.session_id != ledger["session_id"]:
         raise ValueError("session-config.json does not belong to session.json")
     policy = policy_for(session)
@@ -712,6 +862,7 @@ def resume(output: str | Path, *, runner, session_lock: SessionLock, bundle=None
     if session.proposal_mode == "deterministic" and proposals != deterministic_schedule(session):
         raise ValueError("the deterministic schedule no longer matches the ledger")
     bundle = _resume_bundle(ledger, bundle)
+    authorize_session(session_lock, session, bundle)
     facts = {sha: {"template_hash": value, "block_count": (ledger.get("block_counts") or {}).get(sha)}
              for sha, value in ledger["template_hashes"].items()}
     scorer, environment = builtin_registry().digest(), environment_record()["sha256"]
@@ -843,15 +994,46 @@ def add_session_commands(subparsers) -> None:
     resume_parser = subparsers.add_parser("resume", help="Continue a started session under its persisted deadline")
     resume_parser.add_argument("--output", required=True)
     resume_parser.add_argument("--image-bundle", help="only when the bundle tune used has moved; its image IDs "
-                                                      "must equal the ones pinned in session.json")
+                                                      "(or, for a metal-native session's native-bundle.json, its "
+                                                      "executable and library digests) must equal the ones pinned "
+                                                      "in session.json")
     for command in (tune_parser, resume_parser):
         command.add_argument("--policy", default="runtime-policy.json")
         command.add_argument("--capabilities-dir", default=DEFAULT_CAPABILITIES)
 
 
 def _default_runner_factory(args, policy: CampaignPolicy):
-    from .runner import ContainerRunner
-    return ContainerRunner(capabilities_dir=args.capabilities_dir, policy_path=args.policy, policy=policy)
+    """The runner for whichever runtime each candidate names. For an NVIDIA candidate the dispatcher builds
+    exactly ``ContainerRunner(capabilities_dir=..., policy_path=..., policy=...)``, lazily, as this factory did."""
+    from .runtime import DispatchRunner
+    return DispatchRunner(capabilities_dir=args.capabilities_dir, policy_path=args.policy, policy=policy)
+
+
+def _requested_runtime(args) -> tuple[str | None, str | None]:
+    """``(runtime, native_bundle)`` as asked on the command line, refusing contradictions; never a guess.
+
+    ``--runtime``/``--native-bundle`` are read with ``getattr`` because the top-level CLI adds them to this
+    parser (``cli.py``), not ``add_session_commands``; a parser without them asks for the NVIDIA session this
+    command always ran. Both flags are explicit, as ``cli._run_tune`` also requires: a native bundle never switches
+    the runtime by itself, and ``--runtime metal-native`` never runs without the pinned server it describes.
+    """
+    runtime, native = getattr(args, "runtime", None), getattr(args, "native_bundle", None)
+    if runtime is not None and runtime not in RUNTIMES:
+        raise ValueError(f"unknown runtime {runtime!r}; expected one of {', '.join(RUNTIMES)}")
+    if native is not None and runtime != "metal-native":
+        raise ValueError("--native-bundle pins a metal-native llama-server; add --runtime metal-native (the "
+                         "nvidia-container runtime takes --image-bundle)")
+    if runtime == "metal-native" and native is None:
+        raise ValueError("--runtime metal-native needs --native-bundle (native-bundle.json from `llmbench prepare "
+                         "--runtime metal-native`): it is what pins the llama-server executable that will run")
+    return runtime, native
+
+
+def _native_bundle_at(path: str | Path, flag: str) -> NativeBundle:
+    bundle = read_bundle(path)
+    if not isinstance(bundle, NativeBundle):
+        raise ValueError(f"{flag} {path} is an image bundle (NVIDIA images), not a native-bundle.json")
+    return bundle
 
 
 def _exit_code(outcome: dict) -> int:
@@ -869,29 +1051,58 @@ def main_tune(args, *, runner_factory=None, clock=time.monotonic, wall=time.time
     started, started_clock = wall(), clock()  # derivation and GGUF hashing below are charged to the session
     try:
         lock = SessionLock.read(args.policy)
-        _authorize(lock)
         floor, ceiling = getattr(args, "context_floor", None), getattr(args, "context_ceiling", None)
         if args.config:
             if floor is not None or ceiling is not None:
                 raise ValueError("--context-floor/--context-ceiling derive a search space from --model; a --config "
                                  "session already fixes its own ctx_tiers and context range")
-            session = read_session_config(args.config)
+            if getattr(args, "native_bundle", None) is not None:
+                raise ValueError("--native-bundle derives a metal-native session from --model; a --config session "
+                                 "already pins its runtime in `base` and its bundle in `image_bundle` (a moved "
+                                 "bundle goes in --image-bundle)")
+            session = read_session_config(args.config)  # a bounded read: the runtime is the session's own
+            runtime = getattr(args, "runtime", None)
+            if runtime is not None and runtime != session.base.runtime:
+                raise ValueError(f"--runtime {runtime} differs from the {session.base.runtime} runtime this session "
+                                 "config's base candidate names; a --config session is run as it is written")
+            _authorize(lock, required_operations_for(session.base))
         else:
             from .derive import derive_session_config
             from .config import read_run_config
+            native_path = _requested_runtime(args)[1]  # metal-native exactly when a native bundle is given
+            if native_path is None:
+                _authorize(lock)  # the NVIDIA session: refused before any GGUF is hashed, as it always was
             if args.search != "default":
                 raise ValueError(f"unknown search preset {args.search!r}; only 'default' exists")
-            bundle = read_image_bundle(args.image_bundle) if args.image_bundle else None
-            session = derive_session_config(args.model, base=read_run_config(args.base_config),
-                                            budget_seconds=args.budget_seconds or 14400,
-                                            image_bundle=args.image_bundle,
-                                            inference_image=bundle.inference if bundle else None,
-                                            context_floor=floor, context_ceiling=ceiling)
+            if native_path is None:
+                bundle = read_bundle(args.image_bundle) if args.image_bundle else None
+                if isinstance(bundle, NativeBundle):
+                    raise ValueError(f"--image-bundle {args.image_bundle} is a native bundle; pass it as "
+                                     "--native-bundle with --runtime metal-native")
+                session = derive_session_config(args.model, base=read_run_config(args.base_config),
+                                                budget_seconds=args.budget_seconds or 14400,
+                                                image_bundle=args.image_bundle,
+                                                inference_image=bundle.inference if bundle else None,
+                                                context_floor=floor, context_ceiling=ceiling)
+            else:
+                from .derive import planned_operations
+                if args.image_bundle:
+                    raise ValueError("--image-bundle pins NVIDIA container images; a metal-native session is pinned "
+                                     "by --native-bundle alone")
+                native = _native_bundle_at(native_path, "--native-bundle")
+                base = read_run_config(args.base_config)
+                # Refused before any GGUF is hashed, for the base as the derivation will serve it: the native
+                # server, and the template's broker only when the bundle's sandbox verdict keeps it.
+                _authorize(lock, planned_operations(base, native_bundle=native))
+                session = derive_session_config(args.model, base=base, budget_seconds=args.budget_seconds or 14400,
+                                                image_bundle=native_path, native_bundle=native,
+                                                context_floor=floor, context_ceiling=ceiling)
         if args.budget_seconds:
             raw = session.model_dump(mode="json")
             raw["budgets"]["wall_seconds"] = args.budget_seconds
             session = ContainerSessionConfig.model_validate_json(canonical_json(raw))
-        bundle_path = args.image_bundle or session.image_bundle  # the effective bundle; tune pins it in the ledger
+        # The effective bundle (an image bundle, or a metal-native session's native bundle); tune pins it.
+        bundle_path = args.image_bundle or session.image_bundle
         policy = policy_for(session)
         runner = (runner_factory or _default_runner_factory)(args, policy)
         outcome = tune(session, args.output, runner=runner, session_lock=lock, bundle_path=bundle_path, clock=clock,
@@ -909,9 +1120,17 @@ def main_tune(args, *, runner_factory=None, clock=time.monotonic, wall=time.time
 def main_resume(args, *, runner_factory=None, clock=time.monotonic, wall=time.time) -> int:
     try:
         lock = SessionLock.read(args.policy)
-        _authorize(lock)
-        session = read_session_config(Path(args.output) / SESSION_CONFIG_NAME)
-        bundle = read_image_bundle(args.image_bundle) if args.image_bundle else None
+        session = read_session_config(Path(args.output) / SESSION_CONFIG_NAME)  # the runtime is the session's
+        _authorize(lock, required_operations_for(session.base))
+        runtime = getattr(args, "runtime", None)
+        if runtime is not None and runtime != session.base.runtime:
+            raise ValueError(f"--runtime {runtime} differs from the {session.base.runtime} runtime this session was "
+                             "tuned with; resume continues the session as it was started")
+        image_path, native_path = args.image_bundle, getattr(args, "native_bundle", None)
+        if image_path and native_path:
+            raise ValueError("pass a moved bundle once: --image-bundle or --native-bundle, not both")
+        bundle = (_native_bundle_at(native_path, "--native-bundle") if native_path
+                  else read_bundle(image_path) if image_path else None)
         policy = policy_for(session)
         runner = (runner_factory or _default_runner_factory)(args, policy)
         outcome = resume(args.output, runner=runner, session_lock=lock, bundle=bundle, clock=clock, wall=wall)
@@ -935,9 +1154,12 @@ def main(argv=None, *, runner_factory=None) -> int:
 
 
 __all__ = ["SessionBudgets", "SearchSpace", "HoldoutPlan", "ContainerSessionConfig", "read_session_config",
-           "read_image_bundle", "image_ids", "policy_for", "holdout_selections", "run_config_for", "to_manifest",
-           "asset_metadata", "check_context_range_against_headers", "build_candidates", "output_reserve_tokens",
-           "usable_input_tokens", "tune", "resume", "add_session_commands", "main_tune", "main_resume", "main"]
+           "read_image_bundle", "read_bundle", "image_ids", "native_overlay", "bundled_base",
+           "required_operations_for", "authorize_config", "authorize_session", "policy_for", "holdout_selections",
+           "run_config_for",
+           "to_manifest", "asset_metadata", "check_context_range_against_headers", "build_candidates",
+           "output_reserve_tokens", "usable_input_tokens", "tune", "resume", "add_session_commands", "main_tune",
+           "main_resume", "main"]
 
 
 if __name__ == "__main__":  # python -m llmbench.containers.session tune|resume ... (until cli.py wires them)

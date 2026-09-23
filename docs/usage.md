@@ -1,7 +1,8 @@
 # Usage
 
 All commands are `llmbench <command>` (or `python run.py <command>` from a checkout). Commands that start
-containers need `runtime-policy.json` in the working directory; without it they exit 2 and do nothing.
+containers, or a native `llama-server` on a Mac, need `runtime-policy.json` in the working directory; without it
+they exit 2 and do nothing.
 
 ## Preparation and retries
 
@@ -115,9 +116,245 @@ Then use a base config that carries a `broker` block and the worker image: copy 
 set `worker_image.image_id` and `worker_image.reference` to the id in `worker-image.id`, and pass it with
 `--base-config`. `broker.max_requests` must cover one request per EvalPlus item and two per Polyglot exercise.
 
+On an Apple Silicon Mac the worker is built for `linux/arm64` and pinned in the native bundle instead; see
+[Apple Silicon (Metal) native runtime](#apple-silicon-metal-native-runtime).
+
 Give reasoning models a real output budget (`generation.max_output_tokens`, 8192 or more) or their thinking is
 cut off and scored as failure; `scripts/coding_report.py --root <sweep> [--suite aider-polyglot]` prints how many
 responses hit the cap beside every score, and paired significance tests between candidates and models.
+
+## Apple Silicon (Metal) native runtime
+
+On an Apple Silicon Mac there is no NVIDIA GPU for the inference container, so the `metal-native` runtime runs a
+**pinned llama.cpp `llama-server` executable directly on the Mac with Metal offload**. Everything else is the same
+as on NVIDIA: the benchmark definitions, datasets, scorers, the stage machine, the settings evidence, the analysis
+and the reports. Model-written code still runs only in the sandboxed Docker worker, never on the Mac itself; without
+Docker the coding suites are recorded as **blocked**.
+
+Select it with `--runtime metal-native` together with the `native-bundle.json` that pins the server
+(`--native-bundle`). A candidate config says which runtime it is (`"runtime": "metal-native"`, a `native_server`
+and `native_limits`, no `inference_image`); a config that names no runtime is an NVIDIA config, unchanged.
+
+### 1. Authorise native execution
+
+Running a host executable is a separate permission from running containers, so a policy written for the NVIDIA
+containers never silently authorises it. The machine's owner adds it to `runtime-policy.json`:
+
+```json
+{
+  "allow_model_operations": true,
+  "allow_inference": true,
+  "allow_container_execution": true,
+  "allow_native_execution": true,
+  "reason": "Allow the pinned llama-server on this Mac, and the coding sandbox containers."
+}
+```
+
+A native candidate needs `allow_native_execution`, `allow_model_operations` and `allow_inference`.
+`allow_container_execution` is needed only for the coding sandbox: inspecting the worker image at prepare time,
+and a session whose base config carries a `broker`. An absent `allow_native_execution` means false.
+
+### 2. Install the pinned llama.cpp release
+
+```bash
+# From a copy you downloaded yourself (no network is used):
+python scripts/install_llamacpp_macos.py --archive ~/Downloads/llama-b11011-bin-macos-arm64.tar.gz
+# Or let the script fetch the pinned release asset (explicit opt-in):
+python scripts/install_llamacpp_macos.py --download
+```
+
+The pin is llama.cpp `b11011` (commit `aa39d7a3e145a88202793a89462d65e94a5fc25f`), release asset
+`llama-b11011-bin-macos-arm64.tar.gz`, 11156605 bytes, SHA-256
+`9f88854d8216454a883f6d970e52a888d85c1ff321086c08c3d2f69362e0154d`, built upstream by the release workflow's
+macOS arm64 job with `-DGGML_METAL_EMBED_LIBRARY=ON` and `-DGGML_RPC=ON` among its flags. The size and hash are
+checked **before** anything is extracted; unsafe members (absolute paths, `..`, links leaving the directory) are
+refused; the `com.apple.quarantine` attribute is removed; and the executable's own `--version` must report build
+11011, commit `aa39d7a3e`. The result is `artifacts/native-runtime/llama-b11011/` (`--output` changes the root) with
+an `install-manifest.json` recording the asset, its hash, the upstream build flags and every file's SHA-256. An
+existing install directory is reused only when its files match; it is never overwritten. Running the executable,
+even as `--version`, is native execution, so the installer needs `allow_native_execution` too.
+
+### 3. Prepare: pin the executable
+
+```bash
+llmbench prepare --runtime metal-native \
+  --llama-server artifacts/native-runtime/llama-b11011/llama-server --output artifacts/native-prep
+```
+
+`prepare` refuses anything but macOS on Apple Silicon. It hashes the executable and every `lib*.dylib` beside it
+(the Metal backend lives in `libggml-metal`, so the executable alone would not pin what runs), checks the
+directory against its `install-manifest.json` when there is one, runs the executable **only** as `--version`,
+`--help` and `--list-devices` (with a scrubbed environment and a timeout), refuses unless a Metal (`MTL`) device is
+listed, checks that every flag the harness can pass exists in this build, and writes `native-bundle.json` last. An
+existing bundle is never overwritten: prepare again into a new directory. The saved `llama-server-help.txt`,
+`llama-server-version.txt` and `llama-server-devices.txt` are what `llmbench capabilities` reads for a Metal
+config (default directory `artifacts/native-prep`).
+
+The Metal build's `--help` differs from the CUDA image's (it lists the `--rpc` option), so its `help_sha256`
+differs too; the two runtimes are never mistaken for each other.
+
+### 4. Stage the datasets
+
+```bash
+python scripts/stage_benchmark_datasets.py      # once, with network; writes artifacts/benchmark-datasets/
+```
+
+The Mac evaluator is always a host process, so it reads the staged corpora directly; pass the directory with
+`--dataset-root` (the default is `artifacts/benchmark-datasets` when it exists).
+
+### 5. Optional: the coding sandbox (Docker in a Linux VM)
+
+EvalPlus, Aider Polyglot and the local coding fixtures execute generated code, which only ever happens in the
+sandboxed worker container. On a Mac that needs Docker in a Linux VM, for example Colima:
+
+```bash
+brew install colima docker
+colima start --cpu 2 --memory 2              # the VM's memory comes out of the same unified pool as the model
+
+# Build the worker natively for arm64 (no emulation); use the official multi-platform index digest.
+python scripts/build_worker_image.py --platform linux/arm64 --output artifacts/native-prep/worker-image \
+  --base-image node:24-bookworm-slim@sha256:<index digest>
+
+# Check the harness against ground truth in THIS sandbox: every reference passes, every stub fails.
+python scripts/polyglot_reference_calibration.py --iidfile artifacts/native-prep/worker-image/worker-image.id
+
+# Pin the worker together with the server. A bundle is never overwritten, so after step 3 this is a new
+# directory; pass its native-bundle.json to tune from then on.
+llmbench prepare --runtime metal-native \
+  --llama-server artifacts/native-runtime/llama-b11011/llama-server --output artifacts/native-prep-coding \
+  --worker-iidfile artifacts/native-prep/worker-image/worker-image.id
+```
+
+`prepare` probes the sandbox without side effects (Docker CLI present, daemon reachable, the pinned worker image
+present locally, container execution allowed) and records the verdict in the bundle's `sandbox` block. Derivation
+plans from that verdict: when it is not `available`, the three code-executing suites are planned as `blocked` with
+the reason (`the Docker sandbox is unavailable (...); generated code is never executed on the host`), not
+selected, and the base config's `broker` is dropped. Starting Colima later does not change a bundle: prepare again
+into a new directory. To actually run the coding suites, also give `tune` a base config with a `broker` block
+(copy `examples/candidate-coding.json`, point `worker_image` at the arm64 image, pass it with `--base-config`). A
+candidate whose config carries a broker probes the sandbox again before evaluating; if it has gone away, the coding
+rows are recorded as `environment_error` with reason `sandbox_unavailable: ...`; the candidate, session,
+cross-model and coding reports print the category as `blocked`, never as a score of zero (the rows still count as
+failures in the denominator, so such a candidate cannot meet a coding floor).
+
+### 6. Check before running (free)
+
+```bash
+llmbench validate --config my-metal-candidate.json
+llmbench plan --config my-metal-candidate.json           # runtime, native server argv, unsupported/not-enforced
+llmbench capabilities --config my-metal-candidate.json   # reads artifacts/native-prep by default
+llmbench doctor --native-bundle artifacts/native-prep/native-bundle.json
+```
+
+For a Metal config `plan` prints the native server argv (the model's host path, `--host 127.0.0.1`, and a port
+placeholder; the real port is chosen when the server starts) and no Compose project. `doctor` adds a static
+runtime block: platform, total memory, whether `docker` is on the PATH, the GPU lease, and for a native bundle
+whether its executable still exists with the pinned SHA-256. None of them starts anything.
+
+### 7. Tune, sweep, resume
+
+```bash
+llmbench tune --model /path/to/model.gguf --runtime metal-native \
+  --native-bundle artifacts/native-prep/native-bundle.json \
+  --dataset-root artifacts/benchmark-datasets --output runs/mac-model --budget-seconds 7200
+
+python scripts/sweep_models.py --models a.gguf b.gguf --output runs/mac-compare --runtime metal-native \
+  --native-bundle artifacts/native-prep/native-bundle.json --dataset-root artifacts/benchmark-datasets
+
+llmbench resume --output runs/mac-model
+
+llmbench candidate --config my-metal-candidate.json \
+  --native-bundle artifacts/native-prep/native-bundle.json --output runs/one-candidate
+```
+
+`--runtime metal-native` always needs `--native-bundle`, and a native bundle is never accepted without it. Without
+`--context-floor/--context-ceiling`, a Mac session is derived at 4096 usable input tokens (RULER's shortest
+length, so every suite can be planned); the NVIDIA defaults are unchanged. The per-item time estimates the plan
+uses were measured on the NVIDIA host, so a Mac plan multiplies them by a `planning_slowdown` of 3.0, recorded in
+`session-config.json` and printed with the plan. `candidate --native-bundle` refuses a bundle whose executable,
+library, build or help pins differ from the config's, and `resume` one whose executable, library or worker-image
+pins differ from the session's: a rebuilt server (or sandbox) is a new session. After each model the sweep
+checks that the GPU lease is released and that no process is still running the bundle's executable. A Metal
+candidate's `runtime_revision` is prefixed `metal:`, so a CUDA and a Metal result of the same llama.cpp commit are
+never treated as the same backend.
+
+### How memory is measured and labelled
+
+Apple Silicon has one physical memory pool shared by the CPU, the GPU and every other application, so a Metal
+candidate has **no VRAM figure** (`vram_used_mib_after_load` stays null) and reports never put its numbers in the
+`VRAM MiB` column. Instead, `result.json → memory` (`"kind": "apple-unified"`) records:
+
+| Where | What it is |
+|---|---|
+| `admission` | three samples before the load: host available memory, macOS memory pressure, GPU utilisation, swap, power |
+| `after_load.server_phys_footprint_mib` | the llama-server process's `phys_footprint` (what Activity Monitor calls Memory); **includes** its Metal allocations |
+| `after_load.server_rss_mib` | its resident set size, for comparison; the footprint, not the RSS, is the figure that counts the Metal allocations |
+| `after_load.host_memory_available_mib`, `swap_used_mib`, `memory_pressure_level` | host-wide: other applications included |
+| `after_load.power` | `pmset -g batt`: AC or battery and the battery percentage |
+| `server_log.metal_resident_mib`, `metal_budget_mib` | the model, KV, compute and recurrent buffers the server logged on the Metal device, and the Metal working-set budget it reported |
+| `during_evaluation` | the memory watchdog's summary: peak footprint, lowest available memory, highest pressure, swap growth, GPU utilisation, violations |
+| `memory_breakdown_at_exit` | llama.cpp's own memory table printed when the server stopped |
+| `coding_sandbox` | the sandbox probe for this candidate |
+
+The raw samples are kept in `memory-samples.jsonl` and `verify.json`. In reports: the candidate report prints
+`VRAM after load not applicable: unified memory` and a `Unified memory after load` line; the session table appends
+`Runtime`, `Server footprint MiB (unified)`, `Metal buffers MiB`, `Swap growth MiB` and `Power` columns (`-` on
+NVIDIA rows); the cross-model report adds the same columns when a Mac session is present and never takes a
+lowest-VRAM figure across the two kinds of memory. `KV placement` `gpu`/`ram` on a Mac means Metal buffers versus
+CPU buffers in the same memory.
+
+### Admission, the memory watchdog and cleanup
+
+There is no cgroup around a macOS process, so `native_limits` are checked by the runner instead:
+
+| `native_limits` field | Default | Meaning |
+|---|---|---|
+| `memory_reserve_mib` | 1024 | admission needs the model file plus this much host memory available |
+| `max_memory_pressure_level` | 2 | admission refuses above this macOS pressure level (1 normal, 2 warn, 4 critical) |
+| `max_foreign_gpu_utilization_percent` | 50 | admission refuses when the GPU is already busier than this (median of the samples) |
+| `max_server_footprint_mib` | none | the watchdog stops the server above this footprint; none = the Metal budget from the startup log |
+| `max_swap_growth_mib` | 2048 | the watchdog stops the server when host swap grows more than this since admission |
+| `sample_interval_seconds` | 1.0 | how often the watchdog samples during evaluation |
+| `stop_grace_seconds` | 15 | SIGTERM to SIGKILL grace when stopping the server |
+
+Admission refuses rather than guesses: missing telemetry is a refusal, and a busy GPU or a Mac under memory
+pressure is a conflict to report, never a process to stop. The watchdog also stops the server at critical pressure
+(level 4); the candidate then fails with `native_memory_watchdog: <reason>`. Nothing but the candidate's own
+server is ever stopped.
+
+The server runs in its own process group, bound to `127.0.0.1` on a port chosen when it starts, with every
+`LLAMA_*`, `GGML_*`, `HF_*`/`HUGGINGFACE_*`, `DYLD_*` (dynamic-loader overrides such as `DYLD_INSERT_LIBRARIES`),
+`MTL_*`/`METAL_*` (Metal debug and validation layers) and `*_proxy` variable removed from its environment, so
+nothing but the recorded argv configures it and no unpinned code is loaded into it. Cleanup sends SIGTERM to that
+group, then SIGKILL after the grace period, and is verified only when the child was reaped, its process group is
+empty, no process carries this candidate's `--alias` and `--port`, and the port refuses connections. Anything less is
+`cleanup-uncertain` (exit code 4) and stops the campaign, exactly like a container that would not go away. A
+server that died of a SIGKILL the harness did not send is reported as such (macOS can do that under memory
+pressure; the report does not claim it did).
+
+### What is unsupported or not enforced
+
+* **Refused:** `evaluator.mode: container` (the evaluator container's network cannot reach a server on the Mac's
+  loopback; the evaluator is a host process) and `limits.gpu_device_id` other than `"0"` (Metal exposes one
+  device, `MTL0`).
+* **Accepted but not enforced, and listed in the candidate report:** `limits.inference_memory_mib` and
+  `limits.inference_cpus` are Docker cgroup limits a host process does not have (the admission and the watchdog
+  apply instead; CPU use follows `engine.threads`/`engine.threads_batch`), and `limits.max_foreign_vram_mib` is
+  NVIDIA-only (the GPU-utilisation admission replaces it).
+* **One Mac, one server at a time.** The same GPU lease as the NVIDIA runtime serialises every live run. If a run
+  was killed, `llmbench doctor` names the lease holder; for a native run it tells you to check that its
+  `llama-server` is gone (`ps -p <pid>` when the pid was recorded, else `pgrep -fl llama-server`), not `docker ps`.
+
+### Results on a laptop
+
+A Mac shares its memory, its GPU and its power budget with everything else running on it. Before measuring, close
+memory-heavy applications (the machine's owner decides what to close; the harness never stops anything of theirs),
+and prefer AC power: every Metal result records the power source and the battery percentage, and a result measured
+on battery or under memory pressure should be read as such. Swap growth is host-wide, so it can come from another
+application. Compare Mac results with Mac results measured the same way; a Mac tok/s and an NVIDIA tok/s measure
+different hardware, and a unified-memory footprint is never a VRAM figure.
+
+<!-- TODO(lead): append the measured metal-native results (machine, model, candidates, tok/s, footprint) here. -->
 
 ## Screen, measure interactions, then confirm
 

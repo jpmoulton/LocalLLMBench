@@ -1,4 +1,11 @@
-"""Durable, explicit sequential candidates. Default is read-only --check; only --run starts inference."""
+"""Durable, explicit sequential candidates. Default is read-only --check; only --run starts inference.
+
+A plan names the runtime its candidates run under with the optional ``inference_runtime`` (default
+``nvidia-container``, pinned by ``image_bundle`` exactly as before). ``metal-native`` plans are pinned by
+``native_bundle`` instead and take no ``image_bundle``; every config must run the plan's runtime and match its
+bundle's pins, and each candidate is launched with ``--native-bundle``. Terminal evidence must prove cleanup either
+way: no container, network or owned server process left, and for a native server that was started, how it exited.
+"""
 from __future__ import annotations
 
 import argparse
@@ -20,14 +27,18 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from llmbench.containers.cli import check_image_bundle  # noqa: E402
+from llmbench.containers.cli import check_image_bundle, check_native_bundle  # noqa: E402
 from llmbench.containers.config import (  # noqa: E402
-    ContainerRunConfig, ContainerRunResult, read_image_bundle,
+    DEFAULT_RUNTIME, RUNTIMES, ContainerRunConfig, ContainerRunResult, read_image_bundle, read_native_bundle,
 )
 from llmbench.containers.preflight import check_path_lengths  # noqa: E402
 
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
-TOP_FIELDS = {"schema_version", "plan_id", "image_bundle", "entries"}
+TOP_FIELDS = {"schema_version", "plan_id", "entries"}
+OPTIONAL_FIELDS = {"min_free_disk_gib", "source_snapshot", "image_bundle", "inference_runtime", "native_bundle"}
+BUNDLE_FIELD = {"nvidia-container": "image_bundle", "metal-native": "native_bundle"}
+"""Which plan field pins each runtime's server. Exactly one is present: the other runtime's bundle has nothing to
+say about these candidates, and accepting it would compare nothing and pass."""
 ENTRY_FIELDS = {"id", "config", "output", "budget_seconds", "phase", "model"}
 GLOBAL_LOCK_DIR = ROOT / "artifacts" / ".prepared-sweep-supervisor"
 
@@ -81,10 +92,15 @@ def read_plan(path):
     path = Path(path).resolve(strict=True)
     base = path.parent
     raw = load_json(path)
-    if (not isinstance(raw, dict) or not TOP_FIELDS.issubset(raw)
-            or set(raw) - TOP_FIELDS - {"min_free_disk_gib", "source_snapshot"}
+    runtime = raw.get("inference_runtime", DEFAULT_RUNTIME) if isinstance(raw, dict) else None
+    if (not isinstance(raw, dict) or not TOP_FIELDS.issubset(raw) or set(raw) - TOP_FIELDS - OPTIONAL_FIELDS
             or type(raw["schema_version"]) is not int or raw["schema_version"] != 1):
         raise ValueError("Plan requires exactly schema_version=1, plan_id, image_bundle, entries")
+    if runtime not in RUNTIMES:
+        raise ValueError(f"inference_runtime must be one of {', '.join(RUNTIMES)}")
+    wanted, other = BUNDLE_FIELD[runtime], BUNDLE_FIELD[next(item for item in RUNTIMES if item != runtime)]
+    if wanted not in raw or other in raw:
+        raise ValueError(f"A plan for the {runtime} runtime requires {wanted} and takes no {other}")
     if not isinstance(raw["plan_id"], str) or not NAME.fullmatch(raw["plan_id"]):
         raise ValueError("Invalid plan_id")
     if not isinstance(raw["entries"], list) or not raw["entries"]:
@@ -92,8 +108,8 @@ def read_plan(path):
     minimum_disk = raw.get("min_free_disk_gib", 12)
     if type(minimum_disk) not in (int, float) or not math.isfinite(minimum_disk) or minimum_disk < 1:
         raise ValueError("min_free_disk_gib must be finite and at least 1")
-    bundle_path = resolve_path(base, raw["image_bundle"])
-    bundle = read_image_bundle(bundle_path)
+    bundle_path = resolve_path(base, raw[wanted])
+    bundle = read_image_bundle(bundle_path) if runtime == DEFAULT_RUNTIME else read_native_bundle(bundle_path)
     metadata = base / (".sweep-" + raw["plan_id"])
     if metadata.resolve() != metadata or not metadata.resolve().is_relative_to(base):
         raise ValueError("Supervisor metadata cannot be a symlink or junction")
@@ -112,9 +128,17 @@ def read_plan(path):
             raise ValueError("budget_seconds must be finite and positive")
         config_path = resolve_path(base, item["config"])
         config = ContainerRunConfig.model_validate_json(config_path.read_bytes())
-        mismatches = check_image_bundle(config, bundle)
-        if mismatches:
-            raise ValueError(f"{identifier}: image bundle mismatch: {'; '.join(mismatches)}")
+        if config.runtime != runtime:  # checked first: the other runtime's bundle check would say less
+            raise ValueError(f"{identifier}: the config runs {config.runtime} but the plan's inference_runtime is "
+                             f"{runtime}")
+        if runtime == DEFAULT_RUNTIME:
+            mismatches = check_image_bundle(config, bundle)
+            if mismatches:
+                raise ValueError(f"{identifier}: image bundle mismatch: {'; '.join(mismatches)}")
+        else:
+            mismatches = check_native_bundle(config, bundle)
+            if mismatches:
+                raise ValueError(f"{identifier}: native bundle mismatch: {'; '.join(mismatches)}")
         output = resolve_path(base, item["output"], output=True)
         check_path_lengths(output)
         if output.is_relative_to(metadata) or metadata.is_relative_to(output):
@@ -147,9 +171,13 @@ def read_plan(path):
     identity = {"plan_sha256": digest(path), "bundle_sha256": digest(bundle_path),
                 "runtime_sha256": source_hash.hexdigest(), "source_snapshot_sha256": snapshot_sha256,
                 "configs": {entry["id"]: entry["config_sha256"] for entry in entries}}
+    if runtime != DEFAULT_RUNTIME:  # an NVIDIA identity keeps its exact keys, so its state.json still resumes
+        identity["inference_runtime"] = runtime
     return {"path": str(path), "base": str(base), "plan_id": raw["plan_id"], "entries": entries,
-            "image_bundle": str(bundle_path), "metadata": str(metadata), "identity": identity,
-            "min_free_disk_gib": minimum_disk}
+            "inference_runtime": runtime,
+            "image_bundle": str(bundle_path) if runtime == DEFAULT_RUNTIME else None,
+            "native_bundle": None if runtime == DEFAULT_RUNTIME else str(bundle_path),
+            "metadata": str(metadata), "identity": identity, "min_free_disk_gib": minimum_disk}
 
 
 def atomic_json(path, value):
@@ -276,18 +304,32 @@ def guard_disk(plan, *, usage=shutil.disk_usage):
 
 
 def terminal(entry, returncode):
+    """The checkpointed outcome of one candidate, or a refusal when its evidence does not prove cleanup.
+
+    A native candidate's cleanup evidence names the owned server processes still present
+    (``processes_remaining``, which must be empty exactly like ``containers_remaining``) and how the server it
+    started exited (``server_exit``). When the runner attempted a cleanup it started a server, so a missing exit is
+    missing proof, not a clean stop. An NVIDIA result is judged exactly as before and checkpointed with the same keys.
+    """
     path = Path(entry["output"]) / "result.json"
     result = ContainerRunResult.model_validate_json(path.read_bytes(), strict=True)
     if result.config_fingerprint != entry["config_fingerprint"] or result.synthetic:
         raise ValueError("Terminal evidence is synthetic or belongs to another configuration")
     cleanup = result.cleanup
     if (not cleanup.verified or cleanup.containers_remaining or cleanup.networks_remaining
-            or cleanup.lease_retained or cleanup.error or result.abort_campaign):
+            or cleanup.processes_remaining or cleanup.lease_retained or cleanup.error or result.abort_campaign):
         raise ValueError("Candidate cleanup is uncertain; preserve evidence and reconcile owned resources")
-    return {"status": "completed" if returncode == 0 and result.state == "completed" else "failed",
-            "returncode": returncode, "result_state": result.state, "result_sha256": digest(path),
-            "cleanup_verified": True, "attempt_id": result.attempt_id,
-            "failure_reasons": list(result.failure_reasons)}
+    native = result.runtime != DEFAULT_RUNTIME
+    if native and cleanup.attempted and not cleanup.server_exit:
+        raise ValueError("Native candidate cleanup does not record how its llama-server exited; preserve evidence "
+                         "and confirm the server process is gone")
+    outcome = {"status": "completed" if returncode == 0 and result.state == "completed" else "failed",
+               "returncode": returncode, "result_state": result.state, "result_sha256": digest(path),
+               "cleanup_verified": True, "attempt_id": result.attempt_id,
+               "failure_reasons": list(result.failure_reasons)}
+    if native:
+        outcome.update(runtime=result.runtime, server_exit=cleanup.server_exit)
+    return outcome
 
 
 def verify_resume(plan, ledger):
@@ -309,9 +351,10 @@ def candidate_command(plan, entry):
     python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.is_file():
         python = Path(sys.executable)
+    bundle = (["--image-bundle", plan["image_bundle"]] if plan["inference_runtime"] == DEFAULT_RUNTIME
+              else ["--native-bundle", plan["native_bundle"]])
     return [str(python), "-B", str(ROOT / "run.py"), "candidate", "--config", entry["config"],
-            "--output", entry["output"], "--budget-seconds", str(entry["budget_seconds"]),
-            "--image-bundle", plan["image_bundle"]]
+            "--output", entry["output"], "--budget-seconds", str(entry["budget_seconds"]), *bundle]
 
 
 def request_cleanup(child, seconds):
@@ -414,10 +457,13 @@ def main(argv=None):
     try:
         plan = read_plan(args.plan)
         if not args.run:
-            print(json.dumps({"mode": "check", "plan_id": plan["plan_id"], "entries": len(plan["entries"]),
-                              "total_candidate_budget_seconds": sum(e["budget_seconds"] for e in plan["entries"]),
-                              "identity": plan["identity"], "metadata": plan["metadata"],
-                              "min_free_disk_gib": plan["min_free_disk_gib"]}, indent=2))
+            report = {"mode": "check", "plan_id": plan["plan_id"], "entries": len(plan["entries"]),
+                      "total_candidate_budget_seconds": sum(e["budget_seconds"] for e in plan["entries"]),
+                      "identity": plan["identity"], "metadata": plan["metadata"],
+                      "min_free_disk_gib": plan["min_free_disk_gib"]}
+            if plan["inference_runtime"] != DEFAULT_RUNTIME:  # an NVIDIA check prints exactly what it always did
+                report = {**report, "inference_runtime": plan["inference_runtime"]}
+            print(json.dumps(report, indent=2))
             return 0
         def stop(_signum, _frame):
             raise KeyboardInterrupt

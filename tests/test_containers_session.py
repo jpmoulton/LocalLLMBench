@@ -742,3 +742,347 @@ def test_example_session_validates_and_matches_the_live_acceptance_plan():
     assert [item.label() for item in deterministic_schedule(session)] == ["baseline", "kv-q8_0-q8_0"]
     policy = policy_for(session)
     assert policy.budgets.wall_seconds == 2400 and policy.budgets.reserve_validation_seconds == 900
+
+
+# ---- metal-native runtime -------------------------------------------------------------------------------------
+# The session machinery is runtime-agnostic: a native bundle pins a host llama-server where an image bundle pins
+# a CUDA image, and every NVIDIA path above must stay exactly what it was.
+
+NATIVE_LOCK = SessionLock(allow_model_operations=True, allow_inference=True, allow_native_execution=True)
+"""A policy for the Mac: native execution, no containers. ``LOCK`` above is the NVIDIA policy (no native)."""
+ARM64_WORKER = {"role": "worker", "reference": "sha256:" + "7" * 64, "image_id": "sha256:" + "7" * 64,
+                "platform": "linux/arm64", "entrypoint": ["python", "-m", "llmbench.coding.worker"]}
+
+
+def make_native_bundle(*, executable="/Users/example/llama-b11011/llama-server", executable_sha256="d" * 64,
+                       libraries_sha256="e" * 64, sandbox=None, worker=None):
+    """A NativeBundle as `prepare --runtime metal-native` records it (no process is ever started from it here)."""
+    from llmbench.containers.config import NativeBundle
+    server = {"executable": executable, "executable_sha256": executable_sha256,
+              "libraries_sha256": libraries_sha256, "build_info": "b11011-aa39d7a3e", "help_sha256": "f" * 64,
+              "source": "llama.cpp b11011 macos-arm64 release"}
+    return NativeBundle.model_validate_json(canonical_json({
+        "prepared_utc": "2026-09-23T00:00:00+00:00", "native_server": server,
+        "libraries": {"libggml-metal.dylib": "1" * 64}, "worker": worker, "help_sha256": "f" * 64,
+        "registry_digest": "c" * 64, "host": {"machine": "arm64", "chip": "Apple M1"},
+        "build": {"provenance": "unrecorded"},
+        "sandbox": {"status": "blocked", "reason": "docker CLI not found"} if sandbox is None else sandbox}))
+
+
+def native_session(tmp_path, bundle=None, *, native_limits=None, **options) -> ContainerSessionConfig:
+    """``make_session`` with its base served by a native bundle, as a derived metal-native session would be."""
+    from llmbench.containers.session import native_overlay
+    raw = json.loads(make_session(tmp_path, **options).model_dump_json())
+    native_overlay(raw["base"], bundle or make_native_bundle())
+    if native_limits is not None:
+        raw["base"]["native_limits"] = native_limits
+    return ContainerSessionConfig.model_validate_json(canonical_json(raw))
+
+
+def test_a_native_bundle_turns_candidates_into_metal_runs_and_pins_the_server_not_its_location(tmp_path):
+    from llmbench.containers.config import NativeLimits
+    from llmbench.containers.session import image_ids
+    session = make_session(tmp_path)  # an NVIDIA session: the bundle alone decides what serves its candidates
+    bundle = make_native_bundle(worker=ARM64_WORKER)
+    baseline = baseline_proposal(session)
+    config = run_config_for(session, bundle, baseline)
+    assert config.runtime == "metal-native" and config.inference_image is None
+    assert config.native_server == bundle.native_server and config.native_limits == NativeLimits()
+    assert config.worker_image == bundle.worker and config.worker_image.platform == "linux/arm64"
+    assert config.evaluator.mode == "host-process" and config.server_model_path == config.model.host_path
+    # The ledger keeps its `image_ids` key; a native bundle's pins have disjoint keys, so the two kinds of bundle
+    # can never compare equal on resume, and an image bundle still pins exactly what it always did.
+    assert image_ids(bundle) == {"native_server": "d" * 64, "libraries": "e" * 64, "worker": "sha256:" + "7" * 64}
+    assert image_ids(make_bundle()) == {"inference": "sha256:" + "a" * 64, "evaluator": "sha256:" + "b" * 64,
+                                        "worker": None}
+    # Where the executable lives is not identity; what it is (its digests) is.
+    moved = run_config_for(session, make_native_bundle(executable="/opt/elsewhere/llama-server",
+                                                       worker=ARM64_WORKER), baseline)
+    assert moved.fingerprint() == config.fingerprint()
+    assert moved.native_server.executable == "/opt/elsewhere/llama-server"
+    rebuilt = run_config_for(session, make_native_bundle(libraries_sha256="9" * 64, worker=ARM64_WORKER), baseline)
+    assert rebuilt.fingerprint() != config.fingerprint()
+    # Limits a native session was tuned under survive a bundle; an image bundle cannot serve a native session.
+    tuned = native_session(tmp_path / "n", native_limits={"memory_reserve_mib": 2048, "max_swap_growth_mib": 512})
+    kept = run_config_for(tuned, make_native_bundle(executable="/opt/moved/llama-server"), baseline_proposal(tuned))
+    assert (kept.native_limits.memory_reserve_mib, kept.native_limits.max_swap_growth_mib) == (2048, 512)
+    with pytest.raises(ValueError, match="native-bundle.json"):
+        run_config_for(tuned, make_bundle(), baseline_proposal(tuned))
+
+
+def test_the_metal_backend_of_a_commit_is_never_the_cuda_backend_of_the_same_commit(tmp_path):
+    session = make_session(tmp_path)
+    baseline = baseline_proposal(session)
+    cuda = _manifest(run_config_for(session, None, baseline))
+    metal = _manifest(run_config_for(session, make_native_bundle(), baseline))
+    assert cuda.backend.runtime_revision.startswith("b11011-aa39d7a3e+")  # NVIDIA: unchanged format
+    assert metal.backend.runtime_revision == "metal:" + cuda.backend.runtime_revision  # same build, same engine
+    # Only the revision differs -- no BackendSettings field was added -- so the controller can never read a
+    # Metal-vs-CUDA pair as a single-family treatment of one backend.
+    assert metal.backend.model_dump(exclude={"runtime_revision"}) == cuda.backend.model_dump(
+        exclude={"runtime_revision"})
+    with pytest.raises(ValueError, match="exactly one declared family"):
+        infer_comparison_family(cuda, metal)
+    assert metal.model.model_dump() == cuda.model.model_dump() and metal.tasks == cuda.tasks
+
+
+def test_planning_slowdown_is_recorded_only_when_it_is_not_the_nvidia_default(tmp_path):
+    plain = make_session(tmp_path)
+    assert plain.planning_slowdown == 1.0
+    assert "planning_slowdown" not in plain.model_dump(mode="json")
+    assert "planning_slowdown" not in json.loads(plain.model_dump_json())  # session-config.json bytes unchanged
+    raw = json.loads(plain.model_dump_json())
+    raw["planning_slowdown"] = 3.0
+    slow = ContainerSessionConfig.model_validate_json(json.dumps(raw))
+    assert slow.planning_slowdown == 3.0 and slow.model_dump(mode="json")["planning_slowdown"] == 3.0
+    assert ContainerSessionConfig.model_validate_json(slow.model_dump_json()) == slow
+    for bad in (0, -1, 101):
+        with pytest.raises(ValidationError):
+            ContainerSessionConfig.model_validate_json(json.dumps({**raw, "planning_slowdown": bad}))
+
+
+def test_a_native_session_needs_native_permission_and_resume_refuses_a_different_server(tmp_path,
+                                                                                    isolated_gpu_lock):
+    from llmbench.containers.session import read_ledger, resume
+    from llmbench.safety import OperationForbidden
+    bundle = make_native_bundle()
+    session = native_session(tmp_path, bundle)
+    bundle_path = tmp_path / "prep" / "native-bundle.json"
+    bundle_path.parent.mkdir()
+    bundle_path.write_text(bundle.model_dump_json(), encoding="utf-8")
+    clock = FakeClock()
+    runner = FakeRunner(clock, policy=policy_for(session))
+    refused = tmp_path / "refused"
+    with pytest.raises(OperationForbidden, match="native"):  # an NVIDIA policy never authorizes a host binary
+        tune(session, refused, runner=runner, session_lock=LOCK, clock=clock, wall=clock.wall,
+             metadata_reader=metadata_reader(), bundle_path=bundle_path)
+    assert runner.calls == [] and not refused.exists()
+    # The Mac policy runs it without any container permission (no broker, so no sandbox workers either).
+    out = tmp_path / "out"
+    outcome = tune(session, out, runner=runner, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall,
+                   metadata_reader=metadata_reader(), bundle_path=bundle_path)
+    assert outcome["stop_reason"] in {"complete", "candidates"} and runner.calls
+    assert {call["config"].runtime for call in runner.calls} == {"metal-native"}
+    assert {call["config"].native_server.executable_sha256 for call in runner.calls} == {"d" * 64}
+    ledger = read_ledger(out)
+    assert ledger["image_bundle"] == str(bundle_path.resolve())
+    assert ledger["image_ids"] == {"native_server": "d" * 64, "libraries": "e" * 64, "worker": None}
+    # resume: a rebuilt llama-server (different library digest) is refused before anything runs ...
+    second = FakeRunner(clock, policy=policy_for(session))
+    with pytest.raises(ValueError, match="differ from the ledger"):
+        resume(out, runner=second, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall,
+               bundle=make_native_bundle(libraries_sha256="9" * 64))
+    with pytest.raises(ValueError, match="differ from the ledger"):  # ... and so is an image bundle
+        resume(out, runner=second, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall, bundle=make_bundle())
+    with pytest.raises(OperationForbidden):  # the policy is checked for the session's own runtime
+        resume(out, runner=second, session_lock=LOCK, clock=clock, wall=clock.wall)
+    # ... while the same server moved elsewhere is the same session, and its bundle missing names the flag to use.
+    moved = resume(out, runner=second, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall,
+                   bundle=make_native_bundle(executable="/opt/moved/llama-server"))
+    assert second.calls == [] and moved["stop_reason"] in {"complete", "candidates"}
+    bundle_path.unlink()
+    with pytest.raises(ValueError, match="pass the moved native-bundle.json as --image-bundle") as missing:
+        resume(out, runner=second, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall)
+    assert "--native-bundle" not in str(missing.value)  # the resume parser has no such flag
+    # The advice works as given: the resume command line accepts the moved native bundle through --image-bundle.
+    from llmbench.containers.session import main
+    relocated = tmp_path / "moved" / "native-bundle.json"
+    relocated.parent.mkdir()
+    relocated.write_text(make_native_bundle(executable="/opt/moved/llama-server").model_dump_json(), encoding="utf-8")
+    mac = _policy_file(tmp_path, "mac-policy.json", allow_native_execution=True)
+    assert main(["resume", "--output", str(out), "--image-bundle", str(relocated), "--policy", str(mac)],
+                runner_factory=lambda args, policy: second) == 0
+    assert second.calls == []  # every candidate had already run; nothing was re-measured
+
+
+def test_read_bundle_tells_the_two_bundle_kinds_apart_by_content(tmp_path):
+    from llmbench.containers.config import ImageBundle, NativeBundle
+    from llmbench.containers.session import read_bundle
+    native, image = tmp_path / "image-bundle.json", tmp_path / "native-bundle.json"  # names deliberately swapped
+    native.write_text(make_native_bundle().model_dump_json(), encoding="utf-8")
+    image.write_text(make_bundle().model_dump_json(), encoding="utf-8")
+    assert isinstance(read_bundle(native), NativeBundle) and isinstance(read_bundle(image), ImageBundle)
+    hybrid = json.loads(make_bundle().model_dump_json())
+    hybrid["native_server"] = json.loads(make_native_bundle().model_dump_json())["native_server"]
+    (tmp_path / "hybrid.json").write_text(json.dumps(hybrid), encoding="utf-8")
+    with pytest.raises(ValidationError):  # neither strict model accepts the other's keys
+        read_bundle(tmp_path / "hybrid.json")
+    (tmp_path / "broken.json").write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a JSON bundle"):
+        read_bundle(tmp_path / "broken.json")
+    with pytest.raises(ValueError, match="regular file"):
+        read_bundle(tmp_path / "absent.json")
+
+
+def _tune_args(tmp_path, weights, output, policy, **overrides):
+    import argparse
+    values = dict(config=None, model=str(weights), output=str(output), budget_seconds=3600, image_bundle=None,
+                  search="default", context_floor=None, context_ceiling=None, base_config=str(EXAMPLE),
+                  policy=str(policy), capabilities_dir="artifacts/container-prep", runtime=None, native_bundle=None)
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _policy_file(tmp_path, name, **grants):
+    path = tmp_path / name
+    path.write_text(json.dumps({"allow_model_operations": True, "allow_inference": True, **grants}), encoding="utf-8")
+    return path
+
+
+def test_main_tune_derives_a_metal_session_from_the_native_bundle_and_refuses_contradictions(
+        tmp_path, capsys, isolated_gpu_lock, monkeypatch):
+    from llmbench.containers.session import SESSION_CONFIG_NAME, main_tune, read_ledger, read_session_config
+    monkeypatch.chdir(tmp_path)  # no staged datasets: the plan's content is not what this test is about
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    (weights / "tiny-Q4_K_M.gguf").write_bytes(gguf_bytes("Q4_K_M", name="tiny-model", n_ctx_train=32768, nextn=0))
+    bundle_path = tmp_path / "native-bundle.json"
+    bundle_path.write_text(make_native_bundle().model_dump_json(), encoding="utf-8")
+    mac = _policy_file(tmp_path, "mac-policy.json", allow_native_execution=True)
+    nvidia = _policy_file(tmp_path, "nvidia-policy.json", allow_container_execution=True)
+    clock, runners = FakeClock(), []
+
+    def factory(args, campaign_policy):
+        runners.append(FakeRunner(clock, policy=campaign_policy))
+        return runners[-1]
+
+    def run(output, policy=mac, **overrides):
+        return main_tune(_tune_args(tmp_path, weights, output, policy, **overrides), runner_factory=factory,
+                         clock=clock, wall=clock.wall)
+
+    native = dict(runtime="metal-native", native_bundle=str(bundle_path))
+    for overrides, message in (({"runtime": "metal-native"}, "needs --native-bundle"),
+                               ({"native_bundle": str(bundle_path)}, "add --runtime metal-native"),
+                               ({"runtime": "nvidia-container", "native_bundle": str(bundle_path)},
+                                "add --runtime metal-native"),
+                               ({**native, "image_bundle": str(bundle_path)}, "pinned by --native-bundle alone"),
+                               ({"image_bundle": str(bundle_path)}, "is a native bundle")):
+        assert run(tmp_path / "refused", policy=nvidia if "image_bundle" in overrides and len(overrides) == 1
+                   else mac, **overrides) == 2
+        assert message in capsys.readouterr().err and not (tmp_path / "refused").exists()
+    assert run(tmp_path / "denied", policy=nvidia, **native) == 2  # container permission is not native permission
+    assert "native forbidden" in capsys.readouterr().err and not (tmp_path / "denied").exists()
+    assert runners == []
+    output = tmp_path / "s1"
+    assert run(output, **native) == 0
+    capsys.readouterr()
+    session = read_session_config(output / SESSION_CONFIG_NAME)
+    assert session.base.runtime == "metal-native" and session.base.inference_image is None
+    assert session.planning_slowdown == 3.0 and session.image_bundle == str(bundle_path)
+    assert session.search.ctx_tiers == (4864,)  # RULER's shortest length, output and template reserved on top
+    assert (session.search.context_floor, session.search.context_ceiling) == (4096, 4096)
+    assert read_ledger(output)["image_ids"]["native_server"] == "d" * 64
+    assert {call["config"].runtime for call in runners[0].calls} == {"metal-native"}
+    # A --config session states its own runtime; the flags that derive one are refused beside it.
+    assert run(tmp_path / "s2", config=str(output / SESSION_CONFIG_NAME), model=None,
+               native_bundle=str(bundle_path)) == 2
+    assert "--native-bundle derives" in capsys.readouterr().err
+    assert run(tmp_path / "s3", config=str(output / SESSION_CONFIG_NAME), model=None,
+               runtime="nvidia-container") == 2
+    assert "differs from the metal-native runtime" in capsys.readouterr().err
+    assert run(tmp_path / "s4", policy=nvidia, config=str(output / SESSION_CONFIG_NAME), model=None) == 2
+    assert not (tmp_path / "s4").exists() and len(runners) == 1
+
+
+def test_main_tune_authorizes_the_broker_only_when_the_sandbox_verdict_keeps_it(tmp_path, capsys, isolated_gpu_lock,
+                                                                                 monkeypatch):
+    """A Mac policy without container permission is a reason prepare records the sandbox as blocked; the derived
+    session then drops the template's broker, so tune must not demand container permission for it up front. When
+    the sandbox is available the broker stays and starts Docker workers, so container permission is required."""
+    from llmbench.containers.config import read_run_config
+    from llmbench.containers.derive import planned_operations
+    from llmbench.containers.session import NVIDIA_OPERATIONS, SESSION_CONFIG_NAME, main_tune, read_session_config
+    monkeypatch.chdir(tmp_path)
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    (weights / "tiny-Q4_K_M.gguf").write_bytes(gguf_bytes("Q4_K_M", name="tiny-model", n_ctx_train=32768, nextn=0))
+    raw = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    raw["broker"] = {"max_requests": 2}
+    base_config = tmp_path / "broker-base.json"
+    base_config.write_text(json.dumps(raw), encoding="utf-8")
+    blocked, available = tmp_path / "blocked.json", tmp_path / "available.json"
+    blocked.write_text(make_native_bundle().model_dump_json(), encoding="utf-8")  # docker CLI not found
+    available.write_text(make_native_bundle(sandbox={"status": "available", "reason": None},
+                                            worker=ARM64_WORKER).model_dump_json(), encoding="utf-8")
+    base = read_run_config(base_config)
+    assert planned_operations(base, native_bundle=make_native_bundle()) == ("native", "load", "inference")
+    assert planned_operations(base, native_bundle=make_native_bundle(sandbox={"status": "available"},
+                                                                     worker=ARM64_WORKER)) == (
+        "native", "load", "inference", "container")
+    assert planned_operations(base) == NVIDIA_OPERATIONS  # no native bundle: the NVIDIA tuple, broker or not
+    mac = _policy_file(tmp_path, "mac-policy.json", allow_native_execution=True)
+    clock, runners = FakeClock(), []
+
+    def factory(args, campaign_policy):
+        runners.append(FakeRunner(clock, policy=campaign_policy))
+        return runners[-1]
+
+    def run(output, bundle):
+        return main_tune(_tune_args(tmp_path, weights, output, mac, base_config=str(base_config),
+                                    runtime="metal-native", native_bundle=str(bundle)),
+                         runner_factory=factory, clock=clock, wall=clock.wall)
+
+    assert run(tmp_path / "needs-container", available) == 2
+    assert "container forbidden" in capsys.readouterr().err
+    assert not (tmp_path / "needs-container").exists() and runners == []
+    assert run(tmp_path / "blocked", blocked) == 0
+    session = read_session_config(tmp_path / "blocked" / SESSION_CONFIG_NAME)
+    assert session.base.broker is None and "coding" not in {item.benchmark_id for item in session.base.benchmarks}
+    assert {call["config"].broker for call in runners[0].calls} == {None}
+
+
+def test_the_default_session_runner_dispatches_on_runtime_and_builds_nothing_up_front(tmp_path, monkeypatch):
+    import argparse
+    from llmbench.containers import runner as runner_module
+    from llmbench.containers.runtime import DispatchRunner
+    from llmbench.containers.session import _default_runner_factory
+    session = make_session(tmp_path)
+    policy = policy_for(session)
+    runner = _default_runner_factory(argparse.Namespace(capabilities_dir="caps", policy="p.json"), policy)
+    assert isinstance(runner, DispatchRunner) and runner.synthetic is False
+    assert (runner.capabilities_dir, runner.policy_path, runner.policy) == ("caps", "p.json", policy)
+    assert runner.built == ()  # neither ContainerRunner nor NativeRunner exists until a candidate arrives
+    # An NVIDIA candidate reaches exactly the ContainerRunner this factory built before runtimes existed: the same
+    # three keywords, built once and reused, and each run's arguments passed through untouched.
+    built, runs = [], []
+
+    class RecordingContainerRunner:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def run(self, config, output_dir, **kwargs):
+            runs.append((config, output_dir, kwargs))
+            return "result"
+
+    monkeypatch.setattr(runner_module, "ContainerRunner", RecordingContainerRunner)
+    config = run_config_for(session, None, baseline_proposal(session))
+    assert runner.run(config, tmp_path / "a", remaining_budget_seconds=5.0, lease_held=True) == "result"
+    assert runner.run(config, tmp_path / "b") == "result"
+    assert built == [{"capabilities_dir": "caps", "policy_path": "p.json", "policy": policy}]
+    assert runs == [(config, tmp_path / "a", {"remaining_budget_seconds": 5.0, "lease_held": True}),
+                    (config, tmp_path / "b", {"remaining_budget_seconds": None, "lease_held": False})]
+    assert runner.built == ("nvidia-container",)  # no NativeRunner was imported or built for an NVIDIA session
+
+
+def test_nvidia_sessions_still_need_exactly_the_container_policy(tmp_path, isolated_gpu_lock):
+    from llmbench.containers.session import NVIDIA_OPERATIONS, authorize_session, required_operations_for
+    from llmbench.safety import OperationForbidden
+    session = make_session(tmp_path)
+    assert required_operations_for(session.base) == NVIDIA_OPERATIONS == ("container", "load", "inference")
+    authorize_session(LOCK, session, make_bundle())  # the NVIDIA policy, NVIDIA bundle: allowed as always
+    clock = FakeClock()
+    runner = FakeRunner(clock, policy=policy_for(session))
+    with pytest.raises(OperationForbidden, match="container"):  # native permission never authorizes containers
+        tune(session, tmp_path / "out", runner=runner, session_lock=NATIVE_LOCK, clock=clock, wall=clock.wall,
+             metadata_reader=metadata_reader())
+    assert runner.calls == [] and not (tmp_path / "out").exists()
+    # A native bundle over an NVIDIA session changes what runs, so it changes what must be allowed.
+    with pytest.raises(OperationForbidden, match="native"):
+        authorize_session(LOCK, session, make_native_bundle())
+    # A native session with a coding broker starts sandboxed Docker workers: container permission as well.
+    raw = json.loads(native_session(tmp_path / "b").model_dump_json())
+    raw["base"]["broker"] = {"max_requests": 2}
+    brokered = ContainerSessionConfig.model_validate_json(json.dumps(raw))
+    assert required_operations_for(brokered.base) == ("native", "load", "inference", "container")
+    with pytest.raises(OperationForbidden, match="container"):
+        authorize_session(NATIVE_LOCK, brokered)
