@@ -7,7 +7,7 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from ..coding.sandbox import SandboxLimits
 from ..config import GenerationSettings, StrictModel, TaskSelection, canonical_json, freeze_json
@@ -16,8 +16,15 @@ SHA256 = r"^[0-9a-f]{64}$"
 IMAGE_ID = r"^sha256:[0-9a-f]{64}$"
 DIGEST_REF = r"^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$"
 NAME = r"^[a-z0-9][a-z0-9._-]{0,62}$"
+BUILD_INFO = r"^b\d+-[0-9a-f]{7,40}$"
 MODEL_CONTAINER_PATH = "/models/model.gguf"
 EVALUATOR_ENTRYPOINT = ("python", "-m", "llmbench.container_eval")
+# The inference runtimes a candidate can name. `nvidia-container` is the original pinned CUDA image run under
+# Docker Compose and stays the default: a config that does not name a runtime serialises, fingerprints and runs
+# exactly as it did before runtimes existed. `metal-native` runs a pinned llama-server executable directly on an
+# Apple Silicon host with Metal offload; generated code still only ever runs in the sandboxed worker containers.
+RUNTIMES = ("nvidia-container", "metal-native")
+DEFAULT_RUNTIME = "nvidia-container"
 CacheType = Literal["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
 # b11011 system_info reports FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 (observed live).
 FLASH_ATTN_KV_PAIRS = frozenset({("f16", "f16"), ("bf16", "bf16"), ("q8_0", "q8_0"), ("q4_0", "q4_0")})
@@ -32,7 +39,9 @@ class ImageRef(StrictModel):
     role: Literal["inference", "evaluator", "worker"]
     reference: str
     image_id: str = Field(pattern=IMAGE_ID)
-    platform: Literal["linux/amd64"] = "linux/amd64"
+    # linux/arm64 exists for sandbox WORKER images built natively on an Apple Silicon host's Linux VM; the
+    # inference and evaluator images this project pins are linux/amd64 and a stored value is never guessed.
+    platform: Literal["linux/amd64", "linux/arm64"] = "linux/amd64"
     entrypoint: tuple[str, ...] = Field(min_length=1)
     build_info: str | None = None
     help_sha256: str | None = Field(default=None, pattern=SHA256)
@@ -46,7 +55,68 @@ class ImageRef(StrictModel):
             raise ValueError("entrypoint items must be nonempty strings")
         if self.role == "inference" and (not self.help_sha256 or not self.build_info):
             raise ValueError("an inference image requires build_info and the normalized help_sha256")
+        if self.role != "worker" and self.platform != "linux/amd64":
+            raise ValueError("only a sandbox worker image may be linux/arm64")
         return self
+
+
+class NativeServerRef(StrictModel):
+    """A pinned llama-server executable run directly on the host: the native analogue of an inference `ImageRef`.
+
+    Identity is the executable's SHA-256 plus `libraries_sha256`, a digest over every llama.cpp/ggml library
+    shipped beside it (the Metal backend lives in `libggml-metal`, so hashing the executable alone would not pin
+    what runs). `build_info` and `help_sha256` are read from the executable's own `--version` and `--help` and
+    re-checked at admission. `executable` is where it lives on THIS host and, like `ModelAsset.host_path`, is not
+    part of the fingerprint; `source` is display text only.
+    """
+
+    role: Literal["inference"] = "inference"
+    backend: Literal["metal"] = "metal"
+    platform: Literal["darwin/arm64"] = "darwin/arm64"
+    executable: str = Field(min_length=1)
+    executable_sha256: str = Field(pattern=SHA256)
+    libraries_sha256: str = Field(pattern=SHA256)
+    build_info: str = Field(pattern=BUILD_INFO)
+    help_sha256: str = Field(pattern=SHA256)
+    source: str | None = None
+
+    @field_validator("executable")
+    @classmethod
+    def absolute_executable(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts or any(char in value for char in ("\r", "\n", "\x00")):
+            raise ValueError("native executable must be an absolute path without parent traversal")
+        return value
+
+
+class NativeLimits(StrictModel):
+    """Admission and watchdog limits for a native (unified-memory) server. There is no cgroup on a macOS host
+    process, so these are checked by the runner instead of enforced by a kernel: admission refuses to start when
+    they already fail, and the watchdog stops the server when they fail during the run.
+
+    Memory on Apple Silicon is one pool shared by the CPU, the GPU and every other application, so every number
+    here is labelled for what it is: process memory is the server's `phys_footprint` (what Activity Monitor calls
+    Memory, including its Metal allocations), `available` is the host's available memory, and swap is host-wide.
+    None of them is VRAM.
+    """
+
+    # Admission: the host must have at least the model file plus this reserve available before the load.
+    memory_reserve_mib: int = Field(default=1024, ge=0, le=1_048_576)
+    # Admission: macOS kern.memorystatus_vm_pressure_level (1 normal, 2 warn, 4 critical) at or below this.
+    max_memory_pressure_level: Literal[1, 2, 4] = 2
+    # Admission: the GPU's own utilisation (IOAccelerator "Device Utilization %") sampled before the load. A game
+    # or another inference server shares the GPU with the measurement; that is a conflict to report, never a
+    # process to stop.
+    max_foreign_gpu_utilization_percent: int = Field(default=50, ge=0, le=100)
+    # Watchdog: stop the server when its phys_footprint exceeds this. None means Metal's own
+    # recommendedMaxWorkingSetSize as the server logged it at startup.
+    max_server_footprint_mib: int | None = Field(default=None, ge=256, le=2_097_152)
+    # Watchdog: stop the server when host swap in use grows by more than this during the candidate.
+    max_swap_growth_mib: int = Field(default=2048, ge=0, le=1_048_576)
+    # How often the watchdog samples memory while the evaluator runs.
+    sample_interval_seconds: float = Field(default=1.0, ge=0.2, le=30.0)
+    # Seconds between SIGTERM and SIGKILL when stopping the server.
+    stop_grace_seconds: int = Field(default=15, ge=1, le=120)
 
 
 class ModelAsset(StrictModel):
@@ -329,12 +399,24 @@ class EvaluatorSettings(StrictModel):
 
 
 class ContainerRunConfig(StrictModel):
+    """One candidate. The name predates native runtimes: `runtime` says what serves the model.
+
+    `nvidia-container` (the default) requires `inference_image`; `metal-native` requires `native_server` and
+    `native_limits` and has no inference image. Keys that hold the NVIDIA defaults (`runtime`, `native_server`,
+    `native_limits`) are left out of every serialisation, so an NVIDIA config's JSON, fingerprint, alias and
+    Compose project are byte-identical to what they were before runtimes existed, and an evaluator image built
+    from an older wheel still accepts it.
+    """
+
     schema_version: Literal[1] = 1
     label: str = Field(pattern=NAME)
     session_id: str | None = Field(default=None, pattern=NAME)
     parent_grant_seconds: int | None = Field(default=None, ge=1)
     assets: tuple[ModelAsset, ...] = Field(min_length=1, max_length=1)
-    inference_image: ImageRef
+    runtime: Literal["nvidia-container", "metal-native"] = DEFAULT_RUNTIME
+    inference_image: ImageRef | None = None
+    native_server: NativeServerRef | None = None
+    native_limits: NativeLimits | None = None
     evaluator: EvaluatorSettings = Field(default_factory=EvaluatorSettings)
     worker_image: ImageRef | None = None
     broker: BrokerSettings | None = None
@@ -353,9 +435,33 @@ class ContainerRunConfig(StrictModel):
     bounds: StageBounds = Field(default_factory=StageBounds)
     harness_revision: str = Field(min_length=1)
 
+    @model_serializer(mode="wrap")
+    def _omit_default_runtime(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            if data.get("runtime") == DEFAULT_RUNTIME:
+                data.pop("runtime")
+            for key in ("inference_image", "native_server", "native_limits"):
+                if key in data and data[key] is None:
+                    data.pop(key)
+        return data
+
     @model_validator(mode="after")
     def coherent(self) -> "ContainerRunConfig":
-        if self.inference_image.role != "inference":
+        if self.runtime == "nvidia-container":
+            if self.inference_image is None:
+                raise ValueError("the nvidia-container runtime requires inference_image")
+            if self.native_server is not None or self.native_limits is not None:
+                raise ValueError("native_server and native_limits belong to the metal-native runtime only")
+        else:
+            if self.native_server is None or self.native_limits is None:
+                raise ValueError("the metal-native runtime requires native_server and native_limits")
+            if self.inference_image is not None:
+                raise ValueError("the metal-native runtime runs no inference image; remove inference_image")
+            if self.evaluator.mode != "host-process":
+                raise ValueError("the metal-native runtime supports only the host-process evaluator: a native "
+                                 "server is not reachable from the evaluator container's internal network")
+        if self.inference_image is not None and self.inference_image.role != "inference":
             raise ValueError("inference_image must have role inference")
         if self.worker_image is not None and self.worker_image.role != "worker":
             raise ValueError("worker_image must have role worker")
@@ -380,6 +486,24 @@ class ContainerRunConfig(StrictModel):
     def model(self) -> ModelAsset:
         return self.assets[0]
 
+    @property
+    def build_info(self) -> str:
+        """The llama.cpp build serving this candidate, whichever runtime pins it."""
+        server = self.native_server if self.runtime == "metal-native" else self.inference_image
+        return server.build_info
+
+    @property
+    def help_sha256(self) -> str:
+        """The pinned normalized `llama-server --help` hash, whichever runtime pins it."""
+        server = self.native_server if self.runtime == "metal-native" else self.inference_image
+        return server.help_sha256
+
+    @property
+    def server_model_path(self) -> str:
+        """The exact path the server is given with `--model`: the bind-mount target inside the inference
+        container, or the host file itself for a native server."""
+        return self.model.host_path if self.runtime == "metal-native" else MODEL_CONTAINER_PATH
+
     def fingerprint(self) -> str:
         # Labels, grants, stage bounds, host locations and display sources do not change what is measured.
         payload = self.model_dump(mode="json", exclude={"label", "session_id", "parent_grant_seconds",
@@ -387,9 +511,12 @@ class ContainerRunConfig(StrictModel):
         payload["evaluator"].pop("watchdog_slack_seconds")
         for asset in payload["assets"]:
             asset.pop("host_path")
-        for image in (payload["inference_image"], payload["worker_image"], payload["evaluator"]["image"]):
+        for image in (payload.get("inference_image"), payload["worker_image"], payload["evaluator"]["image"]):
             if image is not None:
                 image.pop("source")
+        if payload.get("native_server") is not None:
+            payload["native_server"].pop("executable")
+            payload["native_server"].pop("source")
         return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
     def alias(self) -> str:
@@ -430,6 +557,21 @@ class CleanupEvidence(StrictModel):
     verified: bool = False
     error: str | None = None
     lease_retained: bool = False
+    # Native runtime only (omitted from the JSON when unset, so container results are unchanged): how the owned
+    # server process ended ("returncode=0", "signal=SIGTERM", ...) and the owned processes still present after
+    # the stop, as "pid:<n>" entries. A non-empty list is unverified cleanup, exactly like a leftover container.
+    server_exit: str | None = None
+    processes_remaining: tuple[str, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _omit_native_defaults(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            if data.get("server_exit") is None:
+                data.pop("server_exit", None)
+            if not data.get("processes_remaining"):
+                data.pop("processes_remaining", None)
+        return data
 
 
 class ArtifactEntry(StrictModel):
@@ -469,12 +611,27 @@ class ContainerRunResult(StrictModel):
     abort_campaign: bool = False
     artifacts: tuple[ArtifactEntry, ...] = ()
     reports: dict[str, Any] = Field(default_factory=dict)
+    # Native runtime only; omitted from the JSON for the default runtime so container results are unchanged.
+    runtime: Literal["nvidia-container", "metal-native"] = DEFAULT_RUNTIME
+    # Unified-memory evidence of a native run (kind "apple-unified"): server phys_footprint and RSS, Metal buffer
+    # sizes from the startup log, host available memory, swap and memory pressure. Never VRAM; see NativeLimits.
+    memory: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("image_evidence", "model_evidence", "speed", "quality", "reports")
+    @field_validator("image_evidence", "model_evidence", "speed", "quality", "reports", "memory")
     @classmethod
     def immutable_json(cls, value):
         canonical_json(value)
         return freeze_json(value)
+
+    @model_serializer(mode="wrap")
+    def _omit_native_defaults(self, handler):
+        data = handler(self)
+        if isinstance(data, dict):
+            if data.get("runtime") == DEFAULT_RUNTIME:
+                data.pop("runtime")
+            if not data.get("memory"):
+                data.pop("memory", None)
+        return data
 
     @model_validator(mode="after")
     def abort_tracks_cleanup(self) -> "ContainerRunResult":
@@ -522,6 +679,46 @@ class ImageBundle(StrictModel):
         if self.help_sha256 != self.inference.help_sha256:
             raise ValueError("bundle help_sha256 must equal the inference image help_sha256")
         return self
+
+
+class NativeBundle(StrictModel):
+    """Output of `llmbench prepare --runtime metal-native`: the pinned native server, what its own `--version`,
+    `--help` and `--list-devices` said, the host it was prepared on, and whether the coding sandbox was available.
+
+    The native analogue of `ImageBundle`. There is no evaluator image (a native server is evaluated by the
+    host-process evaluator) and the sandbox worker image is optional: without it the coding suites are recorded
+    as blocked, never run on the host.
+    """
+
+    schema_version: Literal[1] = 1
+    prepared_utc: str = Field(min_length=1)
+    runtime: Literal["metal-native"] = "metal-native"
+    native_server: NativeServerRef
+    libraries: dict[str, str] = Field(default_factory=dict)
+    worker: ImageRef | None = None
+    help_sha256: str = Field(pattern=SHA256)
+    registry_digest: str = Field(pattern=SHA256)
+    host: dict[str, Any] = Field(default_factory=dict)
+    build: dict[str, Any] = Field(default_factory=dict)
+    sandbox: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("libraries", "host", "build", "sandbox")
+    @classmethod
+    def immutable_json(cls, value):
+        canonical_json(value)
+        return freeze_json(value)
+
+    @model_validator(mode="after")
+    def coherent(self) -> "NativeBundle":
+        if self.help_sha256 != self.native_server.help_sha256:
+            raise ValueError("bundle help_sha256 must equal the native server help_sha256")
+        if self.worker is not None and self.worker.role != "worker":
+            raise ValueError("bundle worker image must have role worker")
+        return self
+
+
+def read_native_bundle(path: str | Path) -> NativeBundle:
+    return NativeBundle.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
 def read_run_config(path: str | Path) -> ContainerRunConfig:

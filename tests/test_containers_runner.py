@@ -1294,7 +1294,10 @@ def test_policy_copy_is_written_before_up_and_mounted_read_only(tmp_path):
     harness = ContainerHarness(tmp_path, lock=lock, up=up)
     result = harness.run()
     assert result.state == "completed"
-    assert seen["policy"] == (canonical_json(dataclasses.asdict(lock)) + "\n").encode("utf-8")
+    assert seen["policy"] == (canonical_json(lock.to_json()) + "\n").encode("utf-8")
+    # The copy an evaluator container reads is the pre-native policy shape: an image built from an older wheel
+    # rejects unknown keys, so the native permission is written only when it is granted.
+    assert b"allow_native_execution" not in seen["policy"]
     assert SessionLock.read(harness.output / "plan" / "runtime-policy.json") == lock
     assert seen["config"] == (canonical_json(harness.config.model_dump(mode="json")) + "\n").encode("utf-8")
     assert read_run_config(harness.output / "plan" / "evaluator-config.json") == harness.config

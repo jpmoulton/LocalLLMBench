@@ -23,9 +23,13 @@ SPOOL_RESULTS_PATH = "/spool/results"
 EVALUATOR_STOP_GRACE = "10s"
 
 
-def build_server_argv(config: ContainerRunConfig) -> tuple[str, ...]:
+def build_server_argv(config: ContainerRunConfig, *, model_path: str = MODEL_CONTAINER_PATH, host: str = "0.0.0.0",
+                      port: int = INFERENCE_PORT) -> tuple[str, ...]:
+    """The exact llama-server argv. Only the endpoint differs between runtimes: the container reads the model at
+    its bind-mount target and listens on every interface of its private network, while a native server reads
+    the host file and must listen on loopback alone (`native.py`). Every setting flag is identical."""
     engine = config.engine
-    argv = ["--model", MODEL_CONTAINER_PATH, "--host", "0.0.0.0", "--port", str(INFERENCE_PORT),
+    argv = ["--model", model_path, "--host", host, "--port", str(port),
             "--alias", config.alias(), "--ctx-size", str(engine.ctx_size),
             "--n-gpu-layers", str(engine.n_gpu_layers),
             "--cache-type-k", engine.cache_type_k, "--cache-type-v", engine.cache_type_v,

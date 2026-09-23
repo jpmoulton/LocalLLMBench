@@ -643,8 +643,10 @@ def run_evaluation(config: Any, ctx: EvaluationContext, *, backend_factory: Any 
     alias = config.alias()
     n_ctx = config.engine.ctx_size
     factory = backend_factory or LlamaCppBackend
-    backend = factory(ctx.base_url, expected=ExpectedServer(alias=alias, n_ctx=n_ctx,
-                                                            build_info=config.inference_image.build_info),
+    # The model path is the one the server was actually given: the container bind target, or the host file a
+    # native server reads directly (`ContainerRunConfig.server_model_path`).
+    backend = factory(ctx.base_url, expected=ExpectedServer(alias=alias, n_ctx=n_ctx, build_info=config.build_info,
+                                                            model_path=config.server_model_path),
                       permissions=LivePermission(False, True, False), session_lock=ctx.session_lock,
                       policy_path=ctx.policy_path, timeout=request_timeout, allow_remote=ctx.allow_remote,
                       cache_prompt=config.engine.cache_prompt, deadline_monotonic=ctx.deadline_monotonic, clock=ctx.clock)

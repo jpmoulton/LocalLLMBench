@@ -13,7 +13,6 @@ denominator checks.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 import re
@@ -364,8 +363,8 @@ class _Attempt:
                 lock.check(operation, RunMode.LIVE)
             registry_digest = runner.registry_validator(config)
             caps = load_capabilities(runner.capabilities_dir)
-            require_supported(self.plan.server_argv, caps, expected_help_sha256=config.inference_image.help_sha256)
-            if caps.build is not None and caps.build != config.inference_image.build_info:
+            require_supported(self.plan.server_argv, caps, expected_help_sha256=config.help_sha256)
+            if caps.build is not None and caps.build != config.build_info:
                 raise ValueError(f"saved server version {caps.build} is not the configured build_info")
         except (OperationForbidden, BackendError, ValueError, OSError, ImportError) as exc:
             raise _Stop("rejected", f"{type(exc).__name__}: {exc}") from exc
@@ -417,7 +416,7 @@ class _Attempt:
             "environment": {}, "project": self.plan.project_name, "labels": dict(self.plan.labels)})
         if self.container_mode:
             config_bytes = (canonical_json(self.config.model_dump(mode="json")) + "\n").encode("utf-8")
-            policy_bytes = (canonical_json(dataclasses.asdict(self._lock())) + "\n").encode("utf-8")
+            policy_bytes = (canonical_json(self._lock().to_json()) + "\n").encode("utf-8")
             self.artifacts.write("plan/evaluator-config.json", config_bytes)
             self.artifacts.write("plan/runtime-policy.json", policy_bytes)
             self.artifacts.write_json("plan/evaluator-grant.json", self.grant.model_dump(mode="json"))
@@ -732,7 +731,7 @@ class _Attempt:
         self.settings = build_settings_evidence(
             self.config.engine, self.plan.server_argv, evaluation.get("readback"), self.startup,
             evaluation.get("overflow_probe"), alias=self.config.alias(),
-            build_info=self.config.inference_image.build_info)
+            build_info=self.config.build_info)
         self.artifacts.write_json("settings-evidence.json", {
             "settings": [row.model_dump(mode="json") for row in self.settings],
             "unverified_required": unverified_required(self.settings)})
