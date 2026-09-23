@@ -72,8 +72,25 @@ can rank anything.
 Also learned the hard way: stopping a sweep by killing its wrapper leaves the GPU container running. Stop the
 session itself, and check `docker ps` afterwards.
 
-<!-- TODO(lead): add the metal-native lessons from the live Mac runs here, in the same form (what happened, and the
-guard that now exists). Only real incidents belong in this file; none have been recorded for this runtime yet. -->
+### The native Apple Silicon (Metal) runtime
+
+These came from bringing the `metal-native` runtime up on a 2020 MacBook Pro (M1, 8 GB unified memory, macOS
+14.2.1) with llama.cpp b11011.
+
+| id | What happened | Guard |
+|---|---|---|
+| MAC-001 | The Mac was already under memory pressure before any model loaded: 6.9-8.7 GB of swap in use and 1.0-2.4 GB available beside the owner's other applications. Admission refused the first live candidate twice (1197 MiB available with the Colima VM up, 2025 MiB with it stopped, against 2080 MiB required) | admission judges available memory, pressure and GPU use and reports a conflict instead of stopping anything; the sandbox VM is stopped when no coding suite runs; a lower `native_limits.memory_reserve_mib` is an explicit, fingerprinted config value, and swap growth is measured per candidate from the pre-load sample |
+| MAC-002 | Process RSS said 618 MiB for a llama-server whose physical footprint was 1901 MiB: Metal buffers are VM_ALLOCATE regions RSS does not show | the server's memory is `phys_footprint` (libproc `proc_pid_rusage`), labelled as such; RSS is recorded beside it, never instead of it, and nothing is called VRAM |
+| MAC-003 | The GPU of a Mac is never idle: WindowServer compositing kept IOAccelerator "Device Utilization %" at 30-34% with nothing else running | the foreign-GPU admission uses the median of three samples against a 50% ceiling, and the utilisation is recorded with every sample |
+| MAC-004 | `sysctl -n vm.swapusage` prints `9216,00M` under a comma-decimal locale, which the parser rightly refused, so swap would have read as unknown for such users | every telemetry probe runs with `LC_ALL=C` and a fixed system `PATH` |
+| MAC-005 | An amd64 sandbox worker on Colima's arm64 VM runs under emulation or not at all, and a slow or failed harness would be scored as the model's failure | the sandbox probe blocks a worker whose architecture differs from the daemon's; the worker is built natively with `--platform linux/arm64` and calibrated in the real sandbox (all 83 Aider Polyglot references pass, all 83 stubs fail) before any coding score is trusted |
+| MAC-006 | A leftover `"credsStore": "desktop"` from an uninstalled Docker Desktop made every anonymous `docker pull` fail with a missing credential helper | a private `DOCKER_CONFIG` for the harness tooling; the owner's `~/.docker/config.json` is left alone |
+| MAC-007 | A test that forbids subprocesses passed or failed depending on test order: on macOS the first `platform.platform()` call runs `uname -p` | `tests/conftest.py` warms that cache once, so the guard is order-independent |
+| MAC-008 | The laptop switched from battery to AC power in the middle of the session | power source and battery level are part of every unified-memory sample and every native report |
+
+The memory rules that fall out of this: on unified memory there is one pool. `gpu`/`ram` KV placement means a
+Metal buffer or a CPU buffer in the same physical memory; host available memory, swap and pressure include every
+other application; the only per-server number is its footprint.
 
 ## Things that are easy to get wrong about the hardware
 

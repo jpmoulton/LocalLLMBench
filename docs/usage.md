@@ -354,7 +354,22 @@ on battery or under memory pressure should be read as such. Swap growth is host-
 application. Compare Mac results with Mac results measured the same way; a Mac tok/s and an NVIDIA tok/s measure
 different hardware, and a unified-memory footprint is never a VRAM figure.
 
-<!-- TODO(lead): append the measured metal-native results (machine, model, candidates, tok/s, footprint) here. -->
+On September 23, 2026, a MacBook Pro (M1, 8 GB unified memory, macOS 14.2.1, AC power) ran the pinned llama.cpp
+`b11011` Metal server with two Q4_K_M GGUFs. The local run is at `runs/mac/sweep-main/` (ignored by Git); these
+figures are from its cross-model report. Each model completed four candidates: baseline, q8_0 KV, q4_0 KV and
+reasoning on. Each completed candidate received 24 tool-calling and 8 retrieval items, plus three speed probes.
+
+| Model | GGUF SHA-256 | Baseline tok/s | Fastest measured tok/s | Baseline server footprint | BFCL baseline | RULER baseline |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3-1.7B Q4_K_M | `b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897` | 27.2 | 28.1 (q8_0 KV) | 1902 MiB | 0.708 | 0.250 |
+| Qwen3.5-2B Q4_K_M | `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223` | 29.3 | 30.7 (reasoning on) | 1815 MiB | 0.500 | 0.750 |
+
+The server footprint includes Metal allocations in unified memory. The sweep did not validate a preset: the
+default 50 tok/s floor exceeded every measured speed, the item counts could not establish close quality
+differences, and no holdout passed. Some candidates verified a 4096-token usable input; higher context tiers were
+planned but did not run before the budget expired. EvalPlus and Aider Polyglot were unmeasured because the sweep's
+base config omitted the broker, even though a Linux/arm64 coding worker was separately built and calibrated. These
+results show a functioning native runtime and its observed tradeoffs, not a cross-model winner.
 
 ## Screen, measure interactions, then confirm
 

@@ -49,7 +49,11 @@ The two runtimes are covered differently, and a change should say which kind of 
   things in `pytest` are real on purpose: darwin-only reads of the test process's own `phys_footprint`, and a
   harmless Python child standing in for `llama-server` so process groups, signals and the proof of absence are
   tested for real (POSIX only). No test starts `llama-server`, Metal, Docker or Colima.
-<!-- TODO(lead): record which metal-native paths have been exercised live (prepare, tune, sweep, coding sandbox). -->
+On an M1 Mac the pinned installer, native preparation, Metal candidate process, smoke runs, `tune` and the
+two-model sweep have been exercised live. A Linux/arm64 coding worker was built and calibrated in Colima: all 83
+Aider Polyglot references passed and all 83 unchanged stubs failed. The two-model sweep did not select coding
+benchmarks because its base config had no broker; no live Mac coding score is claimed. See
+[the measured Mac results](usage.md#results-on-a-laptop).
 
 When a real run disagrees with a fixture, capture the new output into `tests/data/` (with machine-specific paths
 replaced) and fix the parser against it; do not edit a capture to fit the parser.

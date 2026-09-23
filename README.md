@@ -190,6 +190,8 @@ Beta. Exercised live on one machine (RTX 5090, Windows 11, Docker Desktop on WSL
 the unit suite runs on Linux, macOS and Windows. Single-GPU NVIDIA and single-file GGUF models only. The
 `metal-native` runtime was developed on an Apple M1 MacBook Pro (8 GB, macOS 14) against the same llama.cpp build;
 single Apple Silicon Macs only.
-<!-- TODO(lead): add the measured metal-native results (machine, model, session) here once they exist. -->
+On that Mac, real Metal sweeps of Qwen3-1.7B and Qwen3.5-2B Q4_K_M completed four candidates per model; baseline
+generation measured 27.2 and 29.3 tok/s respectively. Neither produced a validated preset. The measurements and
+their limits are in [the Mac results](docs/usage.md#results-on-a-laptop).
 
 MIT licensed. Vendored third-party data and its licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
