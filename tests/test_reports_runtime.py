@@ -379,6 +379,36 @@ def _records(root: Path) -> list[dict]:
     return [cross_model_report.collect_model(slug, meta, root) for slug, meta in index.items()]
 
 
+def test_cross_model_report_reads_the_pinned_asset_hash_for_each_sweep_model(tmp_path):
+    """The sweep index records paths, while completed sessions pin their model hashes in assets."""
+    entries = (("qwen3-1-7b", "1" * 64), ("qwen3-5-2b", "2" * 64))
+    records = []
+    for slug, digest in entries:
+        _session(tmp_path, slug, runtime="metal-native")
+        model_path = str(tmp_path / f"{slug}.gguf")
+        config_path = tmp_path / slug / "run" / "session-config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["assets"] = [{"role": "main", "host_path": model_path, "sha256": digest}]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        records.append(cross_model_report.collect_model(slug, {"model": model_path}, tmp_path))
+
+    assert [record["sha256"] for record in records] == [digest for _, digest in entries]
+    markdown = cross_model_report.render_markdown(records, "now")
+    for _, digest in entries:
+        assert f"- SHA256: `{digest}`" in markdown
+    assert "- SHA256: `None`" not in markdown
+
+
+def test_cross_model_report_does_not_assign_an_unrelated_asset_hash(tmp_path):
+    _session(tmp_path, "mac", runtime="metal-native")
+    config_path = tmp_path / "mac" / "run" / "session-config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["assets"] = [{"role": "main", "host_path": str(tmp_path / "other.gguf"), "sha256": "a" * 64}]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    record = cross_model_report.collect_model("mac", {"model": str(tmp_path / "model.gguf")}, tmp_path)
+    assert record["sha256"] is None
+
+
 def test_an_nvidia_only_sweep_renders_the_original_tables(tmp_path):
     _session(tmp_path, "gpu", results=[("baseline", _result(vram=21042.0)), ("kv-q8", _result(vram=20500.0))])
     records = _records(tmp_path)
