@@ -28,14 +28,28 @@ def markdown_report(campaign: dict) -> str:
         return str(value).replace("|", "\\|").replace("\n", " ").replace("<", "&lt;")
     def number(value):
         return "unmeasured" if value is None else f"{value:.3f}"
+    def blocked(block) -> int:
+        # Rows the evaluator backfilled because the Docker coding sandbox was unavailable are counted, never
+        # scored (containers.report.summarize_evaluation). A block without the count reads exactly as before.
+        value = block.get("blocked") if isinstance(block, dict) else None
+        return value if type(value) is int and value > 0 else 0
+    def quality(block) -> str:
+        count, score = blocked(block), block.get("score")
+        if count:  # never "unmeasured" (that hides why) and never a zero (that reads as the model's failure)
+            return "blocked" if score is None else f"{number(score)} ({count} blocked)"
+        return number(score)
+    any_blocked = False
     for row in rows:
+        blocks = [row.get("quality", {}).get(category, {}) for category in ("coding", "tools", "retrieval")]
+        any_blocked = any_blocked or any(blocked(block) for block in blocks)
         values = [row.get("attempt_id", "planned"), row.get("status", "planned"),
-                  number(row.get("speed", {}).get("minimum_native_tps")),
-                  *(number(row.get("quality", {}).get(category, {}).get("score"))
-                    for category in ("coding", "tools", "retrieval")),
+                  number(row.get("speed", {}).get("minimum_native_tps")), *(quality(block) for block in blocks),
                   str(row.get("eligibility", {}).get("eligible", False))]
         lines.append("| " + " | ".join(cell(value) for value in values) + " |")
     lines.extend(["", "50 tok/s is a floor, with no speed ceiling. Scores retain failed attempts in the denominator.",
+                  *(["`blocked` means the Docker sandbox that runs generated code was unavailable, so those "
+                     "items were not run: they are not a score of zero and stay out of the score."]
+                    if any_blocked else []),
                   "", "## Eligibility details", ""])
     for row in rows:
         reasons = row.get("eligibility", {}).get("reasons", ["planned_only"])

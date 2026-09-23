@@ -107,9 +107,10 @@ llmbench tune --model /path/to/model.gguf --runtime metal-native \
   --dataset-root artifacts/benchmark-datasets --output runs/my-model --budget-seconds 7200
 ```
 
-Reports and `resume` work exactly as above, and `scripts/sweep_models.py` takes the same `--runtime metal-native
---native-bundle` pair. Memory on a Mac is one pool shared by the CPU, the
-GPU and every other application, so a Mac report has no VRAM figure: it reports the server's unified-memory
+Reports and `resume` work exactly as above (a session remembers its runtime and bundle, so `resume` takes neither
+flag), and `scripts/sweep_models.py` takes the same `--runtime metal-native --native-bundle` pair. Memory on a Mac
+is one pool shared by the CPU, the GPU and every other application, so a Mac report has no VRAM figure: it
+reports the server's unified-memory
 footprint, its Metal buffers, swap growth, memory pressure and whether the Mac was on battery. Coding benchmarks,
 the optional Docker sandbox and everything else specific to the Mac:
 [docs/usage.md](docs/usage.md#apple-silicon-metal-native-runtime).
@@ -151,9 +152,12 @@ to write it; one GPU workload runs at a time behind a lock; and model-written co
 | `analyze` | Re-score a finished run under a different acceptance policy, without the GPU | no |
 | `list`, `show`, `report`, `doctor` | Read recorded evidence, rebuild reports, show the environment | no |
 
-Without installing: `python run.py <command>` is the same program. With `--runtime metal-native`, the commands
-that start containers start a pinned `llama-server` process on the Mac instead; Docker is then used only for the
-coding sandbox.
+Without installing: `python run.py <command>` is the same program. For a metal-native config or session, the
+commands that start containers start a pinned `llama-server` process on the Mac instead, and Docker is used only
+for the coding sandbox. A config or session names its own runtime; `--runtime metal-native` chooses it only where
+none exists yet (`tune --model`, `prepare`, `scripts/sweep_models.py`, `capabilities` without `--config`), and
+`optimize`, `sample` and `resume` have no `--runtime` flag. Which command takes which flag:
+[docs/usage.md](docs/usage.md#apple-silicon-metal-native-runtime).
 
 ## Reading the results honestly
 

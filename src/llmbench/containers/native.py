@@ -21,6 +21,9 @@ replaces only the primitives that touched Docker, so both runtimes produce the s
 * cleanup: SIGTERM to the owned process group, SIGKILL after the grace period, then positive proof of absence --
   the child reaped, its process group empty, no process carrying this attempt's alias and port, and the port
   refusing connections. Anything short of that is `cleanup-uncertain`, exactly like a container that would not go.
+  The server is stopped before anything else (the coding broker's Docker calls come after it), and a Ctrl-C that
+  arrives during that bounded stop is held until the proof is recorded, then delivered: the server runs in its own
+  session, so an interrupted stop is the one thing nothing else would ever finish.
 
 Generated code is never executed here. Coding suites still go through the host broker's sandboxed Docker workers;
 when that sandbox is unavailable they are recorded as blocked with the reason, and nothing is generated for them.
@@ -36,10 +39,12 @@ import socket
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..backends.base import BackendError
 from ..config import RunMode, canonical_json
 from ..safety import OperationForbidden, SessionLock
 from .capabilities import parse_server_help, require_supported
@@ -84,6 +89,37 @@ def port_accepts(port: int, timeout: float = 0.5) -> bool:
             return True
     except OSError:
         return False
+
+
+@contextmanager
+def _sigint_deferred():
+    """Hold SIGINT for the bounded block inside, then deliver it to whatever handled it before.
+
+    One Ctrl-C through the sweep wrappers reaches the harness twice: the terminal's own SIGINT, and the one the
+    supervisor forwards about a quarter of a second later. The first starts cleanup; the second used to land in
+    the middle of it -- between SIGTERM and the SIGKILL that must follow, or before SIGTERM was ever sent -- and
+    leave a llama-server that no signal from the terminal can reach (its own session). While this block runs a
+    SIGINT is only recorded; on the way out the previous handler is restored and a recorded SIGINT is raised
+    again, so the interrupt is deferred, never dropped. Signal handlers belong to the main thread: anywhere else,
+    or when the current handler was not installed from Python (and so could not be put back), nothing is changed.
+    """
+    pending: list[int] = []
+    previous, installed = None, False
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.getsignal(signal.SIGINT)
+        if previous is not None:
+            try:
+                signal.signal(signal.SIGINT, lambda signum, frame: pending.append(signum))
+                installed = True
+            except (ValueError, OSError):
+                installed = False
+    try:
+        yield
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+            if pending:
+                signal.raise_signal(signal.SIGINT)
 
 
 @dataclass(frozen=True)
@@ -218,19 +254,33 @@ class NativeServerProcess:
         self._signal_group(signal.SIGTERM)
 
     def stop(self, grace_seconds: float, deadline: float, clock=time.monotonic) -> None:
+        """SIGTERM to the owned group, SIGKILL once the grace period is over, then any member the group still holds.
+
+        Whatever cuts this short -- a KeyboardInterrupt in a wait, any error -- forfeits the grace period, never the
+        stop: the group is killed before the interruption propagates. The server runs in its own session, so no
+        terminal signal will ever reach it, and nothing after an interrupted stop would send the SIGKILL.
+        """
         if self.process is None:
             return
-        if self.process.poll() is None:
-            self._signal_group(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=max(0.1, min(grace_seconds, deadline - clock())))
-            except subprocess.TimeoutExpired:
-                self._signal_group(signal.SIGKILL)
+        try:
+            if self.process.poll() is None:
+                self._signal_group(signal.SIGTERM)
                 try:
-                    self.process.wait(timeout=max(0.1, min(10.0, deadline - clock())))
+                    self.process.wait(timeout=max(0.1, min(grace_seconds, deadline - clock())))
                 except subprocess.TimeoutExpired:
-                    pass
-        self._reap_group_members()
+                    self._signal_group(signal.SIGKILL)
+                    try:
+                        self.process.wait(timeout=max(0.1, min(10.0, deadline - clock())))
+                    except subprocess.TimeoutExpired:
+                        pass
+            self._reap_group_members()
+        except BaseException:
+            try:
+                self._signal_group(signal.SIGKILL)  # still unreaped, so its pid cannot belong to anyone else
+                self._reap_group_members()
+            except Exception:  # the interruption is what the caller must see; remaining() reports any survivor
+                pass
+            raise
         if self._drain is not None:
             self._drain.join(timeout=max(0.1, min(5.0, deadline - clock())))
 
@@ -328,6 +378,9 @@ class NativeRunner(ContainerRunner):
 class _NativeAttempt(_Attempt):
     LEASE_OWNER = "native-run"
     VERIFY_DETAIL = "startup log, load time and unified memory after load (server footprint, Metal buffers, swap)"
+    # The deferred SIGINT (`_sigint_deferred`) is delivered right after the absence proof is recorded; that proof
+    # stands (see `_Attempt._keeps_proven_cleanup`) and the run is recorded as cancelled.
+    KEEPS_PROVEN_CLEANUP_ON_INTERRUPT = True
 
     def __init__(self, runner: NativeRunner, config: ContainerRunConfig, run_dir: Path, remaining_budget_seconds,
                  lease_held: bool) -> None:
@@ -340,6 +393,7 @@ class _NativeAttempt(_Attempt):
         self.watchdog_violation: str | None = None
         self.sandbox: dict[str, Any] | None = None
         self.admission_sample: dict | None = None
+        self.launch_error: str | None = None  # the OSError with which starting the server failed, if it did
         super().__init__(runner, config, run_dir, remaining_budget_seconds, lease_held)
         self.container_mode = False
 
@@ -396,7 +450,7 @@ class _NativeAttempt(_Attempt):
             raise _Stop("rejected", f"{type(exc).__name__}: {exc}") from exc
         try:
             identity = self._verify_server_identity(lock)
-        except (PreflightError, ValueError, OSError) as exc:
+        except (PreflightError, BackendError, ValueError, OSError) as exc:  # BackendError: help/argv refusals
             raise _Stop("rejected", f"native server identity: {exc}") from exc
         if not self.lease_held:
             from .lease import LeaseHeld
@@ -416,10 +470,17 @@ class _NativeAttempt(_Attempt):
         self.artifacts.write_json("preflight.json", preflight)
 
     def _verify_server_identity(self, lock: SessionLock) -> dict:
-        """The pinned executable and libraries by hash, then its own --version and --help, then the argv."""
+        """The pinned executable and libraries by hash, then the linkage proof, then its own --version and --help,
+        then the argv.
+
+        The linkage proof (`native_prep.check_native_linkage`) is what makes the libraries pin complete: hashing the
+        files beside the executable says nothing about a build that loads its Metal backend from `../lib` or
+        `/opt/homebrew`. Preparation proves it once, but nothing forces a config through preparation (a candidate
+        needs no `--native-bundle`, and a bundle is unauthenticated JSON), so admission proves it again from the
+        very files it just hashed before anything is executed. It only reads Mach-O load commands."""
         if self.runner.identity_check is not None:
             return self.runner.identity_check(self.config, self.plan.server_argv)
-        from .native_prep import NativeProcessExecutor, hash_native_server
+        from .native_prep import NativeProcessExecutor, check_native_linkage, hash_native_server
         ref = self.config.native_server
         executable = Path(ref.executable)
         hashed = hash_native_server(executable)
@@ -430,6 +491,10 @@ class _NativeAttempt(_Attempt):
             problems.append("the llama.cpp/ggml libraries beside the executable differ from the pinned set")
         if problems:
             raise PreflightError("; ".join(problems))
+        try:
+            check_native_linkage(executable, hashed["libraries"])
+        except ValueError as exc:
+            raise PreflightError(str(exc)) from exc
         executor = NativeProcessExecutor(executable, session_lock=lock, cwd=self.run_dir)
         version = executor.run("--version", timeout_seconds=self._timeout(PROBE_TIMEOUT_SECONDS))
         helptext = executor.run("--help", timeout_seconds=self._timeout(PROBE_TIMEOUT_SECONDS))
@@ -487,10 +552,17 @@ class _NativeAttempt(_Attempt):
             log_cap=self.config.limits.log_max_bytes)
         try:
             self.server.start()
-        except OSError as exc:
+        except OSError as exc:  # Popen reports a failed fork or exec only after reaping any child it made
+            self.launch_error = f"{type(exc).__name__}: {exc}"
             raise _Stop("failed", f"llama-server could not be started: {exc}") from exc
         self.container_id = f"pid:{self.server.pid}"
         self.base_url = f"http://{LOOPBACK}:{self.plan.port}"
+        if self.lease.held:
+            # A standalone run's own lease names the server it now owns, so a lease left behind by a killed harness
+            # tells the reader which llama-server to look for (`locks.describe_lock`). A lease taken by a campaign
+            # belongs to the campaign and is never rewritten here.
+            self._guard("lease_server_pid_not_recorded", lambda: self.lease.annotate(
+                runtime="metal-native", server_pid=self.server.pid))
 
     def _ready(self) -> None:
         super()._ready()
@@ -596,38 +668,22 @@ class _NativeAttempt(_Attempt):
 
     # ---- cleanup ---------------------------------------------------------------------------------------------
     def _cleanup(self) -> None:
-        self._stop_watchdog()
-        if not self.up_attempted or self.server is None:
-            self.cleanup = CleanupEvidence(attempted=False, verified=True)
+        started = self.up_attempted and self.server is not None
+        # Bounded throughout: the watchdog's join timeout, the stop's grace and deadline, the absence checks and the
+        # broker's own bounds. Nothing in here may be cut short by the second SIGINT of a single Ctrl-C.
+        with _sigint_deferred():
+            try:
+                self._stop_watchdog()
+            finally:  # whatever the watchdog does, the server is stopped
+                deadline = self.clock() + self.config.bounds.cleanup_reserve_seconds
+                if started:
+                    self._stop_and_prove_absence(deadline)
+                else:
+                    self.cleanup = CleanupEvidence(attempted=False, verified=True)
+        if not started:
             if self.model_evidence:
                 self._reverify_model()
             return
-        deadline = self.clock() + self.config.bounds.cleanup_reserve_seconds
-        evidence = {"attempted": True, "verified": False, "error": None}
-        broker_error = self._cancel_broker() if self.broker is not None else None
-        remaining: list[str] = []
-        try:
-            self.server.stop(self.limits.stop_grace_seconds, deadline, clock=self.clock)
-            evidence["server_exit"] = self.server.describe_exit()
-            if self.server.unexpected_kill():
-                self._fail("failed", "inference_killed_by_sigkill: the server died of a SIGKILL the harness did not "
-                                     "send (macOS sends that under memory pressure; not proven here)")
-            elif self.server.state()[0] == "exited" and not self.server.signals_sent and self.state == "completed":
-                self._fail("failed", f"llama-server exited on its own ({evidence['server_exit']})")
-            marker = ("--alias", self.config.alias(), "--port", str(self.plan.port))
-            remaining = self.server.remaining(marker)
-            if self.plan.port is not None and port_accepts(self.plan.port):
-                remaining.append(f"port:{self.plan.port}-still-accepting")
-            evidence.update(processes_remaining=tuple(remaining), verified=not remaining)
-            self.containers_absent = not remaining
-            if remaining:
-                evidence["error"] = "owned server processes remain after the stop"
-        except Exception as exc:
-            evidence.update(verified=False, error=f"{type(exc).__name__}: {exc}")
-        finally:
-            if broker_error and evidence["verified"]:
-                evidence.update(verified=False, error=broker_error)
-            self.cleanup = CleanupEvidence(**evidence)
         if self.server.log_error or self.server.dropped_bytes:
             self.warnings.append(f"inference_log_truncated:{NATIVE_LOG}: kept {self.server.log_bytes} bytes, dropped "
                                  f"{self.server.dropped_bytes}" + (f" ({self.server.log_error})"
@@ -645,6 +701,40 @@ class _NativeAttempt(_Attempt):
                                                        "telemetry": self._sample(deadline, pid=None)})
         except Exception as exc:
             self.warnings.append(f"cleanup_telemetry_unavailable: {type(exc).__name__}: {exc}")
+
+    def _stop_and_prove_absence(self, deadline: float) -> None:
+        """Stop the server, then record positive proof that nothing it was remains; the broker's workers after it.
+
+        The server goes first so the broker's Docker calls can neither delay the SIGTERM nor use up its grace. A
+        launch that never produced a process is recorded as `not-started: <the OSError>`, which is what the launcher
+        reported, and the absence checks still run: evidence, not the assumption that a failed start left nothing.
+        """
+        evidence: dict[str, Any] = {"attempted": True, "verified": False, "error": None}
+        try:
+            self.server.stop(self.limits.stop_grace_seconds, deadline, clock=self.clock)
+            evidence["server_exit"] = self.server.describe_exit()
+            if evidence["server_exit"] is None and self.server.pid is None and self.launch_error:
+                evidence["server_exit"] = f"not-started: {self.launch_error}"
+            if self.server.unexpected_kill():
+                self._fail("failed", "inference_killed_by_sigkill: the server died of a SIGKILL the harness did not "
+                                     "send (macOS sends that under memory pressure; not proven here)")
+            elif self.server.state()[0] == "exited" and not self.server.signals_sent and self.state == "completed":
+                self._fail("failed", f"llama-server exited on its own ({evidence['server_exit']})")
+            marker = ("--alias", self.config.alias(), "--port", str(self.plan.port))
+            remaining = self.server.remaining(marker)
+            if self.plan.port is not None and port_accepts(self.plan.port):
+                remaining.append(f"port:{self.plan.port}-still-accepting")
+            evidence.update(processes_remaining=tuple(remaining), verified=not remaining)
+            self.containers_absent = not remaining
+            if remaining:
+                evidence["error"] = "owned server processes remain after the stop"
+        except Exception as exc:
+            evidence.update(verified=False, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            broker_error = self._cancel_broker() if self.broker is not None else None
+            if broker_error and evidence["verified"]:
+                evidence.update(verified=False, error=broker_error)
+            self.cleanup = CleanupEvidence(**evidence)
 
     def _guard_text(self, label: str, action) -> str:
         try:

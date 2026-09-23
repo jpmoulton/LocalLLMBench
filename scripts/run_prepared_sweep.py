@@ -303,13 +303,28 @@ def guard_disk(plan, *, usage=shutil.disk_usage):
                          f"at least {plan['min_free_disk_gib']} GiB required")
 
 
+def server_never_started(result):
+    """Recorded evidence, never the mere absence of it, that a native candidate's llama-server was not started.
+
+    Both must hold: the ``start`` stage is recorded and did not succeed, and no server ``pid:<n>`` was recorded
+    (the runner records one as soon as the launch returns). A result that says nothing about its start, or that
+    recorded a server pid, still has to say how that server exited.
+    """
+    starts = [stage for stage in result.stages if stage.name == "start"]
+    return (bool(starts) and all(stage.status != "ok" for stage in starts)
+            and not any(item.startswith("pid:") for item in result.container_ids))
+
+
 def terminal(entry, returncode):
     """The checkpointed outcome of one candidate, or a refusal when its evidence does not prove cleanup.
 
     A native candidate's cleanup evidence names the owned server processes still present
     (``processes_remaining``, which must be empty exactly like ``containers_remaining``) and how the server it
-    started exited (``server_exit``). When the runner attempted a cleanup it started a server, so a missing exit is
-    missing proof, not a clean stop. An NVIDIA result is judged exactly as before and checkpointed with the same keys.
+    started exited (``server_exit``). An attempted cleanup does not by itself mean a server ran: the runner marks
+    the start attempted before it launches llama-server, and a launch that fails (the executable gone, fork out of
+    resources) leaves no process to have an exit. So a missing exit is missing proof unless the result shows the
+    server never started (``server_never_started``); the absence proof above is required either way. An NVIDIA
+    result is judged exactly as before and checkpointed with the same keys.
     """
     path = Path(entry["output"]) / "result.json"
     result = ContainerRunResult.model_validate_json(path.read_bytes(), strict=True)
@@ -320,7 +335,7 @@ def terminal(entry, returncode):
             or cleanup.processes_remaining or cleanup.lease_retained or cleanup.error or result.abort_campaign):
         raise ValueError("Candidate cleanup is uncertain; preserve evidence and reconcile owned resources")
     native = result.runtime != DEFAULT_RUNTIME
-    if native and cleanup.attempted and not cleanup.server_exit:
+    if native and cleanup.attempted and not cleanup.server_exit and not server_never_started(result):
         raise ValueError("Native candidate cleanup does not record how its llama-server exited; preserve evidence "
                          "and confirm the server process is gone")
     outcome = {"status": "completed" if returncode == 0 and result.state == "completed" else "failed",
@@ -355,6 +370,18 @@ def candidate_command(plan, entry):
               else ["--native-bundle", plan["native_bundle"]])
     return [str(python), "-B", str(ROOT / "run.py"), "candidate", "--config", entry["config"],
             "--output", entry["output"], "--budget-seconds", str(entry["budget_seconds"]), *bundle]
+
+
+def child_options():
+    """Keep the terminal's interrupt away from the candidate, so the one ``request_cleanup`` sends is the only one.
+
+    A child left in the supervisor's process group also receives the terminal's own SIGINT; ``Popen.wait`` then
+    gives it 0.25 s before the supervisor sees the interrupt and forwards another, which lands inside the
+    candidate's cleanup (the native llama-server stop and its absence proof) and turns it cleanup-uncertain. So on
+    POSIX the candidate starts in a session of its own; on Windows ``CREATE_NEW_PROCESS_GROUP`` already does this.
+    """
+    return ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+            else {"start_new_session": True})
 
 
 def request_cleanup(child, seconds):
@@ -403,8 +430,7 @@ def run_plan(plan, *, resume=False, popen=subprocess.Popen, process_guard=guard_
                 ledger.record("launching", identifier, status="launching", child_pid=None,
                               stdout_file=str(log), argv=argv, output=entry["output"])
                 try:
-                    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
-                    child = popen(argv, cwd=str(ROOT), stdout=stdout, stderr=subprocess.STDOUT, **options)
+                    child = popen(argv, cwd=str(ROOT), stdout=stdout, stderr=subprocess.STDOUT, **child_options())
                     ledger.record("started", identifier, status="running", child_pid=child.pid)
                     try:
                         code = child.wait(timeout=entry["budget_seconds"] + cleanup_wait)

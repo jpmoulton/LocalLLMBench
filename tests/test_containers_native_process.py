@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from llmbench.containers.artifacts import RunArtifacts
 from llmbench.containers.native import (NativeServerProcess, free_loopback_port, port_accepts,
                                         scrubbed_environment)
 
@@ -128,6 +129,59 @@ def test_the_log_is_drained_past_its_cap_without_stalling_the_server(tmp_path):
     assert server.log_bytes == 4096 and server.dropped_bytes == 2000 * 1024 - 4096
     assert server.read_log(1 << 20).status == "output-limit"
     assert (tmp_path / "server.log").stat().st_size == 4096 and server.log_sink.closed
+
+
+def test_a_log_the_artifact_budget_refuses_is_still_drained_and_the_refusal_recorded(tmp_path):
+    # The real sink: a run's artifact store with a 1 MiB budget. Once it refuses a write the drain keeps reading
+    # (a full pipe would stall llama-server mid-benchmark), keeps nothing more, and says why.
+    artifacts = RunArtifacts(tmp_path / "run", 1_048_576)
+    server = NativeServerProcess(sys.executable, ["-c", textwrap.dedent("""
+        import sys
+        for _ in range(2000):
+            sys.stdout.write("x" * 1023 + "\\n")
+        sys.stdout.flush()
+    """)], cwd=tmp_path, env=scrubbed_environment(), log_sink=artifacts.open_external("logs/server.log", "xb"),
+                                 log_path=tmp_path / "run" / "logs" / "server.log", log_cap=16 << 20)
+    server.start()
+    try:
+        assert wait_for(lambda: server.state()[0] == "exited")  # 2 MB against a 1 MiB budget never blocks
+    finally:
+        server.stop(1, time.monotonic() + 10)
+    assert server.describe_exit() == "returncode=0"
+    assert server.log_error and "budget" in server.log_error
+    assert 0 < server.log_bytes <= 1_048_576 and server.log_bytes + server.dropped_bytes == 2000 * 1024
+    assert server.log_sink.closed
+
+
+def test_an_interrupted_stop_still_kills_the_owned_group(tmp_path):
+    # A second Ctrl-C landing in the wait after SIGTERM must not leave a server that ignores SIGTERM running: it
+    # is in its own session, so nothing else would ever stop it.
+    server = child(tmp_path, """
+        import signal, time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        print("ready", flush=True)
+        while True:
+            time.sleep(0.1)
+    """)
+    server.start()
+    try:
+        assert wait_for(lambda: b"ready" in server.read_log(64).stdout)
+        real_wait = server.process.wait
+
+        def interrupted_wait(timeout=None):
+            server.process.wait = real_wait
+            raise KeyboardInterrupt()
+        server.process.wait = interrupted_wait
+        with pytest.raises(KeyboardInterrupt):
+            server.stop(30, time.monotonic() + 60)
+        assert server.signals_sent[:2] == ["SIGTERM", "SIGKILL"]
+        assert wait_for(lambda: server.state()[0] == "exited", 5)
+        assert server.describe_exit() == "signal=SIGKILL" and not server.unexpected_kill()
+        assert wait_for(lambda: server.remaining(("--alias", "llmbench-test", "--port", "1")) == [], 5)
+    finally:
+        if server.process.poll() is None:
+            os.killpg(server.pgid, signal.SIGKILL)
+            server.process.wait(timeout=10)
 
 
 def test_signals_are_never_sent_to_a_reaped_child(tmp_path, monkeypatch):

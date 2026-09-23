@@ -180,6 +180,102 @@ def test_seed_group_never_averages_only_surviving_seeds(failed_seed_attempted):
     assert summaries[1]["attempted_seeds"] == [] and summaries[1]["measured_seeds"] == []
 
 
+BLOCKED_REASON = "sandbox_unavailable: the Docker daemon is not reachable"
+
+
+def _backfilled(row):
+    """What container_eval._execution_block writes for an item the unavailable Docker sandbox could not run."""
+    return {**row, "score": 0.0, "passed": False, "status": "environment_error",
+            "outcome_status": "environment_error", "reason": BLOCKED_REASON, "synthetic": False,
+            "model_evaluated": False}
+
+
+def test_sandbox_blocked_items_are_counted_and_never_scored_as_a_measured_zero():
+    coding = [{"suite": "evalplus", "task_id": f"Mbpp/{index}", "split": "development", "category": "coding"}
+              for index in range(3)]
+    ruler = [{"suite": "ruler", "task_id": "r/1", "split": "development", "category": "retrieval",
+              "status": "completed", "score": 1.0},
+             {"suite": "ruler", "task_id": "r/2", "split": "development", "category": "retrieval",
+              "status": "environment_error", "score": 1.0, "model_evaluated": False, "reason": "server gone"}]
+    scores = _scores([*map(_backfilled, coding), *ruler], measured=True)
+    for block in (scores["by_suite"]["evalplus"], scores["by_category"]["coding"]):
+        assert block["score"] is None and block["item_count"] == 0 and block["failed_item_count"] == 0
+        assert (block["blocked_item_count"], block["blocked_reason"]) == (3, BLOCKED_REASON)
+    # Every other failure, another environment error included, stays in the denominator as zero.
+    assert scores["by_suite"]["ruler"]["score"] == 0.5 and "blocked_item_count" not in scores["by_suite"]["ruler"]
+    summary = _seed_summary([{"role": "stochastic", "temperature": 0.8, "top_p": 0.95, "seed": seed,
+                              "evidence": "measured-descriptive", "scores": scores} for seed in (42, 43)],
+                            _sampling_grid([0.8], [42, 43], 0.95), [*coding, *ruler])[0]
+    blocked = summary["scores"]["by_suite"]["evalplus"]
+    assert all(blocked[key] is None for key in ("mean", "minimum", "maximum", "population_stddev"))
+    assert (blocked["measured_seed_count"], blocked["unique_benchmark_items"], blocked["blocked_seed_count"],
+            blocked["blocked_reason"]) == (0, 3, 2, BLOCKED_REASON)
+    assert summary["scores"]["by_suite"]["ruler"]["mean"] == 0.5
+    assert "blocked_seed_count" not in summary["scores"]["by_suite"]["ruler"]
+    # Two seeds that lost the sandbox for different causes: the group names both, not only the first seed's.
+    other = "sandbox_unavailable: docker CLI not found"
+    later = _scores([*({**_backfilled(row), "reason": other} for row in coding), *ruler], measured=True)
+    mixed = _seed_summary([{"role": "stochastic", "temperature": 0.8, "top_p": 0.95, "seed": seed,
+                            "evidence": "measured-descriptive", "scores": block}
+                           for seed, block in ((42, scores), (43, later))],
+                          _sampling_grid([0.8], [42, 43], 0.95), [*coding, *ruler])[0]
+    assert mixed["scores"]["by_suite"]["evalplus"]["blocked_reason"] == f"{other}; {BLOCKED_REASON}"
+
+
+class EvaluatingRunner(Runner):
+    """Completes every attempt and writes the evaluation a sandbox-less evaluator would: the items of the
+    ``blocked`` suites backfilled, every other item answered."""
+
+    def __init__(self, clock, expected, blocked):
+        super().__init__(clock, [("completed", True)] * 8)
+        self.expected, self.blocked = expected, blocked
+
+    def run(self, config, output, *, remaining_budget_seconds):
+        result = super().run(config, output, remaining_budget_seconds=remaining_budget_seconds)
+        samples = [_backfilled(row) if row["suite"] in self.blocked else {**row, "status": "completed", "score": 1.0}
+                   for row in self.expected]
+        artifacts = RunArtifacts(output)
+        artifacts.write_json("evaluation.json", {"samples": samples})
+        artifacts.write_index()
+        return result
+
+
+def test_a_sampling_run_reports_a_sandbox_blocked_suite_as_blocked_never_as_a_score(tmp_path):
+    config = read_run_config(EXAMPLE)
+    expected = expected_task_rows(config.benchmarks)
+    suites = {row["suite"]: row["category"] for row in expected}
+    blocked, answered = sorted(suites)[:1], sorted(suites)[1:]
+    assert blocked and answered
+    report = _run_sampling(config, tmp_path / "out", runner=EvaluatingRunner(Clock(), expected, set(blocked)),
+                           clock=Clock(), temperatures=[0.8], seeds=[42], budget_seconds=10000)
+    assert report["state"] == "completed"
+    assert all(attempt["evidence"] == "measured-descriptive" for attempt in report["attempts"])
+    for attempt in report["attempts"]:
+        for axis, name in (("by_suite", blocked[0]), ("by_category", suites[blocked[0]])):
+            block = attempt["scores"][axis][name]
+            assert block["score"] is None and block["blocked_reason"] == BLOCKED_REASON
+        assert attempt["scores"]["by_suite"][answered[0]]["score"] == 1.0
+    seed = report["seed_summary"][0]["scores"]["by_suite"]
+    assert seed[blocked[0]]["mean"] is None and seed[blocked[0]]["blocked_seed_count"] == 1
+    assert seed[answered[0]]["mean"] == 1.0
+    assert any("blocked_item_count" in line for line in report["interpretation"])
+    assert json.loads((tmp_path / "out" / REPORT_NAME).read_text()) == report
+    # Nothing but blocked items: nothing was put to the model, so no attempt counts as measured.
+    nothing = _run_sampling(config, tmp_path / "none", runner=EvaluatingRunner(Clock(), expected, set(suites)),
+                            clock=Clock(), temperatures=[0.8], seeds=[42], budget_seconds=10000)
+    assert nothing["state"] == "completed-with-unmeasured-attempts"
+    assert all(attempt["evidence"] == "unmeasured" and "every benchmark item was blocked: " + BLOCKED_REASON
+               in attempt["failure_reasons"][-1] for attempt in nothing["attempts"])
+    # No blocked item anywhere: the report carries neither the keys nor the note.
+    plain = _run_sampling(config, tmp_path / "plain", runner=EvaluatingRunner(Clock(), expected, set()),
+                          clock=Clock(), temperatures=[0.8], seeds=[42], budget_seconds=10000)
+    assert set(plain["attempts"][1]["scores"]["by_suite"][blocked[0]]) == {
+        "score", "item_count", "completed_item_count", "failed_item_count", "output_truncation_count",
+        "output_truncation_observed_items", "input_truncation_count", "input_truncation_observed_items"}
+    assert not any("blocked" in line for line in plain["interpretation"])
+    assert "blocked_seed_count" not in json.dumps(plain["seed_summary"])
+
+
 def _native_config_and_bundle(tmp_path):
     from llmbench.containers.session import native_overlay
     from test_containers_session import make_native_bundle

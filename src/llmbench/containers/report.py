@@ -19,7 +19,8 @@ from ..reports import markdown_report, html_report
 from ..search import assess_candidate
 from .config import ContainerRunConfig, ContainerRunResult
 from .readback import unverified_required
-from .session_report import NATIVE_RUNTIME, SANDBOX_BLOCKED, pressure_text, unified_memory_evidence
+from .session_report import (NATIVE_RUNTIME, SANDBOX_BLOCKED, blocked_count, pressure_text, sandbox_blocked_row,
+                             unified_memory_evidence)
 
 CATEGORIES = ("coding", "tools", "retrieval")
 CANDIDATE_UNIFIED_NOTE = (
@@ -38,15 +39,31 @@ def default_policy(config: ContainerRunConfig) -> CampaignPolicy:
 
 
 def summarize_evaluation(config: ContainerRunConfig, evaluation: dict, policy: CampaignPolicy | None) -> dict:
+    """Speed and per-category quality of one candidate's evaluation.
+
+    The denominator rule is controller.execute_attempt's: a declared task that failed, timed out or hit an
+    environment error scores zero. The one exception is a row the evaluator backfilled because the Docker coding
+    sandbox was unavailable (``session_report.sandbox_blocked_row``): nothing was asked of the model, so it is
+    counted under ``blocked`` (with its reason) and never enters ``attempted`` or the score. A category left with
+    no other row is therefore unmeasured -- ``attempted`` 0, ``score`` None, reported and not judged, exactly as
+    when derivation saw no sandbox and never selected the suites -- instead of a 0.0 that fails the candidate as
+    ``coding_absolute_quality_failed``. The ``blocked`` keys appear only when such rows exist, so every other
+    result (every NVIDIA one) serialises as before.
+    """
     policy = policy or default_policy(config)
     samples = [row for row in evaluation.get("samples") or [] if isinstance(row, dict)]
     observations = [_observation(row) for row in evaluation.get("speed_observations") or []]
     quality = {}
-    for category in CATEGORIES:  # Same denominator rule as controller.execute_attempt: failures score zero.
+    for category in CATEGORIES:
         rows = [sample for sample in samples if sample.get("category") == category]
+        blocked = [row for row in rows if sandbox_blocked_row(row)]
+        rows = [row for row in rows if not sandbox_blocked_row(row)]
         scores = [float(row.get("score", 0)) if row.get("status") == "completed" else 0. for row in rows]
         quality[category] = {"attempted": len(rows), "score": sum(scores) / len(scores) if scores else None,
                              "comparison": {"status": "unmeasured"}}
+        if blocked:
+            quality[category].update(blocked=len(blocked),
+                                     blocked_reason="; ".join(sorted({row["reason"] for row in blocked})))
     return {"speed": summarize_speed(observations, policy.acceptance), "quality": quality,
             "samples_total": len(samples)}
 
@@ -106,7 +123,13 @@ def _engine_line(engine) -> str:
 
 def _native_lines(config: ContainerRunConfig, result: ContainerRunResult, memory: dict, load: str) -> list[str]:
     """Identity and unified-memory lines for a metal-native candidate, from the config's pin and the result's
-    ``memory`` block. Every figure that was not measured reads ``unmeasured``; none is derived from another."""
+    ``memory`` block. Every figure that was not measured reads ``unmeasured``; none is derived from another.
+
+    Each figure sits on the line of the moment it measures. The after-load line holds the one sample taken once
+    the model had loaded; swap growth runs from the admission sample to the evaluation's highest sample, so it is
+    printed on the evaluation line, where an after-load label would pin growth the evaluation caused on the load.
+    Power is printed at load and over the evaluation, and a change of source between any two readings gets a line
+    of its own: the battery warning follows ANY reading on battery, not only the after-load one."""
     server = config.native_server
     pressure = pressure_text(memory["pressure_level"]) or "unmeasured"
     lines = [f"- llama-server: `{_cell(server.executable)}` sha256 `{server.executable_sha256}`, libraries "
@@ -118,17 +141,26 @@ def _native_lines(config: ContainerRunConfig, result: ContainerRunResult, memory
              f"- Unified memory after load: server footprint {_mib_text(memory['server_footprint_mib'])} (RSS "
              f"{_mib_text(memory['server_rss_mib'])}); Metal buffers {_mib_text(memory['metal_mib'])} of "
              f"{_mib_text(memory['metal_budget_mib'])} budget; host available "
-             f"{_mib_text(memory['host_available_mib'])}; swap used {_mib_text(memory['swap_used_mib'])} (growth "
-             f"{_mib_text(memory['swap_growth_mib'])}); pressure level {pressure}; power: "
-             f"{_cell(memory['power'] or 'unmeasured')}"]
+             f"{_mib_text(memory['host_available_mib'])}; swap used {_mib_text(memory['swap_used_mib'])}; "
+             f"pressure level {pressure}; power: {_cell(memory['power'] or 'unmeasured')}"]
     violations = memory["watchdog_violations"]
-    if violations is not None:  # the watchdog ran: its summary exists even when nothing was violated
+    # The watchdog ran: its summary exists even when nothing was violated (and carries the growth and power).
+    if violations is not None or memory["swap_growth_mib"] is not None \
+            or memory["power_during_evaluation"] is not None:
         peak = _mib_text(memory["server_footprint_peak_mib"])
+        # The start the watchdog actually used: without a swap reading at admission it is its own first sample.
+        start = f"from {memory['swap_growth_from']} " if memory["swap_growth_from"] else ""
         lines.append(f"- During evaluation: peak server footprint {peak}; "
-                     f"lowest host available {_mib_text(memory['min_host_available_mib'])}; highest pressure level "
-                     f"{pressure_text(memory['max_pressure_level']) or 'unmeasured'}; watchdog violations: "
-                     + (", ".join(_cell(item) for item in violations) or "none"))
-    if str(memory["power"] or "").startswith("battery"):
+                     f"lowest host available {_mib_text(memory['min_host_available_mib'])}; swap growth {start}"
+                     f"to the evaluation peak {_mib_text(memory['swap_growth_mib'])}; highest pressure "
+                     f"level {pressure_text(memory['max_pressure_level']) or 'unmeasured'}; power "
+                     f"{_cell(memory['power_during_evaluation'] or 'unmeasured')}; watchdog violations: "
+                     + ("not recorded" if violations is None
+                        else ", ".join(_cell(item) for item in violations) or "none"))
+    if memory["power_changed"]:
+        lines.append(f"- Power source changed during the run: {_cell(memory['power_timeline'])}; the figures "
+                     "measured across the change do not come from one power condition.")
+    if memory["on_battery"]:
         lines.append("- Measured on battery power: macOS may lower CPU and GPU clocks on battery, so speed on AC "
                      "can differ.")
     if memory["coding_sandbox_status"] is not None:
@@ -140,8 +172,12 @@ def _native_lines(config: ContainerRunConfig, result: ContainerRunResult, memory
     return lines
 
 
-def _coding_blocked(memory: dict | None) -> bool:
-    return memory is not None and memory["coding_sandbox_status"] not in (None, "available")
+def _coding_blocked(memory: dict | None, coding: dict) -> bool:
+    """The sandbox probe of a candidate that DECLARED coding tasks found no usable worker. The broker stage probes
+    whatever the candidate declared, so a NIAH-only holdout sees the same blocked probe; it had no coding row to
+    backfill, and its cell is the ordinary "0 attempted" one."""
+    declared = bool(coding.get("attempted")) or bool(blocked_count(coding))
+    return declared and memory is not None and memory["coding_sandbox_status"] not in (None, "available")
 
 
 def candidate_markdown(config: ContainerRunConfig, result: ContainerRunResult, row: dict,
@@ -183,11 +219,18 @@ def candidate_markdown(config: ContainerRunConfig, result: ContainerRunResult, r
                   *(f"- {_cell(item)}" for item in not_enforced_settings(config)), ""]
 
     def score(name: str) -> str:
-        # Rows a blocked sandbox backfilled score 0.0 in the denominator; printed, that zero would read as a model
-        # that cannot code. It is a harness that could not run the code, so the cell says that instead.
-        if name == "coding" and _coding_blocked(memory):
+        # Rows a blocked sandbox backfilled are counted under `blocked`, never scored: a category with nothing else
+        # says blocked (not "unmeasured", which would hide why), and a mixed one names them beside its score.
+        block = row["quality"][name]
+        blocked = blocked_count(block)
+        if blocked:
+            return (f"{SANDBOX_BLOCKED}, {blocked} declared" if not block["attempted"]
+                    else f"{_number(block['score'])} ({blocked} blocked)")
+        # A result whose rows carry no such mark still prints no score for a declared coding category whose own
+        # sandbox probe failed: its rows can only be backfills, and a number would read as a model that cannot code.
+        if name == "coding" and _coding_blocked(memory, block):
             return SANDBOX_BLOCKED
-        return _number(row["quality"][name]["score"])
+        return _number(block["score"])
 
     floor = policy.acceptance.minimum_tokens_per_second
     lines += ["## Speed", "",

@@ -4,18 +4,32 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
+from llmbench.config import canonical_json
 from llmbench.containers.lease import GpuLease, LeaseHeld
 from llmbench.locks import describe_lock, process_alive
 from llmbench.store import Store
+
+
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 def finished_pid() -> int:
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
+
+
+def killed_holder(script: str, *args) -> None:
+    """Run `script` in a child that takes a lock through the real writer and then dies without any cleanup
+    (`os._exit`, as a SIGKILL, jetsam or a closed terminal would leave it): the lock file stays behind, exactly as
+    that writer wrote it, naming a pid that no longer exists."""
+    subprocess.run([sys.executable, "-c", textwrap.dedent(script), *map(str, args)], check=True, timeout=60,
+                   env={**os.environ, "PYTHONPATH": str(SRC)})
 
 
 def test_process_probe_never_signals_and_reads_liveness():
@@ -99,6 +113,104 @@ def test_a_native_lock_points_at_its_llama_server_never_at_docker(tmp_path):
     with pytest.raises(LeaseHeld, match=f"stale.*llama-server, pid {server}"):
         GpuLease(path).acquire()
     assert path.exists()
+
+
+def test_a_campaign_lock_left_by_a_killed_session_names_both_runtimes_leftovers(tmp_path):
+    # `tune`, `resume` and the sweeps hold the GPU through the campaign lock, which records only its pid. A killed
+    # metal-native session leaves a llama-server in its own session; a killed NVIDIA one may leave a container.
+    # With no runtime recorded neither is assumed: the advice covers both, and nothing removes the lock.
+    lock = tmp_path / "gpu.lock"
+    killed_holder("""
+        import os, sys
+        from pathlib import Path
+        from llmbench.store import Store
+        with Store(Path(sys.argv[1])) as store:
+            with store.campaign_lock(Path(sys.argv[2])):
+                os._exit(0)
+    """, tmp_path / "store", lock)
+    holder = json.loads(lock.read_text(encoding="utf-8"))
+    assert set(holder) == {"pid", "created"}
+    text = describe_lock(lock)
+    assert "no longer running" in text and "stale" in text and "names no runtime" in text
+    assert "`docker ps -a --filter name=llmbench-`" in text and "`pgrep -fl llama-server`" in text
+    assert lock.exists()
+
+
+def test_a_native_lease_left_by_a_killed_run_names_its_llama_server(tmp_path):
+    lock, server = tmp_path / "gpu.lock", finished_pid()
+    killed_holder("""
+        import os, sys
+        from pathlib import Path
+        from llmbench.containers.lease import GpuLease
+        lease = GpuLease(Path(sys.argv[1]), owner="native-run:abc").acquire()
+        lease.annotate(runtime="metal-native", server_pid=int(sys.argv[2]))
+        os._exit(0)
+    """, lock, server)
+    holder = json.loads(lock.read_text(encoding="utf-8"))
+    assert holder["owner"] == "native-run:abc" and holder["runtime"] == "metal-native"
+    assert holder["server_pid"] == server
+    text = describe_lock(lock)
+    assert f"llama-server, pid {server}, is gone too" in text and "docker" not in text
+    with pytest.raises(LeaseHeld, match=f"stale.*llama-server, pid {server}"):
+        GpuLease(lock).acquire()
+    assert lock.exists()
+
+
+def test_a_container_leases_advice_is_unchanged(tmp_path):
+    lock = tmp_path / "gpu.lock"
+    for owner in ("container-run", "container-run:abc"):
+        killed_holder("""
+            import os, sys
+            from pathlib import Path
+            from llmbench.containers.lease import GpuLease
+            GpuLease(Path(sys.argv[1]), owner=sys.argv[2]).acquire()
+            os._exit(0)
+        """, lock, owner)
+        text = describe_lock(lock)
+        assert text.endswith("Check that no container was left behind (`docker ps -a --filter name=llmbench-`), "
+                             "then delete the file") and "llama-server" not in text
+        lock.unlink()
+
+
+def test_annotating_a_lease_only_ever_writes_the_file_it_created(tmp_path):
+    path = tmp_path / "gpu.lock"
+    lease = GpuLease(path, owner="native-run:abc").acquire()
+    written = json.loads(path.read_text(encoding="utf-8"))
+    lease.annotate(runtime="metal-native", server_pid=4242)
+    assert json.loads(path.read_text(encoding="utf-8")) == {**written, "runtime": "metal-native", "server_pid": 4242}
+    for field in ("pid", "owner", "created"):  # who holds the lease is never rewritten
+        with pytest.raises(ValueError, match=field):
+            lease.annotate(**{field: 1})
+    # Someone deleted the lease and another run took the GPU: that run's lock is left exactly as it is.
+    path.unlink()
+    other = canonical_json({"pid": os.getpid(), "created": "now", "owner": "container-run:def"}).encode("utf-8")
+    path.write_bytes(other)
+    with pytest.raises(LeaseHeld, match="no longer the lease this run created"):
+        lease.annotate(server_pid=1)
+    assert path.read_bytes() == other
+    # A byte-identical copy swapped in over the lease is not the file this lease created either.
+    swapped = GpuLease(tmp_path / "swapped.lock", owner="native-run:ghi").acquire()
+    copy = tmp_path / "copy.lock"
+    copy.write_bytes(swapped.path.read_bytes())
+    os.replace(copy, swapped.path)
+    with pytest.raises(LeaseHeld, match="no longer the lease this run created"):
+        swapped.annotate(server_pid=1)
+    assert "server_pid" not in json.loads(swapped.path.read_text(encoding="utf-8"))
+    # A reused inode: the device and inode this lease created, holding another run's record (and a longer copy of
+    # this lease's own bytes is not what it wrote either).
+    reused = GpuLease(tmp_path / "reused.lock", owner="native-run:jkl").acquire()
+    own = reused.path.read_bytes()
+    for foreign in (other, own + b" "):
+        with open(reused.path, "r+b") as handle:  # rewritten in place: the inode stays the one the lease created
+            handle.truncate(0)
+            handle.write(foreign)
+        with pytest.raises(LeaseHeld, match="no longer the lease this run created"):
+            reused.annotate(server_pid=1)
+        assert reused.path.read_bytes() == foreign
+    unheld = GpuLease(tmp_path / "never.lock")
+    with pytest.raises(LeaseHeld):
+        unheld.annotate(server_pid=1)
+    assert not (tmp_path / "never.lock").exists()  # annotating never creates a lock
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")

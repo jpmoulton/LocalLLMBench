@@ -249,9 +249,21 @@ def test_a_version_line_behind_a_log_prefix_is_recorded_not_a_crash(tmp_path, po
     assert manifest["build_info"] == "b11011-aa39d7a3e"
 
 
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
 class FakeResponse:
-    def __init__(self, blocks, url="https://objects.example.invalid/asset"):
-        self.blocks, self.url = list(blocks), url
+    """An HTTP response as the stdlib really behaves: each `recv` delivers what the server sent, `recv_seconds`
+    after the last one; `read(n)` (a BufferedReader) keeps receiving until it has n bytes or EOF, while `read1(n)`
+    returns after a single receive."""
+
+    def __init__(self, sends, url="https://objects.example.invalid/asset", *, clock=None, recv_seconds=0.0):
+        self.sends, self.url, self.clock, self.recv_seconds, self.recvs = list(sends), url, clock, recv_seconds, 0
 
     def __enter__(self):
         return self
@@ -262,31 +274,92 @@ class FakeResponse:
     def geturl(self):
         return self.url
 
+    def _recv(self, size):
+        self.recvs += 1
+        if self.clock is not None:
+            self.clock.now += self.recv_seconds
+        if not self.sends:
+            return b""
+        block = self.sends.pop(0)
+        if len(block) > size:
+            self.sends.insert(0, block[size:])
+        return block[:size]
+
+    def read1(self, size):
+        assert size >= 1
+        return self._recv(size)
+
     def read(self, size):
         assert size >= 1
-        return self.blocks.pop(0) if self.blocks else b""
+        data = b""
+        while len(data) < size and (block := self._recv(size - len(data))):
+            data += block
+        return data
+
+
+def opener_for(response, opened=None):
+    def urlopen(request, *, timeout, context=None):
+        if opened is not None:
+            opened.append((request.full_url, timeout, context))
+        return response
+    return urlopen
 
 
 def test_the_download_itself_is_bounded_in_bytes_time_and_scheme():
     url = "https://example.invalid/llama.tar.gz"
     opened = []
-
-    def opener(response):
-        def urlopen(request, *, timeout):
-            opened.append((request.full_url, timeout))
-            return response
-        return urlopen
-
-    assert installer.fetch_url(url, 6, opener=opener(FakeResponse([b"abc", b"def"]))) == b"abcdef"
-    assert opened == [(url, installer.DOWNLOAD_TIMEOUT_SECONDS)]
+    assert installer.fetch_url(url, 6, opener=opener_for(FakeResponse([b"abc", b"def"]), opened)) == b"abcdef"
+    assert [(item[0], item[1]) for item in opened] == [(url, installer.DOWNLOAD_TIMEOUT_SECONDS)]
     with pytest.raises(ValueError, match="exceeds the pinned 5 bytes"):
-        installer.fetch_url(url, 5, opener=opener(FakeResponse([b"abc", b"def"])))
+        installer.fetch_url(url, 5, opener=opener_for(FakeResponse([b"abc", b"def"])))
     with pytest.raises(ValueError, match="redirected off HTTPS"):
-        installer.fetch_url(url, 6, opener=opener(FakeResponse([b"abc"], url="http://mirror.example.invalid/x")))
-    # every read returns within its socket timeout, but the transfer as a whole overruns the deadline
-    ticks = iter([0.0, 10.0, 2000.0])
-    with pytest.raises(ValueError, match="did not finish within 1800 s"):
-        installer.fetch_url(url, 6, opener=opener(FakeResponse([b"abc", b"def"])), clock=lambda: next(ticks))
+        installer.fetch_url(url, 6, opener=opener_for(FakeResponse([b"abc"], url="http://mirror.example.invalid/x")))
+
+
+def test_a_trickling_server_cannot_hold_the_download_past_its_deadline():
+    # one byte every 100 s: every receive is well inside the 120 s socket timeout, so only the overall deadline can
+    # end it, and it must end it on time, not after a whole 1 MiB block has trickled in
+    clock = Clock()
+    response = FakeResponse([b"x"] * 100_000, clock=clock, recv_seconds=100.0)
+    with pytest.raises(ValueError, match=r"did not finish within 1800 s \(18 bytes read\)"):
+        installer.fetch_url("https://example.invalid/llama.tar.gz", 1_000_000, opener=opener_for(response),
+                            clock=clock)
+    assert clock.now <= installer.DOWNLOAD_DEADLINE_SECONDS + 100.0 and response.recvs == 18
+
+
+def test_every_socket_read_takes_its_timeout_from_the_whole_download_deadline():
+    import socket
+    import ssl
+    clock = Clock()
+    deadline = installer.DownloadDeadline(1800, 120, clock)
+    assert deadline.remaining() == 120  # the per-operation cap while plenty is left
+    clock.now = 1750.0
+    assert deadline.remaining() == 50.0  # then only what is left of the deadline
+    # the TLS sockets the download opens arm themselves before every read and handshake (urllib reads the status
+    # line and headers of every response, redirects included, through them)
+    opened = []
+    installer.fetch_url("https://example.invalid/a", 1, opener=opener_for(FakeResponse([]), opened), clock=clock,
+                        deadline_seconds=50)
+    context = opened[0][2]
+    assert opened[0][1] == 50.0 and isinstance(context, ssl.SSLContext)  # the connect gets at most what is left
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname  # still the verifying default
+    assert issubclass(context.sslsocket_class, ssl.SSLSocket) and ssl.SSLContext.sslsocket_class is ssl.SSLSocket
+    clock.now = 0.0
+    context = installer.DownloadDeadline(1800, 120, clock).context()
+    with socket.socket() as raw, context.wrap_socket(raw, server_hostname="example.invalid",
+                                                     do_handshake_on_connect=False) as tls:
+        with pytest.raises(ValueError, match="closed or unwrapped"):  # armed first, then the (unconnected) read
+            tls.read(1)
+        assert tls.gettimeout() == 120
+        clock.now = 1790.0
+        with pytest.raises(OSError):
+            tls.do_handshake()
+        assert tls.gettimeout() == 10.0
+        clock.now = 1800.0
+        with pytest.raises(TimeoutError, match="did not finish within 1800 s"):
+            tls.read(1)
+        with pytest.raises(TimeoutError):
+            tls.do_handshake()
 
 
 @POSIX
@@ -328,6 +401,84 @@ def test_a_different_existing_install_is_refused_and_left_untouched(tmp_path, po
     after = {path.name: (path.read_bytes() if path.is_file() and not path.is_symlink() else os.readlink(path)
                          if path.is_symlink() else None) for path in target.iterdir()}
     assert after == before
+
+
+UNREADABLE = pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                                reason="needs a file its owner cannot read")
+
+
+@POSIX
+@UNREADABLE
+def test_a_stray_file_in_an_existing_install_is_refused_without_being_read(tmp_path, policy, capsys):
+    # a model kept beside llama-server: the names already differ, so none of its bytes may be read (the file is
+    # unreadable here, so a read would surface as "Permission denied" instead of the refusal)
+    data = tarball(RELEASE)
+    assert run(tmp_path, policy, data) == 0
+    stray = tmp_path / "out" / "llama-test" / "model.gguf"
+    stray.write_bytes(b"GGUF" + b"\x00" * 4096)
+    stray.chmod(0)
+    capsys.readouterr()
+    version = FakeVersion()
+    assert run(tmp_path, policy, data, version=version) == 2
+    assert "exists and differs from the pinned llama-test.tar.gz" in capsys.readouterr().err
+    assert version.calls == [] and stray.stat().st_mode & 0o777 == 0
+
+
+@POSIX
+@UNREADABLE
+def test_an_existing_install_too_large_to_be_the_release_is_refused_before_anything_is_hashed(
+        tmp_path, policy, capsys, monkeypatch):
+    data = tarball(RELEASE)
+    assert run(tmp_path, policy, data) == 0
+    target = tmp_path / "out" / "llama-test"
+    # the same names, but one file has grown past what any accepted archive unpacks to
+    monkeypatch.setattr(installer, "MAX_UNPACKED_BYTES", 4096)
+    grown = target / "libllama.0.1.dylib"
+    grown.write_bytes(b"\x00" * 8192)
+    grown.chmod(0)
+    capsys.readouterr()
+    assert run(tmp_path, policy, data) == 2
+    assert "exists and differs from the pinned" in capsys.readouterr().err
+    with pytest.raises(installer.TreeTooLarge, match="more than 4096 bytes of files"):
+        installer.tree_contents(target)
+    monkeypatch.setattr(installer, "MAX_UNPACKED_BYTES", 512 * 1024 * 1024)
+    monkeypatch.setattr(installer, "MAX_MEMBERS", 3)  # the tree holds 5 entries besides its manifest
+    with pytest.raises(installer.TreeTooLarge, match="more than 3 entries"):
+        installer.tree_contents(target)
+
+
+@POSIX
+def test_tree_hashes_stream_through_the_no_follow_reader_never_a_whole_file_read(tmp_path, monkeypatch):
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "big.bin").write_bytes(b"\x01" * (3 * 1024 * 1024 + 7))
+    (root / "link").symlink_to("sub/big.bin")
+    expected = hashlib.sha256((root / "sub" / "big.bin").read_bytes()).hexdigest()
+
+    def whole_file_read(self):
+        raise AssertionError(f"{self} was read whole into memory")
+    monkeypatch.setattr(Path, "read_bytes", whole_file_read)
+    assert installer.tree_contents(root) == {"files": {"sub/big.bin": expected}, "links": {"link": "sub/big.bin"},
+                                             "directories": ["sub"]}
+
+
+@POSIX
+@UNREADABLE
+def test_an_unlistable_directory_in_an_existing_install_is_an_error_not_skipped(tmp_path):
+    # os.walk skips a directory it cannot list unless told otherwise: an unlistable `sub/` holding a stray model
+    # would then read as the release's empty `sub/`, and a tree that is not the release would compare equal
+    root = tmp_path / "tree"
+    hidden = root / "sub"
+    hidden.mkdir(parents=True)
+    (hidden / "model.gguf").write_bytes(b"GGUF")
+    hidden.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            installer.tree_contents(root)
+        with pytest.raises(PermissionError):
+            installer.same_tree(root, {"files": {}, "links": {}, "directories": ["sub"]})
+    finally:
+        hidden.chmod(0o755)
 
 
 def test_there_is_no_network_without_download(tmp_path, policy):

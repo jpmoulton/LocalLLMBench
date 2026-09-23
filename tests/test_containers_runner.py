@@ -1279,6 +1279,26 @@ def test_evaluator_image_identity_and_entrypoint_are_verified_at_admit(tmp_path)
     assert missing.docker.keys() == ["image-inspect", "image-inspect"]
 
 
+def test_policy_copy_never_carries_the_native_grant_even_when_the_host_policy_grants_it(tmp_path):
+    # One runtime-policy.json authorizing both runtimes on a host: the evaluator container needs only `inference`,
+    # and an evaluator image built from an older wheel refuses any key it does not know (exit 2 before a request).
+    lock = SessionLock(True, True, True, allow_native_execution=True, reason="both runtimes on this host")
+    seen = {}
+
+    def up(argv):
+        if argv[-1] == "inference":
+            seen["policy"] = (Path(argv[9]).parent / "plan" / "runtime-policy.json").read_bytes()
+        return harness.up(argv)
+    harness = ContainerHarness(tmp_path, lock=lock, up=up)
+    result = harness.run()
+    assert result.state == "completed", result.failure_reasons
+    assert b"allow_native_execution" not in seen["policy"]
+    without_native = dataclasses.replace(lock, allow_native_execution=False)
+    assert seen["policy"] == (canonical_json(without_native.to_json()) + "\n").encode("utf-8")
+    assert set(json.loads(seen["policy"])) == {"allow_model_operations", "allow_inference",
+                                               "allow_container_execution", "reason"}
+
+
 def test_policy_copy_is_written_before_up_and_mounted_read_only(tmp_path):
     lock = SessionLock(True, True, True, reason="stage-2 container test")
     seen = {}

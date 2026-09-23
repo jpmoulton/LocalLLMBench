@@ -43,7 +43,7 @@ serialises, fingerprints and runs byte-for-byte as before runtimes existed.
 | | `nvidia-container` | `metal-native` |
 |---|---|---|
 | Inference server | pinned CUDA `llama-server` image under Docker Compose | pinned `llama-server` executable run directly on the Mac, Metal offload |
-| Pinned by | image digest, `help_sha256`, `build_info` (`image-bundle.json`) | executable SHA-256, a digest over every `lib*.dylib` beside it, `help_sha256`, `build_info` (`native-bundle.json`) |
+| Pinned by | image digest, `help_sha256`, `build_info` (`image-bundle.json`) | executable SHA-256, a digest over every `lib*.dylib`/`lib*.so` and Metal shader file (`*.metallib`, `*.metal` and its headers) beside it, `help_sha256`, `build_info` (`native-bundle.json`) |
 | Evaluator | host process or its own container | host process only |
 | Coding sandbox | Docker worker containers via the host broker | the same, Docker in a Linux VM (e.g. Colima); blocked without it |
 | Memory evidence | VRAM in use after load (`nvidia-smi`) | unified memory: server `phys_footprint`, Metal buffers, host available memory, swap, pressure, power |
@@ -81,10 +81,12 @@ so a recycled pid can never be hit.
 ### Trust boundaries
 
 * **The executable is identity, not a path.** `prepare --runtime metal-native` hashes the executable and every
-  library beside it, proves from the Mach-O load commands that those hashed files are the only non-system code
-  dyld will load for it, checks them against the installer's `install-manifest.json` when there is one, and runs
-  it only as `--version`, `--help` and `--list-devices`. Admission re-hashes all of it and re-reads `--version`
-  and `--help` before a single flag is trusted; a changed file is a refusal, not a new baseline.
+  library beside it, and any Metal shader library a build without an embedded one loads from there, proves from
+  the Mach-O load commands that those hashed files are the only non-system code dyld will load for it (each image
+  read at the slice an arm64 process loads, never an arm64e slice listed first), checks them against the
+  installer's `install-manifest.json` when there is one, and runs it only as `--version`, `--help` and
+  `--list-devices`. Admission re-hashes all of it, proves the linkage again and re-reads `--version` and `--help`
+  before a single flag is trusted; a changed file is a refusal, not a new baseline.
 * **A separate permission.** `allow_native_execution` is its own key in `runtime-policy.json`: a policy written for
   the NVIDIA containers never authorises starting a host binary.
 * **Generated code never runs on the host.** The evaluator is a host process on a Mac, but code a model writes is
@@ -106,10 +108,17 @@ as such.
 ### One lease for both
 
 Both runtimes take the same GPU lease file before admission, so an NVIDIA and a native run, or two native runs,
-can never overlap on one machine. The lease names its owner (`native-run:<attempt>` for a native run). A stale
-lease left by a killed run is described by `llmbench doctor` with the check that fits its owner: for a native run,
-that no `llama-server` it started is still running (`ps -p <pid>` when the lease records the server's pid, else
-`pgrep -fl llama-server`); for containers, `docker ps`.
+can never overlap on one machine. What the file records depends on who takes it. A session (`tune`, `resume`,
+each `optimize` stage, and `scripts/sweep_models.py`, which runs `tune`) takes it once as its campaign lock and
+records only its pid and start time; its candidates run under that lock and never rewrite it. `llmbench
+candidate` (also each entry `scripts/run_prepared_sweep.py` runs), and each `sample` attempt, takes it per
+candidate, as `container-run:<attempt>` or `native-run:<attempt>`, and a native one adds `runtime` and the
+llama-server's `server_pid` once the server has started. A stale lease left by a killed
+run is described by `llmbench doctor`, and by the refusal of the next run, with the check that fits what it
+records: `ps -p <server_pid>` when the server's pid is there, `pgrep -fl llama-server` for a native run without
+one, `docker ps -a --filter name=llmbench-` for a container run, and both of the last two for a session's lock,
+which names no runtime ([A run that was killed](usage.md#a-run-that-was-killed)). Nothing ever deletes a lease
+for you.
 
 ## Evidence, not intent
 

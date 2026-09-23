@@ -17,6 +17,8 @@ from llmbench.containers.session_report import (COLUMNS, HEADERS, UNIFIED_COLUMN
                                                 attempt_runtime, has_native_rows, power_text, pressure_text,
                                                 session_html, session_markdown, unified_memory_evidence)
 from llmbench.containers.session_report import SANDBOX_BLOCKED as SESSION_SANDBOX_BLOCKED
+from llmbench.containers.session_report import power_cell
+from llmbench.reports import markdown_report
 from llmbench.store import Store
 from test_containers_campaign import run_tune, small_session
 from test_containers_session import isolated_gpu_lock
@@ -38,22 +40,34 @@ def _script(name: str):
 cross_model_report = _script("cross_model_report")
 coding_report = _script("coding_report")
 
+
+def _power(source, percent=None):
+    """A `parse_pmset_batt` reading."""
+    label = {"ac": "AC Power", "battery": "Battery Power"}[source]
+    return {"power_source": source, "power_source_label": label, "battery_percent": percent,
+            "battery_state": "discharging" if source == "battery" else "charged", "charging": False}
+
+
 # The shape `native.NativeRunner` seals into `result.memory`, with the figures captured on the M1 this runtime was
 # built on (Qwen3-1.7B-Q4_K_M, b11011, full offload): 1905 MiB phys_footprint, 1631.19 MiB of Metal buffers in a
-# 5461 MiB working set.
+# 5461 MiB working set. On battery throughout: admission, load and every watchdog sample read the same source.
 MEMORY = {
     "kind": "apple-unified", "note": "Apple Silicon unified memory ... None of these is VRAM.",
-    "admission": {"kind": "apple-unified", "available_bytes": 6144 * MIB, "verdict": "admitted"},
+    "admission": {"kind": "apple-unified", "available_bytes": 6144 * MIB, "verdict": "admitted",
+                  "power": _power("battery", 74)},
     "after_load": {"server_phys_footprint_mib": 1905.0, "server_rss_mib": 952.5, "host_memory_total_mib": 8192.0,
                    "host_memory_available_mib": 6144.0, "swap_used_mib": 6800.0, "memory_pressure_level": 2,
                    "gpu_device_utilization_percent": 3, "gpu_in_use_system_memory_mib": 1700.0,
-                   "power": {"power_source": "battery", "power_source_label": "Battery Power", "battery_percent": 73,
-                             "battery_state": "discharging", "charging": False}, "errors": []},
+                   "power": _power("battery", 73), "errors": []},
     "server_log": {"metal_device": "Apple M1", "metal_budget_mib": 5461, "metal_resident_mib": 1631.19,
                    "host_resident_mib": 256.19, "offloaded_layers": 29, "total_layers": 29},
     "during_evaluation": {"kind": "apple-unified-watchdog", "peak_phys_footprint_bytes": 1997537280,
                           "min_available_bytes": 6000 * MIB, "max_pressure_level": 2,
-                          "swap_growth_bytes": 128 * MIB, "violations": []},
+                          "swap_baseline": "baseline", "swap_growth_bytes": 128 * MIB, "violations": [],
+                          "power_readings": 120,
+                          "power_first": _power("battery", 73), "power_last": _power("battery", 71),
+                          "power_sources_seen": ["battery"], "power_changes": [], "power_changes_dropped": 0,
+                          "min_battery_percent_on_battery": 71},
 }
 
 
@@ -124,12 +138,26 @@ def test_a_metal_candidate_report_names_the_pinned_executable_and_its_unified_me
     # No VRAM claim of any kind: there is no dedicated VRAM, so "unmeasured" would claim a missed measurement.
     assert "VRAM after load unmeasured" not in text
     assert "- Elapsed 60.0s; model load 2.6s; VRAM after load not applicable: unified memory\n" in text
+    # Each figure on the line of the moment it measures: swap growth runs from admission to the evaluation's
+    # highest sample, so it is an evaluation figure, never an after-load one.
     assert ("- Unified memory after load: server footprint 1905 MiB (RSS 952 MiB); Metal buffers 1631 MiB of 5461 "
-            "MiB budget; host available 6144 MiB; swap used 6800 MiB (growth 128 MiB); pressure level 2 (warn); "
+            "MiB budget; host available 6144 MiB; swap used 6800 MiB; pressure level 2 (warn); "
             "power: battery 73%\n") in text
-    assert ("- During evaluation: peak server footprint 1905 MiB; lowest host available 6000 MiB; highest pressure "
-            "level 2 (warn); watchdog violations: none\n") in text
-    assert "- Measured on battery power:" in text
+    assert ("- During evaluation: peak server footprint 1905 MiB; lowest host available 6000 MiB; swap growth from "
+            "admission to the evaluation peak 128 MiB; highest pressure level 2 (warn); power battery 73% to battery "
+            "71%; watchdog violations: none\n") in text
+    assert "growth 128 MiB)" not in text and "- Measured on battery power:" in text
+    assert "Power source changed" not in text  # one source throughout is no change
+    # Admission had no swap reading, so the watchdog measured growth from its own first sample: the line says that
+    # start, never "admission", which would claim the load's own swap was counted.
+    late = copy.deepcopy(MEMORY)
+    late["during_evaluation"]["swap_baseline"] = "first-sample"
+    later = render(config, result_for(config, samples=[TOOLS], memory=late))
+    assert "; swap growth from the first evaluation sample to the evaluation peak 128 MiB; " in later
+    unrecorded = copy.deepcopy(MEMORY)
+    del unrecorded["during_evaluation"]["swap_baseline"]
+    assert "; swap growth to the evaluation peak 128 MiB; " in render(config, result_for(config, samples=[TOOLS],
+                                                                                         memory=unrecorded))
     # The Docker cgroup limits bound nothing for a host process, and the report says so rather than implying they did.
     section = text.split("## Settings this runtime does not enforce\n\n", 1)[1].split("\n\n", 1)[0]
     assert [line.split(" (", 1)[0] for line in section.splitlines()] == [
@@ -143,27 +171,96 @@ def test_a_metal_candidate_that_never_loaded_reports_every_figure_unmeasured_and
     text = render(config, result_for(config, memory=early, state="rejected", failure_stage="admit",
                                      failure_reasons=("the GPU is already 97% busy",), load_seconds=None))
     assert ("- Unified memory after load: server footprint unmeasured (RSS unmeasured); Metal buffers unmeasured of "
-            "unmeasured budget; host available unmeasured; swap used unmeasured (growth unmeasured); pressure level "
+            "unmeasured budget; host available unmeasured; swap used unmeasured; pressure level "
             "unmeasured; power: unmeasured\n") in text
     assert "During evaluation" not in text and "battery" not in text  # the watchdog never ran; no summary is made up
     assert "model load unmeasured; VRAM after load not applicable: unified memory" in text
 
 
+WHY = "sandbox_unavailable: docker CLI not found"
+# Exactly what container_eval._execution_block backfills for a code-executing suite when the sandbox is unavailable.
+BACKFILLED = [{"suite": "evalplus", "task_id": f"Mbpp/{i}", "split": "development", "category": "coding",
+               "score": 0.0, "passed": False, "status": "environment_error", "outcome_status": "environment_error",
+               "reason": WHY, "synthetic": False, "model_evaluated": False} for i in range(3)]
+
+
 def test_a_blocked_coding_sandbox_is_never_reported_as_a_coding_score():
     config = metal_config()
-    backfilled = [{"task_id": f"evalplus/{i}", "category": "coding", "score": 0.0, "status": "environment_error",
-                   "reason": "sandbox_unavailable: docker CLI not found"} for i in range(3)]
     memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "docker CLI not found"}}
-    result = result_for(config, samples=[TOOLS, *backfilled], memory=memory)
-    assert result.quality["coding"]["score"] == 0.0  # the denominator rule turned three environment errors into 0.0
+    result = result_for(config, samples=[TOOLS, *BACKFILLED], memory=memory)
+    # Nothing was asked of the model: the rows are counted as blocked, never attempted and never scored 0.0.
+    assert result.quality["coding"] == {"attempted": 0, "score": None, "comparison": {"status": "unmeasured"},
+                                        "blocked": 3, "blocked_reason": WHY}
     text = render(config, result)
-    assert f"| coding | 3 | {SANDBOX_BLOCKED} |" in text and "| coding | 3 | 0.00 |" not in text
+    assert f"| coding | 0 | {SANDBOX_BLOCKED}, 3 declared |" in text and "| 0.00 |" not in text
     assert ("- Coding sandbox: blocked (docker CLI not found); the suites that execute generated code were not run, "
             "and generated code is never executed on the host") in text
+    # ...so eligibility reads coding as unmeasured (not judged), never as the model failing coding quality.
+    eligibility = evidence_row(config, result, default_policy(config))["eligibility"]
+    assert "coding" in eligibility["unmeasured_categories"]
+    assert not any(reason.startswith("coding_") for reason in eligibility["reasons"])
+    assert "coding_absolute_quality_failed" not in text
+
+
+def test_only_sandbox_backfills_leave_the_denominator_and_every_other_failure_still_scores_zero():
+    config = metal_config()
+    others = [  # a model-side miss, a timeout, a harness error with another reason, and look-alikes not backfilled
+        {"task_id": "c/1", "category": "coding", "score": 0.0, "status": "completed"},
+        {"task_id": "c/2", "category": "coding", "score": 1.0, "status": "timeout", "model_evaluated": False},
+        {"task_id": "c/3", "category": "coding", "score": 0.0, "status": "environment_error",
+         "model_evaluated": False, "reason": "quality stage did not run"},
+        {"task_id": "c/4", "category": "coding", "score": 0.0, "status": "environment_error", "reason": WHY},
+        {"task_id": "c/5", "category": "coding", "score": 0.0, "status": "environment_error",
+         "model_evaluated": True, "reason": WHY},
+        {"task_id": "c/6", "category": "coding", "score": 1.0, "status": "completed"},
+        # The backfill's reason and origin on a row that timed out: only an environment_error is a backfill.
+        {"task_id": "c/7", "category": "coding", "score": 0.0, "status": "timeout", "model_evaluated": False,
+         "reason": WHY}]
+    quality = summarize_evaluation(config, {"samples": [*others, *BACKFILLED]}, None)["quality"]["coding"]
+    assert quality["attempted"] == 7 and quality["score"] == pytest.approx(1 / 7)  # six zeros stay in
+    assert quality["blocked"] == 3
+    result = result_for(config, samples=[*others, *BACKFILLED],
+                        memory={**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "docker CLI not found"}})
+    assert "| coding | 7 | 0.14 (3 blocked) |" in render(config, result)
+    # Without a backfill no quality block gains a key: an NVIDIA result serialises exactly as before.
+    nvidia = nvidia_config()
+    plain = summarize_evaluation(nvidia, {"samples": [TOOLS, *others]}, None)["quality"]
+    assert all(set(block) == {"attempted", "score", "comparison"} for block in plain.values())
+    assert plain["coding"]["attempted"] == 7
     # An available sandbox changes nothing about the score cell.
     fine = {**MEMORY, "coding_sandbox": {"status": "available", "reason": None}}
-    ran = render(config, result_for(config, samples=[TOOLS, *backfilled], memory=fine))
-    assert "| coding | 3 | 0.00 |" in ran and "- Coding sandbox: available\n" in ran
+    ran = render(config, result_for(config, samples=[TOOLS, *others], memory=fine))
+    assert "| coding | 7 | 0.14 |" in ran and "- Coding sandbox: available\n" in ran
+
+
+def test_the_campaign_report_prints_blocked_for_a_sandbox_blocked_category_never_a_zero(tmp_path):
+    config = metal_config()
+    memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "docker CLI not found"}}
+    result = result_for(config, samples=[TOOLS, *BACKFILLED], memory=memory)
+    files = write_candidate_reports(config, result, {"samples": [TOOLS, *BACKFILLED]}, None, tmp_path / "run")
+    text = (tmp_path / "run" / files["markdown"]).read_text(encoding="utf-8")
+    row = next(line for line in text.splitlines() if line.startswith(f"| {result.attempt_id} "))
+    assert row.split(" | ")[3:6] == ["blocked", "1.000", "unmeasured"]  # coding, tools, retrieval
+    assert "`blocked` means the Docker sandbox that runs generated code was unavailable" in text
+    assert "coding_absolute_quality_failed" not in text
+    mixed = markdown_report({"campaign_id": "c", "results": [{"attempt_id": "a", "synthetic": False, "quality": {
+        "coding": {"attempted": 2, "score": 0.5, "blocked": 3}}}]})
+    assert "| a | planned | unmeasured | 0.500 (3 blocked) | unmeasured | unmeasured | False |" in mixed
+    # A campaign row without the count (every NVIDIA row, every analysed row) reads exactly as before.
+    nvidia = nvidia_config()
+    plain = write_candidate_reports(nvidia, result_for(nvidia, samples=[TOOLS]), {"samples": [TOOLS]}, None,
+                                    tmp_path / "gpu")
+    assert "blocked" not in (tmp_path / "gpu" / plain["markdown"]).read_text(encoding="utf-8")
+
+
+def test_a_blocked_sandbox_probe_says_nothing_about_coding_the_attempt_never_declared():
+    """The broker stage probes the sandbox for every attempt with a broker, a NIAH-only holdout included. With no
+    coding task declared there was nothing to backfill, so the coding cell is the ordinary one."""
+    config = metal_config()
+    memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "the Docker daemon is not reachable"}}
+    text = render(config, result_for(config, samples=[TOOLS], memory=memory))
+    assert "| coding | 0 | unmeasured |" in text and SANDBOX_BLOCKED not in text.split("## Quality")[1]
+    assert "- Coding sandbox: blocked (the Docker daemon is not reachable)" in text  # the probe is still reported
 
 
 def test_watchdog_violations_and_leftover_processes_are_printed_verbatim():
@@ -181,6 +278,72 @@ def test_watchdog_violations_and_leftover_processes_are_printed_verbatim():
             "pid:4242\n") in text
 
 
+def _unplugged():
+    """Admitted and loaded on AC, unplugged a minute into the evaluation: the after-load sample still reads AC."""
+    memory = copy.deepcopy(MEMORY)
+    memory["admission"]["power"] = memory["after_load"]["power"] = _power("ac")
+    memory["during_evaluation"].update(
+        power_first=_power("ac"), power_last=_power("battery", 60), power_sources_seen=["ac", "battery"],
+        power_changes=[{"from": "ac", "to": "battery", "reading": _power("battery", 64), "monotonic_seconds": 61.0}],
+        min_battery_percent_on_battery=60)
+    return memory
+
+
+def _on_ac():
+    memory = copy.deepcopy(MEMORY)
+    memory["admission"]["power"] = memory["after_load"]["power"] = _power("ac")
+    memory["during_evaluation"].update(power_first=_power("ac"), power_last=_power("ac"), power_sources_seen=["ac"],
+                                       min_battery_percent_on_battery=None)
+    return memory
+
+
+def test_a_run_unplugged_after_the_load_says_it_was_measured_on_battery():
+    config = metal_config()
+    text = render(config, result_for(config, samples=[TOOLS], memory=_unplugged()))
+    assert "; pressure level 2 (warn); power: AC\n" in text  # the after-load reading, and only that, is labelled so
+    assert "; power AC → battery 64%; watchdog violations: none\n" in text
+    assert ("- Power source changed during the run: AC (admission) → battery 64% (evaluation); the figures measured "
+            "across the change do not come from one power condition.\n") in text
+    assert "- Measured on battery power:" in text
+    steady = render(config, result_for(config, samples=[TOOLS], memory=_on_ac()))
+    assert "; power AC; watchdog violations: none\n" in steady
+    assert "Power source changed" not in steady and "Measured on battery" not in steady
+
+
+def test_power_evidence_follows_every_reading_and_a_failed_probe_is_no_change():
+    evidence = unified_memory_evidence(_unplugged())
+    assert (evidence["power"], evidence["power_admission"], evidence["power_during_evaluation"]) == (
+        "AC", "AC", "AC → battery 64%")
+    assert (evidence["power_changed"], evidence["on_battery"], evidence["min_battery_percent"]) == (True, True, 60)
+    assert evidence["power_timeline"] == "AC (admission) → battery 64% (evaluation)"
+    assert power_cell(evidence) == "changed: AC (admission) → battery 64% (evaluation)"
+    # Unplugged between admission and the load: the load itself already ran on battery, and the step is named.
+    early = copy.deepcopy(MEMORY)
+    early["admission"]["power"] = _power("ac")
+    assert unified_memory_evidence(early)["power_timeline"] == "AC (admission) → battery 73% (after load)"
+    # A power probe that failed is no reading: nothing changed, and the run is still known to be on battery.
+    blind = copy.deepcopy(MEMORY)
+    blind["admission"]["power"] = None
+    blind["during_evaluation"]["power_first"] = {"power_source": None, "power_source_label": ""}
+    blind_evidence = unified_memory_evidence(blind)
+    assert (blind_evidence["power_changed"], blind_evidence["on_battery"]) == (False, True)
+    assert power_cell(blind_evidence) == "battery 73%" and blind_evidence["power_admission"] is None
+    # Changes past the watchdog's bound are still changes, and the timeline says some were not recorded.
+    flapping = _unplugged()
+    flapping["during_evaluation"]["power_changes_dropped"] = 2
+    assert unified_memory_evidence(flapping)["power_timeline"].endswith(" → ... (2 later change(s) not recorded)")
+    # No reading anywhere: unknown, never "AC" and never "no change".
+    none = copy.deepcopy(MEMORY)
+    none["admission"].pop("power")
+    none["after_load"]["power"] = None
+    for key in ("power_first", "power_last", "power_sources_seen", "power_changes"):
+        none["during_evaluation"].pop(key)
+    none_evidence = unified_memory_evidence(none)
+    assert (none_evidence["power_changed"], none_evidence["on_battery"], none_evidence["power_timeline"]) == (
+        None, None, None)
+    assert unified_memory_evidence(_on_ac())["on_battery"] is False
+
+
 def test_the_report_reads_the_memory_block_the_native_runner_actually_seals(tmp_path):
     """Contract check against `NativeRunner` itself (its test harness: fake process, telemetry and evaluator), not a
     hand-built block: a key renamed on either side would otherwise turn every figure into `unmeasured` silently."""
@@ -191,13 +354,17 @@ def test_the_report_reads_the_memory_block_the_native_runner_actually_seals(tmp_
     evidence = unified_memory_evidence(result.memory)
     measured = ("server_footprint_mib", "server_rss_mib", "server_footprint_peak_mib", "metal_mib", "metal_budget_mib",
                 "host_available_mib", "min_host_available_mib", "swap_used_mib", "swap_growth_mib", "pressure_level",
-                "max_pressure_level", "power", "watchdog_violations")
+                "max_pressure_level", "power", "watchdog_violations", "power_admission", "power_during_evaluation",
+                "power_changed", "on_battery", "min_battery_percent", "swap_growth_from")
     assert [name for name in measured if evidence[name] is None] == []
     assert evidence["coding_sandbox_status"] is None  # no broker configured: the sandbox was never probed
+    assert (evidence["power_changed"], evidence["on_battery"]) == (False, True)
+    assert evidence["swap_growth_from"] == "admission"  # the runner hands the watchdog its admission sample
     text = (harness.output / result.reports["candidate"]).read_text(encoding="utf-8")
     assert ("- Unified memory after load: server footprint 1905 MiB (RSS 952 MiB); Metal buffers 1631 MiB of 5461 "
-            "MiB budget; host available 6144 MiB; swap used 6800 MiB (growth 0 MiB); pressure level 1 (normal); "
+            "MiB budget; host available 6144 MiB; swap used 6800 MiB; pressure level 1 (normal); "
             "power: battery 70%\n") in text
+    assert "; swap growth from admission to the evaluation peak 0 MiB; " in text and "; power battery 70%; " in text
     assert "report_failed" not in " ".join(result.warnings) and "VRAM after load unmeasured" not in text
 
 
@@ -269,15 +436,24 @@ def test_nvidia_session_rows_carry_the_runtime_and_dashes_and_no_unified_note(tm
         assert "Apple Silicon" not in text and "native (Metal)" not in text
 
 
-def _metal_row(tmp_path, memory, *, vram=None) -> dict:
-    """The first attempt of a finished fake tune, re-read with its sealed result turned into a Metal one."""
+def _metal_row(tmp_path, memory, *, vram=None, samples=(), result=None, evidence=True) -> dict:
+    """The first attempt of a finished fake tune, re-read with its sealed result turned into a Metal one. The fake
+    tune declares no coding task; ``samples`` adds stored rows (the backfills a blocked sandbox leaves), ``result``
+    overrides fields of the sealed result, and ``evidence=False`` drops the controller's evidence event, which a
+    candidate that failed never gets."""
     run_tune(tmp_path, small_session(tmp_path))
     with Store(tmp_path / "out") as store:
         attempt = store.attempts_in_insertion_order()[0]
         path = store.root / "raw" / attempt["id"] / "raw.json"
         raw = json.loads(path.read_text(encoding="utf-8"))
-        raw["result"].update(runtime="metal-native", memory=memory, vram_used_mib_after_load=vram)
+        raw["result"].update(runtime="metal-native", memory=memory, vram_used_mib_after_load=vram, **(result or {}))
         path.write_text(json.dumps(raw), encoding="utf-8")
+        with store.db:  # the attempt is sealed; add_sample only appends to running ones
+            for sample in samples:
+                store.db.execute("INSERT INTO samples VALUES (?,?,?)",
+                                 (attempt["id"], sample["task_id"], canonical_json(sample)))
+            if not evidence:
+                store.db.execute("DELETE FROM events WHERE attempt_id = ? AND kind = 'evidence'", (attempt["id"],))
         return attempt_row(store, attempt, None)
 
 
@@ -309,9 +485,50 @@ def test_a_metal_attempt_row_reads_its_result_memory_and_leaves_vram_empty(tmp_p
 
 def test_a_metal_row_whose_sandbox_was_blocked_prints_blocked_not_a_coding_score(tmp_path, isolated_gpu_lock):
     memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "the Docker daemon is not reachable"}}
-    row = _metal_row(tmp_path, memory)
+    row = _metal_row(tmp_path, memory, samples=BACKFILLED)
     assert row["coding"] == SESSION_SANDBOX_BLOCKED and row["first_attempt_vs_repaired"] == SESSION_SANDBOX_BLOCKED
     assert "0.000" not in row["coding"]
+
+
+def test_a_blocked_probe_on_an_attempt_without_coding_tasks_is_not_a_blocked_coding_cell(tmp_path,
+                                                                                         isolated_gpu_lock):
+    """A NIAH-only holdout keeps the base config's broker, so its probe runs and can find the daemon gone; with no
+    coding task declared nothing was backfilled, and "blocked" would claim rows that never existed."""
+    memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "the Docker daemon is not reachable"}}
+    row = _metal_row(tmp_path, memory)
+    assert row["coding"] == "n/a (0 attempted)" and row["first_attempt_vs_repaired"] == "n/a"
+    assert row["unified_memory"]["coding_sandbox_status"] == "blocked"  # the probe itself is still on record
+
+
+def test_a_session_quality_block_that_counts_only_blocked_rows_says_blocked_not_zero_attempted():
+    """``summarize_evaluation`` leaves backfilled rows out of ``attempted``; a block holding nothing else is a declared
+    category that could not run, not one nobody declared."""
+    from llmbench.containers.session_report import _quality_text
+    quality = {"coding": {"attempted": 0, "score": None, "blocked": 3}, "tools": {"attempted": 0, "score": None},
+               "retrieval": {"attempted": 0, "score": None, "blocked": True}}  # a boolean is not a count
+    assert _quality_text(quality, "coding") == SESSION_SANDBOX_BLOCKED
+    assert _quality_text(quality, "coding", failed=True) == SESSION_SANDBOX_BLOCKED
+    assert _quality_text(quality, "tools") == _quality_text(quality, "retrieval") == "n/a (0 attempted)"
+
+
+def test_a_failed_metal_candidate_whose_own_result_counts_blocked_coding_rows_reads_blocked(tmp_path,
+                                                                                            isolated_gpu_lock):
+    """A candidate that failed after its evaluation has no evidence event and no stored sample, yet its own result
+    still counts the coding rows the blocked sandbox backfilled: that is a declared coding task, never "0
+    attempted"."""
+    memory = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "the Docker daemon is not reachable"}}
+    coding = {"attempted": 0, "score": None, "comparison": {"status": "unmeasured"}, "blocked": 3,
+              "blocked_reason": WHY}
+    row = _metal_row(tmp_path, memory, evidence=False, result={
+        "state": "failed", "failure_stage": "verify", "quality": {"coding": coding}})
+    assert row["coding"] == SESSION_SANDBOX_BLOCKED and row["first_attempt_vs_repaired"] == SESSION_SANDBOX_BLOCKED
+
+
+def test_a_metal_row_unplugged_mid_run_names_the_change_in_its_power_cell(tmp_path, isolated_gpu_lock):
+    row = _metal_row(tmp_path, _unplugged())
+    assert row["power"] == "changed: AC (admission) → battery 64% (evaluation)"
+    assert row["unified_memory"]["power"] == "AC" and row["unified_memory"]["on_battery"] is True
+    assert power_cell(unified_memory_evidence(_on_ac())) == "AC"  # one source throughout: the plain reading
 
 
 def test_an_available_sandbox_leaves_the_coding_cell_to_the_evidence(tmp_path, isolated_gpu_lock):
@@ -461,6 +678,26 @@ def test_a_candidate_whose_sandbox_was_blocked_at_run_time_shows_blocked_not_its
     line = next(line for line in cross_model_report.render_markdown(records, "now").splitlines()
                 if line.startswith("| `mac` | baseline"))
     assert "| blocked |" in line and "0.000" not in line.split(" | ")[10]
+
+
+def test_cross_model_coding_is_blocked_only_where_coding_was_declared_and_power_changes_are_named(tmp_path):
+    blocked = {**MEMORY, "coding_sandbox": {"status": "blocked", "reason": "the Docker daemon is not reachable"}}
+    _session(tmp_path, "mac", runtime="metal-native", results=[
+        # A result whose backfilled rows were counted, not attempted (summarize_evaluation): still blocked.
+        ("baseline", _result(runtime="metal-native", memory=blocked, coding={
+            "attempted": 0, "score": None, "blocked": 5, "blocked_reason": "sandbox_unavailable: x"})),
+        # A NIAH-only holdout: the probe ran and failed, but no coding task was declared, so nothing was blocked.
+        ("baseline-holdout", _result(runtime="metal-native", memory=blocked)),
+        ("unplugged", _result(runtime="metal-native", memory=_unplugged()))])
+    records = _records(tmp_path)
+    by_label = {c["label"]: c for c in records[0]["candidates"]}
+    assert by_label["baseline"]["coding_blocked"] == "the Docker daemon is not reachable"
+    assert by_label["baseline-holdout"]["coding_blocked"] is None
+    rows = {line.split(" | ")[1]: line.split(" | ") for line in cross_model_report.render_markdown(records, "now")
+            .splitlines() if line.startswith("| `mac` | ")}
+    assert rows["baseline"][10] == "blocked" and rows["baseline-holdout"][10] == "0/0"
+    assert by_label["unplugged"]["power"] == "changed: AC (admission) → battery 64% (evaluation)"
+    assert rows["unplugged"][-1] == "changed: AC (admission) → battery 64% (evaluation) |"
 
 
 # ---- coding report (scripts/coding_report.py) -----------------------------------------------------------------

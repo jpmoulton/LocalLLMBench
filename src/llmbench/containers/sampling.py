@@ -18,11 +18,16 @@ from .campaign import read_indexed_artifact
 from .config import ContainerRunConfig, NativeBundle, read_run_config
 from .runner import INGEST_MARGIN_SECONDS
 from .session import authorize_config, read_bundle, write_atomic_json, write_exclusive_json
+from .session_report import sandbox_blocked_row
 
 DEFAULT_TEMPERATURES = (0.6, 0.8)
 DEFAULT_SEEDS = (42, 43, 44)
 MAX_ATTEMPTS = 128
 REPORT_NAME = "sampling-report.json"
+# Added to the interpretation only when an attempt had such rows, so every other report reads exactly as before.
+BLOCKED_NOTE = ("Items the evaluator backfilled because the Docker coding sandbox was unavailable are counted as "
+                "blocked_item_count with their blocked_reason and never scored: a suite or category with nothing "
+                "else has a null score, not a measured zero, and its seed aggregates stay null.")
 
 
 def add_sampling_commands(subparsers) -> None:
@@ -76,21 +81,45 @@ def _identity(row: dict) -> tuple:
 
 
 def _metrics(rows: list[dict], *, measured: bool) -> dict:
+    """One suite's or category's descriptive metrics. A failed item stays in the denominator as zero, except a row
+    the evaluator backfilled because the Docker coding sandbox was unavailable (``sandbox_blocked_row``): no item
+    was put to the model, so it is counted as ``blocked_item_count`` with its ``blocked_reason`` and left out of
+    ``item_count`` and the score. A suite of nothing but such rows has a null score, never a measured 0.0; the two
+    keys exist only when such rows do, so every other attempt's metrics are unchanged."""
+    blocked = [row for row in rows if sandbox_blocked_row(row)]
+    rows = [row for row in rows if not sandbox_blocked_row(row)]
     completed = [row for row in rows if row.get("status") == "completed"]
     output_known = [row for row in rows if isinstance(row.get("output_cap_hit"), bool)
                     or isinstance(row.get("finish_reason"), str)]
     input_known = [row for row in rows if isinstance(row.get("truncation_reported"), bool)
                    or isinstance(row.get("input_truncated"), bool)]
-    return {"score": sum(float(row["score"]) if row.get("status") == "completed" else 0.0
-                          for row in rows) / len(rows) if measured and rows else None,
-            "item_count": len(rows), "completed_item_count": len(completed) if measured else None,
-            "failed_item_count": len(rows) - len(completed) if measured else None,
-            "output_truncation_count": sum(row.get("output_cap_hit") is True or row.get("finish_reason") == "length"
-                                           for row in output_known) if measured and output_known else None,
-            "output_truncation_observed_items": len(output_known) if measured else 0,
-            "input_truncation_count": sum(row.get("truncation_reported") is True or row.get("input_truncated") is True
-                                          for row in input_known) if measured and input_known else None,
-            "input_truncation_observed_items": len(input_known) if measured else 0}
+    metrics = {"score": sum(float(row["score"]) if row.get("status") == "completed" else 0.0
+                            for row in rows) / len(rows) if measured and rows else None,
+               "item_count": len(rows), "completed_item_count": len(completed) if measured else None,
+               "failed_item_count": len(rows) - len(completed) if measured else None,
+               "output_truncation_count": sum(row.get("output_cap_hit") is True
+                                              or row.get("finish_reason") == "length"
+                                              for row in output_known) if measured and output_known else None,
+               "output_truncation_observed_items": len(output_known) if measured else 0,
+               "input_truncation_count": sum(row.get("truncation_reported") is True
+                                             or row.get("input_truncated") is True
+                                             for row in input_known) if measured and input_known else None,
+               "input_truncation_observed_items": len(input_known) if measured else 0}
+    if blocked:
+        metrics.update(blocked_item_count=len(blocked),
+                       blocked_reason="; ".join(sorted({row["reason"] for row in blocked})))
+    return metrics
+
+
+def _any_blocked(scores: dict) -> bool:
+    return any(metrics.get("blocked_item_count") for axis in scores.values() for metrics in axis.values())
+
+
+def _all_blocked(scores: dict) -> bool:
+    """Every suite of the attempt was blocked: it measured nothing, so it is not a measured attempt."""
+    suites = list(scores["by_suite"].values())
+    return bool(suites) and all(metrics["score"] is None and metrics.get("blocked_item_count")
+                                for metrics in suites)
 
 
 def _scores(rows: list[dict], *, measured: bool) -> dict:
@@ -146,6 +175,14 @@ def _seed_summary(attempts: list[dict], grid: list[dict], expected: list[dict]) 
                                       "population_stddev": statistics.pstdev(values) if complete else None,
                                       "measured_seed_count": len(values),
                                       "unique_benchmark_items": denominator["item_count"]}
+                # A seed whose items were sandbox-blocked has no score, so the aggregate above is already null;
+                # this says why, instead of leaving a null that reads like a failed or missing seed. Each seed
+                # probed the sandbox on its own, so every distinct reason is named, not only the first seed's.
+                blocked = [row["scores"][axis][name] for row in measured
+                           if row["scores"][axis][name].get("blocked_item_count")]
+                if blocked:
+                    scores[axis][name].update(blocked_seed_count=len(blocked), blocked_reason="; ".join(
+                        sorted({item["blocked_reason"] for item in blocked})))
         result.append({"temperature": temperature, "top_p": top_p,
                        "planned_seeds": planned_seeds, "group_complete": group_complete,
                        "attempted_seeds": [row["seed"] for row in attempts_in_group],
@@ -202,6 +239,9 @@ def _run_sampling(config: ContainerRunConfig, output: str | Path, *, temperature
     def persist() -> None:
         report["elapsed_seconds"] = max(0.0, clock() - started)
         report["seed_summary"] = _seed_summary(report["attempts"], grid, expected)
+        if BLOCKED_NOTE not in report["interpretation"] and any(
+                _any_blocked(attempt["scores"]) for attempt in report["attempts"]):
+            report["interpretation"].append(BLOCKED_NOTE)
         write_atomic_json(root / REPORT_NAME, report)
 
     persist()
@@ -265,6 +305,9 @@ def _run_sampling(config: ContainerRunConfig, output: str | Path, *, temperature
                 if result.config_fingerprint != candidate.fingerprint():
                     raise ValueError("runner result configuration differs from the sampling plan")
                 attempt["scores"] = _read_scores(candidate, root / attempt["output"], expected)
+                if _all_blocked(attempt["scores"]):  # nothing was put to the model: no measurement to describe
+                    raise ValueError("every benchmark item was blocked: " + "; ".join(sorted({
+                        metrics["blocked_reason"] for metrics in attempt["scores"]["by_suite"].values()})))
                 attempt["evidence"] = "measured-descriptive"
             except (ValueError, OSError, TypeError, KeyError) as exc:
                 attempt["failure_reasons"].append(f"score-evidence-unavailable: {type(exc).__name__}: {exc}")

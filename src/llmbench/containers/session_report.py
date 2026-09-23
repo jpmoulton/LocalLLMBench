@@ -21,6 +21,7 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from ..apple import power_source_key
 from ..config import ExperimentManifest, canonical_json
 from .config import DEFAULT_RUNTIME, RUNTIMES, kv_placement_reading
 
@@ -45,10 +46,16 @@ MIB = 1024 * 1024
 UNIFIED_COLUMNS = ("server_footprint_mib", "metal_mib", "swap_growth_mib", "power")
 # macOS kern.memorystatus_vm_pressure_level values (libdispatch levels); any other value is printed as a number.
 PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
-# The Coding (and First/repaired) cell of a Metal row whose own sandbox probe found no usable Docker worker. Its
-# coding rows are backfilled `environment_error`s that the denominator rule scores 0.0; printed as a score, that
-# zero would read as a model that cannot code when it is a harness that could not run the code.
+# Where apple.MemoryWatchdog's swap growth starts (its `swap_baseline`). NativeRunner hands it the admission sample
+# as the baseline; when that sample had no swap reading the watchdog starts from its own first sample, which leaves
+# out whatever the load itself pushed to swap.
+SWAP_GROWTH_FROM = {"baseline": "admission", "first-sample": "the first evaluation sample"}
+# The Coding (and First/repaired) cell of a Metal row that declared coding tasks and whose own sandbox probe found
+# no usable Docker worker. Its coding rows are backfilled `environment_error`s; printed as a score, that would read
+# as a model that cannot code when it is a harness that could not run the code.
 SANDBOX_BLOCKED = "blocked (sandbox unavailable)"
+# container_eval._execution_block's reason prefix for the rows it backfills when the Docker sandbox is unavailable.
+SANDBOX_UNAVAILABLE = "sandbox_unavailable"
 UNIFIED_MEMORY_NOTE = (
     "Apple Silicon (`metal-native` rows): memory is ONE physical pool shared by the CPU, the GPU and every other "
     "application. `KV placement` `gpu`/`ram` there means Metal buffers versus CPU buffers in that same memory, not "
@@ -59,10 +66,13 @@ UNIFIED_MEMORY_NOTE = (
     "Metal device. Swap is host-wide and includes other applications, so `Swap growth MiB` (from the admission "
     "sample taken before the load, or the watchdog's first sample when that one had no swap reading, to the "
     "highest sample during evaluation) may not be the server's doing. "
-    "`Power` is the power source when the model had loaded; a Mac on battery may run slower than on AC. "
+    "`Power` is the power source when the model had loaded, or `changed:` and every source in order when the "
+    "admission sample, the after-load sample and the evaluation watchdog did not all read the same one; a Mac on "
+    "battery may run slower than on AC. "
     "`VRAM MiB` is NVIDIA-only and reads `-` on these rows: a unified-memory footprint is never VRAM and is "
-    f"never compared with it. `Coding` reads `{SANDBOX_BLOCKED}` when the candidate's Docker sandbox probe "
-    "failed: its code-executing rows were backfilled as environment errors, not answered.")
+    f"never compared with it. `Coding` reads `{SANDBOX_BLOCKED}` when the candidate declared coding tasks and "
+    "its Docker sandbox probe failed: its code-executing rows were backfilled as environment errors, not "
+    "answered.")
 # Whole-token columns: "-" when nothing was measured, never a formatted float and never a silent zero.
 TOKEN_COLUMNS = ("input_requested", "input_actual")
 # An "Input measured" cell that the analysis did not verify carries this marker, so a fallback count can never be
@@ -163,12 +173,35 @@ def _speed_columns(speed: dict) -> dict:
             "prefill_tps": _median(prefill), "ttft_s": _median(ttft)}
 
 
+def sandbox_blocked_row(row) -> bool:
+    """A row the evaluator BACKFILLED because the Docker coding sandbox was unavailable
+    (``container_eval._execution_block``): ``environment_error``, ``model_evaluated`` False and a
+    ``sandbox_unavailable: ...`` reason, all three read off the row itself.
+
+    Such a row is not a task the model failed: nothing was sent to the model and no code ran, so it never enters a
+    category score, where the denominator rule would turn it into a 0.0 that reads as a model that cannot code. It
+    is counted as blocked instead. Every other failed row -- a timeout, a crash, another environment error --
+    still scores zero, and a row the evaluator never marked this way (every NVIDIA row) is untouched."""
+    if not isinstance(row, dict):
+        return False
+    reason = row.get("reason")
+    return (row.get("status") == "environment_error" and row.get("model_evaluated") is False
+            and isinstance(reason, str) and reason.startswith(SANDBOX_UNAVAILABLE))
+
+
+def blocked_count(block) -> int:
+    """The ``blocked`` row count a quality block carries (``report.summarize_evaluation``), or 0: a boolean or
+    any other non-count is not a count."""
+    value = block.get("blocked") if isinstance(block, dict) else None
+    return value if type(value) is int and value > 0 else 0
+
+
 def _quality_text(quality: dict, category: str, *, failed: bool = False) -> str:
     """A score, or why there is none. A candidate that died mid-stage still stores 0.0 for every declared task;
     that zero is an artefact of the failure, and printing it would turn a crash into a quality result."""
     row = quality.get(category) if isinstance(quality, dict) else None
     if not isinstance(row, dict) or not row.get("attempted"):
-        return "n/a (0 attempted)"
+        return SANDBOX_BLOCKED if blocked_count(row) else "n/a (0 attempted)"
     if failed:
         return f"unmeasured: run failed ({row.get('attempted')} declared)"
     score = row.get("score")
@@ -318,26 +351,96 @@ def pressure_text(level) -> str | None:
     return f"{level} ({PRESSURE_LEVELS[level]})" if level in PRESSURE_LEVELS else str(level)
 
 
+def _power_label(power) -> str | None:
+    return power_text(power) or power_source_key(power)
+
+
+def _power_evidence(admission: dict, after: dict, during: dict) -> dict:
+    """What the Mac drew power from, from admission to the end of the evaluation.
+
+    The readings, in order, are the admission sample's, the after-load sample's, then the watchdog's first reading,
+    the reading of every change of source it recorded and its last reading (``apple.MemoryWatchdog``). Consecutive
+    readings of one source collapse into one timeline step, so ``power_changed`` is True exactly when two readings
+    in that order name different sources (or the watchdog counted changes past its bound), False when every
+    reading names one source, and None when there is no reading at all. ``on_battery`` is True when ANY reading,
+    or any source the watchdog saw between recorded changes, was the battery: a candidate that loaded on AC and was
+    unplugged mid-evaluation was measured on battery. A reading that failed is no reading, never a change."""
+    raw_changes = during.get("power_changes")  # a sealed result freezes JSON lists into tuples
+    changes = ([item for item in raw_changes if isinstance(item, dict)]
+               if isinstance(raw_changes, (list, tuple)) else [])
+    dropped = during.get("power_changes_dropped")
+    dropped = dropped if type(dropped) is int and dropped > 0 else 0
+    watched = [during.get("power_first"), *(item.get("reading") for item in changes), during.get("power_last")]
+    timeline: list[tuple[str, str, dict]] = []
+    for stage, power in (("admission", admission.get("power")), ("after load", after.get("power")),
+                         *(("evaluation", power) for power in watched)):
+        key = power_source_key(power)
+        if key is not None and (not timeline or timeline[-1][0] != key):
+            timeline.append((key, stage, power))
+    seen = {key for key, _, _ in timeline}
+    if isinstance(during.get("power_sources_seen"), (list, tuple)):
+        seen |= {item for item in during["power_sources_seen"] if isinstance(item, str)}
+    more = f" → ... ({dropped} later change(s) not recorded)" if dropped else ""
+    changed = None if not seen else (len(timeline) > 1 or bool(dropped))
+    # The evaluation on its own: one source reads as its first and last reading ("battery 73% to battery 64%"),
+    # several as each source in the order the watchdog saw them.
+    steps = [power for power in watched[:-1] if power_source_key(power) is not None]
+    labels = [_power_label(power) for power in steps]
+    last = _power_label(during.get("power_last"))
+    if not labels:
+        during_text = None
+    elif len(labels) == 1 and not dropped:
+        during_text = labels[0] if last in (None, labels[0]) else f"{labels[0]} to {last}"
+    else:
+        during_text = " → ".join(labels) + more
+    minimum = during.get("min_battery_percent_on_battery")
+    return {"power_admission": power_text(admission.get("power")), "power_during_evaluation": during_text,
+            "power_changed": changed, "on_battery": None if not seen else "battery" in seen,
+            "power_timeline": (" → ".join(f"{_power_label(power)} ({stage})" for _, stage, power in timeline)
+                               + more) if changed else None,
+            "min_battery_percent": minimum if type(minimum) is int else None}
+
+
+def power_cell(evidence: dict | None) -> str | None:
+    """The `Power` cell of a Metal row: the source when the model had loaded, or ``changed:`` and every source in
+    order when the readings from admission through the evaluation did not all name one. A column that only ever
+    showed the after-load reading would print ``AC`` for a run unplugged mid-evaluation."""
+    if not evidence:
+        return None
+    if evidence.get("power_changed") is True:
+        return f"changed: {evidence.get('power_timeline')}"
+    return evidence.get("power")
+
+
 def unified_memory_evidence(memory) -> dict:
     """The unified-memory figures of a metal-native result's ``memory`` block, each labelled for what it is.
 
-    Reads the block ``native.NativeRunner`` seals (kind ``apple-unified``): ``after_load`` (one labelled sample
-    taken once the model had loaded), ``server_log`` (the Metal buffers and working-set budget the server printed)
-    and ``during_evaluation`` (the memory watchdog's summary). Every value is None when that part was never
+    Reads the block ``native.NativeRunner`` seals (kind ``apple-unified``): ``admission`` (the headroom evidence,
+    whose ``power`` is the last admission sample's), ``after_load`` (one labelled sample taken once the model had
+    loaded), ``server_log`` (the Metal buffers and working-set budget the server printed) and
+    ``during_evaluation`` (the memory watchdog's summary). Every value is None when that part was never
     measured -- a run that failed before the load has no footprint, and a run whose watchdog never started has no
     swap growth -- and a block of any other kind (an NVIDIA result carries none) yields only Nones. Nothing is
     derived from anything else: a missing footprint is not estimated from the Metal buffers, and a missing swap
-    growth is not zero.
+    growth is not zero. ``swap_growth_from`` names where that growth starts, as the watchdog recorded it: the
+    admission sample, or its own first sample when admission had no swap reading (None when it recorded neither).
+    ``power`` is the after-load source; the ``power_*`` and ``on_battery`` fields add the admission reading and
+    every source the watchdog saw (``_power_evidence``).
     """
     fields = {"server_footprint_mib": None, "server_rss_mib": None, "server_footprint_peak_mib": None,
               "metal_mib": None, "metal_budget_mib": None, "host_available_mib": None,
               "min_host_available_mib": None, "swap_used_mib": None, "swap_growth_mib": None,
+              "swap_growth_from": None,
               "pressure_level": None, "max_pressure_level": None, "power": None, "watchdog_violations": None,
-              "coding_sandbox_status": None, "coding_sandbox_reason": None}
+              "coding_sandbox_status": None, "coding_sandbox_reason": None, "power_admission": None,
+              "power_during_evaluation": None, "power_changed": None, "on_battery": None, "power_timeline": None,
+              "min_battery_percent": None}
     if not isinstance(memory, dict) or memory.get("kind") != UNIFIED_KIND:
         return fields
-    after, log, during, sandbox = (memory.get(key) if isinstance(memory.get(key), dict) else {}
-                                   for key in ("after_load", "server_log", "during_evaluation", "coding_sandbox"))
+    admission, after, log, during, sandbox = (
+        memory.get(key) if isinstance(memory.get(key), dict) else {}
+        for key in ("admission", "after_load", "server_log", "during_evaluation", "coding_sandbox"))
+    fields.update(_power_evidence(admission, after, during))
     violations = during.get("violations")
     fields.update(
         server_footprint_mib=_real(after.get("server_phys_footprint_mib")),
@@ -348,6 +451,8 @@ def unified_memory_evidence(memory) -> dict:
         min_host_available_mib=_mib_from_bytes(during.get("min_available_bytes")),
         swap_used_mib=_real(after.get("swap_used_mib")),
         swap_growth_mib=_mib_from_bytes(during.get("swap_growth_bytes")),
+        swap_growth_from=SWAP_GROWTH_FROM.get(during.get("swap_baseline"))
+        if isinstance(during.get("swap_baseline"), str) else None,
         pressure_level=after.get("memory_pressure_level") if type(after.get("memory_pressure_level")) is int
         else None,
         max_pressure_level=during.get("max_pressure_level") if type(during.get("max_pressure_level")) is int
@@ -422,10 +527,24 @@ def attempt_row(store, attempt: dict, analysis_row: dict | None) -> dict:
     # Only a Metal row reads the unified-memory block; an NVIDIA row keeps "-" there whatever its result holds.
     unified = unified_memory_evidence(result.get("memory")) if runtime == NATIVE_RUNTIME else None
     memory_columns = {column: (unified or {}).get(column) for column in UNIFIED_COLUMNS}
+    if unified is not None:
+        memory_columns["power"] = power_cell(unified)
     # ...and a Metal row never carries a VRAM figure, whatever its result holds: there is no dedicated VRAM to
     # have measured, so a stray number there would be something else printed under the NVIDIA heading.
     vram = None if runtime == NATIVE_RUNTIME else result.get("vram_used_mib_after_load")
-    blocked = unified is not None and unified["coding_sandbox_status"] not in (None, "available")
+    # The broker stage probes the sandbox whatever the attempt declared, so a NIAH-only holdout sees the same
+    # blocked probe; with no coding task there was nothing to backfill, and its cell stays "n/a (0 attempted)".
+    # What was declared is read from the controller's evidence, the stored samples, or the result's own quality: a
+    # candidate that failed after its evaluation has neither of the first two, yet its result still counts the
+    # coding rows the blocked sandbox backfilled.
+    coding_blocks = [source["quality"].get("coding") for source in (evidence, result)
+                     if isinstance(source.get("quality"), dict)]
+    declares_coding = (any(isinstance(block, dict) and (bool(block.get("attempted")) or bool(blocked_count(block)))
+                           for block in coding_blocks)
+                       or any(isinstance(row, dict) and row.get("category") == "coding"
+                              for row in record["samples"]))
+    blocked = (declares_coding and unified is not None
+               and unified["coding_sandbox_status"] not in (None, "available"))
     failed = not str(state).startswith("completed")
     return {"attempt_id": attempt["id"], "parent_id": attempt.get("parent_id"), "split": "holdout" if holdout_attempt
             else "development", "label": label, "quantization": manifest.model.quantization,
@@ -825,4 +944,5 @@ __all__ = ["attempt_row", "recommendation", "build_session_report", "session_mar
            "write_session_report", "COLUMNS", "HEADERS", "CONTEXT_CLAIM_NOTE", "FILL_VERIFIED_NOTE",
            "NO_MEASURED_FILL", "UNVERIFIED_FILL", "OFFLOAD_NOTE", "NOT_OBSERVED", "NOT_COVERED", "UNEXPLAINED",
            "SCOPE_UNKNOWN", "SCOPE_UNKNOWN_SUFFIX", "UNIFIED_MEMORY_NOTE", "UNIFIED_COLUMNS", "SANDBOX_BLOCKED",
+           "SANDBOX_UNAVAILABLE", "sandbox_blocked_row", "blocked_count", "power_cell",
            "attempt_runtime", "unified_memory_evidence", "power_text", "pressure_text", "has_native_rows", "Any"]

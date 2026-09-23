@@ -42,7 +42,10 @@ The Mac runs the pinned llama.cpp server natively with Metal (`docs/usage.md`, "
 runtime"). The rules above still apply; these are added.
 
 * **Always pass the runtime explicitly:** `--runtime metal-native --native-bundle artifacts/native-prep/native-bundle.json`
-  on `tune`, and the same pair on `scripts/sweep_models.py`. There is no automatic switch.
+  on `tune --model`, and the same pair on `scripts/sweep_models.py`; either flag alone is refused. There is no
+  automatic switch. `resume` takes neither (the session remembers its runtime and bundle), `tune --config` refuses
+  both (the session config states its runtime), and a `candidate` config names its own runtime (`--native-bundle`
+  is optional there and must match it).
 * **Permissions:** `llmbench doctor` must show `allow_native_execution` (plus the model and inference flags) as
   true; `allow_container_execution` only matters for the coding sandbox. Never add or change a permission
   yourself.
@@ -62,7 +65,10 @@ runtime"). The rules above still apply; these are added.
 * **A Mac is slow at long context.** The plan sizes its work at three times the NVIDIA estimates and a Mac session
   defaults to 4096 usable input tokens; do not promise long-context results the plan did not schedule.
 * **Stopping:** interrupt the session (Ctrl-C) and wait. Afterwards no `llama-server` from the bundle may be left
-  running (`pgrep -fl llama-server`) and the GPU lease must be gone; `llmbench doctor` describes a stale lease.
+  running (`pgrep -fl llama-server`) and the GPU lease must be gone. If a lease is left, `llmbench doctor` names
+  its holder and what to check: a session's lease records no runtime, so it asks for both `pgrep -fl llama-server`
+  and `docker ps -a --filter name=llmbench-`. Report what it says; deleting the lease, or stopping a leftover
+  server, is the user's decision.
 * Mac numbers describe that Mac. Never rank a Mac tok/s against an NVIDIA tok/s as if it were a model difference.
 
 ## Report — the rules that matter

@@ -14,7 +14,9 @@ each under its own explicit key:
 * the GPU's own utilisation and driver memory (`ioreg` IOAccelerator `PerformanceStatistics`). The GPU is busy even
   at rest (the window server composites on it: 34 % in the captured idle sample), which is why admission compares
   a median across samples to a limit instead of demanding an idle GPU;
-* the power source (`pmset -g batt`), because a Mac on battery may be throttled and a result must say so.
+* the power source (`pmset -g batt`), because a Mac on battery may be throttled and a result must say so. The
+  watchdog compares every sample's source with the one before it, so a Mac unplugged after the load is recorded
+  as a change of source when it happened, not hidden behind the one after-load reading.
 
 Every external probe is one of a few fixed argv lists run with a timeout of at most 3 s in a fixed environment
 (system PATH, `LC_ALL=C`: `sysctl vm.swapusage` prints `9216,00M` under a German or French locale), output over
@@ -46,6 +48,9 @@ MAX_PROBE_SECONDS = 3.0
 MAX_COMMAND_OUTPUT_CHARS = 1_048_576
 MAX_ERROR_CHARS = 500
 MAX_WATCHDOG_ERRORS = 50
+# A flapping charger would otherwise grow the watchdog summary without bound; changes past this many are
+# counted (`power_changes_dropped`), never lost silently.
+MAX_POWER_CHANGES = 50
 # kern.memorystatus_vm_pressure_level reports libdispatch's DISPATCH_MEMORYPRESSURE_* levels. Any other value is
 # not a level this module can compare to a limit, so it is refused rather than guessed.
 PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
@@ -158,6 +163,19 @@ def parse_pmset_batt(text: str) -> dict:
     return {"power_source": _POWER_SOURCES.get(sources[0]), "power_source_label": sources[0],
             "battery_percent": percent, "battery_state": state,
             "charging": None if state is None else _CHARGING_STATES.get(state.lower())}
+
+
+def power_source_key(power) -> str | None:
+    """What one `parse_pmset_batt` reading says the Mac drew from: "ac", "battery", or pmset's own label for any
+    other source (a UPS). None when there is no reading: a power probe that failed is not a change of source, and
+    two readings are the same source whatever their battery percentages."""
+    if not isinstance(power, dict):
+        return None
+    for key in ("power_source", "power_source_label"):
+        value = power.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def parse_vm_stat(text: str) -> dict:
@@ -522,6 +540,11 @@ class MemoryWatchdog:
       `baseline`'s (an admission sample taken before the load) when given, else the first sample's;
     * `pressure_critical`: macOS memory pressure at level 4.
 
+    Power is recorded, never judged: the first and last readings the samples carried, every source seen, each
+    change of source (``power_changes``, bounded by MAX_POWER_CHANGES) and the lowest battery percentage read on
+    battery. A candidate that loads on AC and is unplugged mid-evaluation ran its measurements on battery, and the
+    one after-load reading cannot show that.
+
     `on_violation(reason)` is called ONCE, for the first violation, from the sampling thread; later violations are
     still recorded in the summary. The watchdog itself never signals, kills or renices anything. `sampler(pid)`
     must return a `sample_unified_memory`-shaped dict; its exceptions, a non-dict, and an exception from
@@ -578,6 +601,12 @@ class MemoryWatchdog:
         self._swap_baseline = None
         self._swapins = [None, None]
         self._swapouts = [None, None]
+        self._power_readings = 0
+        self._power_first = self._power_last = None
+        self._power_sources: list[str] = []
+        self._power_changes: list[dict] = []
+        self._power_changes_dropped = 0
+        self._min_battery_percent = None
         self._violations: list[dict] = []
         self._notified = False
         self._errors: list[str] = []
@@ -703,6 +732,31 @@ class MemoryWatchdog:
             self._gpu.append(utilization)
             self._gpu_count += 1
             self._gpu_max = _peak(self._gpu_max, utilization, max)
+        self._record_power(sample)
+
+    def _record_power(self, sample: dict) -> None:
+        """Compare this sample's power source with the previous READING's (a sample whose power probe failed sits
+        between them unjudged), so a switch is dated by the first sample that showed it."""
+        power = sample.get("power")
+        source = power_source_key(power)
+        if source is None:
+            return
+        self._power_readings += 1
+        previous = power_source_key(self._power_last)
+        if previous is not None and previous != source:
+            if len(self._power_changes) < MAX_POWER_CHANGES:
+                self._power_changes.append({"from": previous, "to": source, "reading": power,
+                                            "monotonic_seconds": sample.get("monotonic_seconds")})
+            else:
+                self._power_changes_dropped += 1
+        if self._power_first is None:
+            self._power_first = power
+        self._power_last = power
+        if source not in self._power_sources:
+            self._power_sources.append(source)
+        if power.get("power_source") == "battery":
+            self._min_battery_percent = _peak(self._min_battery_percent, _int_or_none(power.get("battery_percent")),
+                                              min)
 
     def _judge(self, sample: dict) -> list[dict]:
         """The violations this sample shows for the FIRST time, one per rule kind."""
@@ -734,7 +788,8 @@ class MemoryWatchdog:
     def summary(self) -> dict:
         """The evidence so far (final once `stop()` returned). `samples` is the retained sample LIST, newest last
         -- large, so an owner persists it to its own file and keeps the rest -- and `sample_count` is how many
-        samples were taken in all; every other key is a count, extreme, delta or setting."""
+        samples were taken in all; every other key is a count, extreme, delta or setting, or (``first``, ``last``,
+        ``power_first``, ``power_last`` and each ``power_changes`` entry's ``reading``) a reading kept verbatim."""
         with self._lock:
             gpu = list(self._gpu)
             # Growth is the largest rise over the start that a SAMPLE observed: a baseline alone measures nothing.
@@ -754,6 +809,11 @@ class MemoryWatchdog:
                     "gpu_utilization_percent": {"median": statistics.median(gpu) if gpu else None,
                                                 "median_of_last": len(gpu), "max": self._gpu_max,
                                                 "samples": self._gpu_count},
+                    "power_readings": self._power_readings, "power_first": self._power_first,
+                    "power_last": self._power_last, "power_sources_seen": list(self._power_sources),
+                    "power_changes": [dict(item) for item in self._power_changes],
+                    "power_changes_dropped": self._power_changes_dropped,
+                    "min_battery_percent_on_battery": self._min_battery_percent,
                     "footprint_limit_bytes": self.footprint_limit_bytes,
                     "footprint_limit_source": self.footprint_limit_source,
                     "swap_growth_limit_bytes": self.swap_growth_limit_bytes,
