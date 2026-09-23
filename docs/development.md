@@ -52,7 +52,9 @@ The two runtimes are covered differently, and a change should say which kind of 
 On an M1 Mac the pinned installer, native preparation, Metal candidate process, smoke runs, `tune` and the
 two-model sweep have been exercised live. A Linux/arm64 coding worker was built and calibrated in Colima: all 83
 Aider Polyglot references passed and all 83 unchanged stubs failed. The two-model sweep did not select coding
-benchmarks because its base config had no broker; no live Mac coding score is claimed. See
+benchmarks because its base config had no broker. A separate coding candidate with the worker was refused by native
+admission when only 1250 MiB was available against 1568 MiB required, before model load; no live Mac coding score
+is claimed. See
 [the measured Mac results](usage.md#results-on-a-laptop).
 
 When a real run disagrees with a fixture, capture the new output into `tests/data/` (with machine-specific paths

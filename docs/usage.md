@@ -371,6 +371,12 @@ planned but did not run before the budget expired. EvalPlus and Aider Polyglot w
 base config omitted the broker, even though a Linux/arm64 coding worker was separately built and calibrated. These
 results show a functioning native runtime and its observed tradeoffs, not a cross-model winner.
 
+A later attempt to add one EvalPlus and one Aider Polyglot coding item used the already calibrated worker in a
+1 GiB Colima VM, with no downloads. Native admission refused the first Qwen3-1.7B candidate before model load:
+1250 MiB of host unified memory was available, below the model-plus-reserve requirement of 1568 MiB. The candidate
+cleaned up and the VM was stopped. No Mac coding score resulted from that attempt; reducing the reserve to force a
+run would discard the memory guard that kept the laptop stable.
+
 ## Screen, measure interactions, then confirm
 
 `optimize` takes a **session configuration containing the full confirmation workload**, with real model hashes
