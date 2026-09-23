@@ -1,10 +1,11 @@
 """Native (`metal-native`) preparation: pin a llama-server executable on this Mac and record what it is.
 
 The native analogue of `image_plan.prepare_images`. Nothing here downloads, builds or serves a model.
-`prepare_native` hashes the executable and every llama.cpp/ggml library beside it, proves from the Mach-O load
-commands that those hashed files are the only non-system code dyld will load for it, runs the executable ONLY as
-`--version`, `--help` and `--list-devices` through `NativeProcessExecutor`, checks that every flag the harness can
-emit exists in that build, and writes `native-bundle.json` last and exclusively. Every refusal is a `ValueError`
+`prepare_native` hashes the executable and every llama.cpp/ggml library (and any Metal shader library a
+non-embedded build loads) beside it, proves from the Mach-O load commands that those hashed files are the only
+non-system code dyld will load for it, runs the executable ONLY as `--version`, `--help` and `--list-devices`
+through `NativeProcessExecutor`, checks that every flag the harness can emit exists in that build, and writes
+`native-bundle.json` last and exclusively. Every refusal is a `ValueError`
 (or `OperationForbidden` from the policy) naming what failed; nothing is guessed or defaulted to make a bundle
 appear. Importing this module performs no I/O.
 """
@@ -46,8 +47,14 @@ PROBE_TIMEOUT_SECONDS = 120  # --list-devices initialises Metal; a cold first ru
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_LIBRARIES = 512
+# A build WITHOUT GGML_METAL_EMBED_LIBRARY keeps its GPU kernels outside every dylib: ggml-metal loads
+# `default.metallib` from the executable's directory, or compiles `ggml-metal.metal` found there (with the two
+# headers the build copies beside it). Those files are code the Metal backend runs, so they are pinned exactly like
+# a library; replacing one after prepare would otherwise change the kernels under an unchanged pin. The pinned
+# b11011 release embeds its shader library, so none of these names exists beside it and its pin is unchanged.
+METAL_RESOURCE_PATTERNS = ("*.metallib", "*.metal", "ggml-common.h", "ggml-metal-impl.h")
 # `lib*.so` covers a GGML_BACKEND_DL build, whose backends are loadable modules named like that even on macOS.
-LIBRARY_PATTERNS = ("lib*.dylib", "lib*.so")
+LIBRARY_PATTERNS = ("lib*.dylib", "lib*.so") + METAL_RESOURCE_PATTERNS
 # Environment that could change what the executable does behind its argv: llama.cpp reads LLAMA_ARG_* for every
 # flag and GGML_* for backend switches, HF_* would point it at a hub, DYLD_* would load libraries the pin does not
 # cover (DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, ...), MTL_*/METAL_* switch on Metal debug
@@ -58,6 +65,10 @@ SCRUBBED_PREFIXES = ("LLAMA_", "GGML_", "HF_", "HUGGINGFACE_", "DYLD_", "MTL_", 
 MH_MAGIC_64 = 0xFEEDFACF
 FAT_MAGIC, FAT_MAGIC_64 = 0xCAFEBABE, 0xCAFEBABF
 CPU_TYPE_ARM64 = 0x0100000C
+# arm64 and arm64e share CPU_TYPE_ARM64 and differ only in the subtype, whose top byte carries capability bits
+# (arm64e's pointer-authentication ABI version), not the subtype itself.
+CPU_SUBTYPE_MASK = 0xFF000000
+ARM64_SUBTYPES = {0: "arm64", 1: "arm64", 2: "arm64e"}  # CPU_SUBTYPE_ARM64_ALL, _ARM64_V8, _ARM64E
 LC_ID_DYLIB, LC_RPATH = 0xD, 0x8000001C
 # LC_LOAD_DYLINKER names the loader the kernel starts for the executable; LC_DYLD_ENVIRONMENT embeds DYLD_*_PATH
 # variables dyld honours for a main executable, i.e. a library search path baked into the bytes. Either one could
@@ -110,7 +121,8 @@ def _sha256_file(path: Path) -> str:
 def hash_native_server(executable: str | Path) -> dict:
     """{executable_sha256, libraries: {name: sha256}, libraries_sha256} for a llama-server and its directory.
 
-    `libraries` has one entry per `lib*.dylib` / `lib*.so` NAME in the executable's directory, valued with the
+    `libraries` has one entry per `lib*.dylib` / `lib*.so` NAME in the executable's directory, and per Metal shader
+    library or source a non-embedded build loads from there (`METAL_RESOURCE_PATTERNS`), valued with the
     SHA-256 of the regular file that name is or links to. A link must resolve to a regular file in that same
     directory, anything else is refused: dyld loads `@rpath/libggml-metal.0.dylib` by its link name, so pinning
     names rather than only the regular files means repointing a link at another (hashed) file still changes
@@ -163,19 +175,59 @@ def _lc_string(body: bytes, where: str) -> str:
     return raw.decode("utf-8")  # UnicodeDecodeError is a ValueError: refused like any other malformed image
 
 
+def _arm64_flavour(subtype: int, where: str) -> str:
+    """"arm64" or "arm64e" for a CPU_TYPE_ARM64 subtype; any other subtype is refused rather than guessed at."""
+    flavour = ARM64_SUBTYPES.get(subtype & 0xFFFFFFFF & ~CPU_SUBTYPE_MASK)
+    if flavour is None:
+        raise ValueError(f"{where}: an arm64 image with the unknown CPU subtype {subtype & 0xFFFFFFFF:#x}")
+    return flavour
+
+
+def _arm64_slice(table: bytes, count: int, wide: bool, where: str) -> tuple[str, int]:
+    """The (flavour, offset) of the slice an arm64 process loads from a universal binary's fat_arch table.
+
+    arm64 and arm64e share CPU_TYPE_ARM64, so the first entry of that type is not necessarily the one that runs:
+    the kernel runs a third-party executable's plain arm64 slice (arm64e only under the developer-only arm64e
+    preview ABI), and dyld loads each library's arm64 slice into that process. So the plain arm64 slice is chosen
+    wherever it sits in the table. An arm64e slice is read only when it is the ONLY arm64-family slice (a platform
+    binary such as /bin/ls ships x86_64 + arm64e), and the flavour returned says so. Two plain arm64 slices, or
+    several arm64e ones and no arm64, are refused: which one loads would be a guess.
+    """
+    size = 32 if wide else 20
+    slices = []
+    for index in range(count):
+        fields = struct.unpack_from(">iiQQII" if wide else ">iiIII", table, index * size)
+        if fields[0] == CPU_TYPE_ARM64:
+            slices.append((_arm64_flavour(fields[1], where), fields[2]))
+    plain = [item for item in slices if item[0] == "arm64"]
+    if len(plain) == 1:
+        return plain[0]
+    if plain:
+        raise ValueError(f"{where} is a universal binary with {len(plain)} arm64 slices; which one loads is "
+                         "ambiguous")
+    if len(slices) == 1:
+        return slices[0]
+    if slices:
+        raise ValueError(f"{where} is a universal binary with {len(slices)} arm64e slices and no arm64 slice")
+    raise ValueError(f"{where} is a universal binary without an arm64 slice")
+
+
 def read_macho_linkage(path: str | Path) -> dict:
     """The arm64 image's dynamic-library load commands, read from the file without running anything.
 
-    Returns {"cpu": "arm64", "filetype", "install_name", "dylibs": [...], "rpaths": [...], "dylinker",
-    "environment": [...]}. A universal binary is read at its arm64 slice. Anything that is not a 64-bit arm64 Mach-O image, or whose load commands are
-    truncated, oversized or malformed, is refused: the linkage proof cannot vouch for what it cannot read.
+    Returns {"cpu", "filetype", "install_name", "dylibs": [...], "rpaths": [...], "dylinker", "environment": [...]}
+    where "cpu" is the flavour of the image actually read: "arm64", or "arm64e" when that was the only arm64-family
+    slice. A universal binary is read at the slice an arm64 process loads (`_arm64_slice`), and that slice's own
+    header must agree with the table about its flavour. Anything that is not a 64-bit arm64 Mach-O image, or whose
+    load commands are truncated, oversized or malformed, is refused: the linkage proof cannot vouch for what it
+    cannot read.
     """
     source = Path(path)
     with os.fdopen(_open_regular(source), "rb") as handle:
         head = handle.read(8)
         if len(head) < 8:
             raise ValueError(f"{source.name} is not a Mach-O image")
-        offset = 0
+        offset, flavour = 0, None
         (magic,) = struct.unpack(">I", head[:4])
         if magic in (FAT_MAGIC, FAT_MAGIC_64):
             (count,) = struct.unpack(">I", head[4:8])
@@ -186,22 +238,19 @@ def read_macho_linkage(path: str | Path) -> dict:
             table = handle.read(count * size)
             if len(table) != count * size:
                 raise ValueError(f"{source.name}: truncated universal binary header")
-            for index in range(count):
-                fields = struct.unpack_from(">iiQQII" if wide else ">iiIII", table, index * size)
-                if fields[0] == CPU_TYPE_ARM64:
-                    offset = fields[2]
-                    break
-            else:
-                raise ValueError(f"{source.name} is a universal binary without an arm64 slice")
+            flavour, offset = _arm64_slice(table, count, wide, source.name)
         handle.seek(offset)
         header = handle.read(32)
         if len(header) != 32:
             raise ValueError(f"{source.name} is not a Mach-O image")
-        magic, cputype, _subtype, filetype, count, size, _flags, _reserved = struct.unpack("<IiiIIIII", header)
+        magic, cputype, subtype, filetype, count, size, _flags, _reserved = struct.unpack("<IiiIIIII", header)
         if magic != MH_MAGIC_64:
             raise ValueError(f"{source.name} is not a 64-bit Mach-O image")
         if cputype != CPU_TYPE_ARM64:
             raise ValueError(f"{source.name} is built for CPU type {cputype:#x}, not arm64")
+        cpu = _arm64_flavour(subtype, source.name)
+        if flavour is not None and cpu != flavour:
+            raise ValueError(f"{source.name}: the universal binary lists an {flavour} slice whose header says {cpu}")
         if count > MAX_LOAD_COMMANDS or size > MAX_LOAD_COMMAND_BYTES:
             raise ValueError(f"{source.name}: {count} load commands in {size} bytes exceeds the reader's bounds")
         commands = handle.read(size)
@@ -226,7 +275,7 @@ def read_macho_linkage(path: str | Path) -> dict:
         elif command == LC_DYLD_ENVIRONMENT:
             environment.append(_lc_string(body, source.name))
         position += length
-    return {"cpu": "arm64", "filetype": MACHO_FILETYPES.get(filetype, filetype), "install_name": install_name,
+    return {"cpu": cpu, "filetype": MACHO_FILETYPES.get(filetype, filetype), "install_name": install_name,
             "dylibs": dylibs, "rpaths": rpaths, "dylinker": dylinker, "environment": environment}
 
 
@@ -239,7 +288,8 @@ def check_native_linkage(executable: Path, libraries: Mapping[str, str]) -> dict
     plain name of a hashed library beside the executable, and every LC_RPATH must be that directory itself. An
     `@rpath/` dependency also needs such an LC_RPATH in scope (its own image's or the executable's): with none,
     dyld falls back to searching the leaf name in `/usr/local/lib` and `/usr/lib`, outside the pin. The executable
-    must use the system `DYLD` and embed no LC_DYLD_ENVIRONMENT search path. A Homebrew-style layout
+    must be arm64 (not arm64e), use the system `DYLD` and embed no LC_DYLD_ENVIRONMENT search path; each image
+    is read at the slice an arm64 process loads (`read_macho_linkage`). A Homebrew-style layout
     (`@loader_path/../lib`, `/opt/homebrew/...`) is refused rather than pinned by the executable alone, because
     the Metal backend it would load is exactly what the pin exists to cover. Code loaded later with `dlopen` (a
     GGML_BACKEND_DL build) is not visible here; such backends beside the executable are still hashed.
@@ -260,6 +310,10 @@ def check_native_linkage(executable: Path, libraries: Mapping[str, str]) -> dict
         local_rpath = any(rpath.rstrip("/") in LOCAL_RPATHS for rpath in info["rpaths"])
         if real == executable.name:
             executable_rpath = local_rpath
+            if info["cpu"] != "arm64":
+                # A third-party arm64e executable runs only under the arm64e preview ABI, and then dyld loads each
+                # library's arm64e slice, not the arm64 slice this proof reads for a universal library.
+                problems.append(f"{real} is an {info['cpu']} executable; the proof covers an arm64 process only")
             if info["dylinker"] not in (None, DYLD):
                 problems.append(f"{real} asks the kernel for the loader {info['dylinker']!r}, not {DYLD}")
         for variable in info["environment"]:

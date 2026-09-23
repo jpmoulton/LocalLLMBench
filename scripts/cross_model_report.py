@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llmbench.containers.config import DEFAULT_RUNTIME  # noqa: E402
 from llmbench.containers.gguf import gguf_summary  # noqa: E402
-from llmbench.containers.session_report import NATIVE_RUNTIME, unified_memory_evidence  # noqa: E402
+from llmbench.containers.session_report import (NATIVE_RUNTIME, blocked_count, power_cell,  # noqa: E402
+                                                unified_memory_evidence)
 
 MISSING = "-"
 UNIFIED = "n/a (unified)"  # a VRAM cell on a Metal row: not unmeasured, there is no VRAM to measure
@@ -201,14 +202,19 @@ def collect_model(slug: str, meta: dict, root: Path) -> dict:
         # default is serialised); a candidate with no result inherits the session's configured runtime.
         runtime = result.get("runtime", DEFAULT_RUNTIME) if result else record["runtime"]
         memory = unified_memory_evidence(result.get("memory")) if runtime == NATIVE_RUNTIME and result else None
-        blocked = memory is not None and memory["coding_sandbox_status"] not in (None, "available")
+        # The sandbox is probed whatever the candidate declared: only one that declared coding tasks (in the
+        # analysis or in its own result, whose blocked rows are counted rather than attempted) had rows to backfill.
+        declared = any(isinstance(block, dict) and (block.get("attempted") or blocked_count(block))
+                       for block in (quality.get("coding"), ((result or {}).get("quality") or {}).get("coding")))
+        blocked = declared and memory is not None and memory["coding_sandbox_status"] not in (None, "available")
         if runtime == NATIVE_RUNTIME:  # no dedicated VRAM exists to have measured; a stray figure is not one
             candidate["vram_mib"] = None
         candidate.update({
             "runtime": runtime, "unified_memory": memory,
             "server_footprint_mib": (memory or {}).get("server_footprint_mib"),
             "metal_mib": (memory or {}).get("metal_mib"), "swap_growth_mib": (memory or {}).get("swap_growth_mib"),
-            "power": (memory or {}).get("power"),
+            # The source at load, or every source in order when a reading from admission on named another one.
+            "power": power_cell(memory),
             # The candidate's own sandbox probe found no usable worker: its coding rows are backfilled
             # environment errors, whatever number the denominator rule turned them into.
             "coding_blocked": (memory["coding_sandbox_reason"] or "the Docker sandbox was unavailable")
@@ -305,8 +311,9 @@ def render_markdown(records: list[dict], generated: str) -> str:
         w("On a `metal-native` row `VRAM MiB` is `n/a (unified)`: Apple Silicon has no dedicated VRAM. `footprint "
           "MiB (unified)` is the llama-server process's phys_footprint after load, which includes its Metal "
           "allocations; `Metal MiB` is the buffers the server logged on the Metal device; `swap growth MiB` is "
-          "host-wide (other applications included); `power` is the power source when the model had loaded. "
-          "`blocked` means the Docker coding sandbox was unavailable, so those suites were not run.")
+          "host-wide (other applications included); `power` is the power source when the model had loaded, or "
+          "`changed:` and every source in order when a reading from admission through the evaluation named "
+          "another. `blocked` means the Docker coding sandbox was unavailable, so those suites were not run.")
         w("")
     w("| Model | Candidate | ctx | KV | spec | reason | tok/s | VRAM MiB | tools | retrieval | coding | "
       "largest prompt | ctx ok | state |"

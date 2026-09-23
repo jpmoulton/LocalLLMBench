@@ -1,6 +1,7 @@
 """Offline acceptance of orchestration; no Docker, model loading, or real subprocess launches."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -231,6 +232,18 @@ def test_interrupted_child_gets_cleanup_signal_and_resume_continues_pending(prep
     assert run(prepared, resume=True, popen=fake_factory([])) == 3
 
 
+def test_a_candidate_gets_only_the_interrupt_the_supervisor_forwards(prepared):
+    """In the supervisor's own process group the candidate would also get the terminal's SIGINT, and the forwarded
+    one would land inside its cleanup; so it starts outside it (Windows keeps its new process group)."""
+    children = []
+    assert run(prepared, popen=fake_factory(children, ["cancelled"], interrupt=True)) == 130
+    isolation = {key: value for key, value in children[0].kwargs.items()
+                 if key in ("creationflags", "start_new_session", "process_group")}
+    assert isolation == ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                         else {"start_new_session": True})
+    assert len(children[0].signals) == 1
+
+
 def test_unresponsive_child_retains_pid_and_stops_without_kill(prepared):
     children = []
     assert run(prepared, popen=fake_factory(children, ["completed"], timeout=True)) == 4
@@ -415,23 +428,30 @@ def native_prepared(prepared):
     return path, plan
 
 
-def native_result(entry, *, attempted=True, server_exit="signal=SIGTERM", remaining=(), state="completed"):
+def native_result(entry, *, attempted=True, server_exit="signal=SIGTERM", remaining=(), state="completed",
+                  start="ok", pids=None, reason="rejected at admission"):
+    """``start`` is the recorded status of the start stage (None: never reached); a started server has its pid."""
+    stages = () if start is None else (
+        {"name": "start", "status": start, "started_offset_seconds": 0, "elapsed_seconds": 0},)
     return ContainerRunResult(
         session_id="session", attempt_id="attempt", config_fingerprint=entry["config_fingerprint"],
         project_name="llmbench-attempt", state=state, synthetic=False, started_utc="start", finished_utc="finish",
-        elapsed_seconds=1, budget_charged_seconds=1, runtime="metal-native",
+        elapsed_seconds=1, budget_charged_seconds=1, runtime="metal-native", stages=stages,
+        container_ids=("pid:4242",) if pids is None and start == "ok" else tuple(pids or ()),
         cleanup={"attempted": attempted, "verified": True, "server_exit": server_exit,
                  "processes_remaining": remaining},
-        abort_campaign=False, failure_reasons=() if state == "completed" else ("rejected at admission",))
+        abort_campaign=False, failure_reasons=() if state == "completed" else (reason,))
 
 
 class NativeProcess(FakeProcess):
+    evidence = {}  # how native_result describes this candidate's run
+
     def wait(self, timeout):
         self.waits.append(timeout)
         self.output.mkdir()
-        write(self.output / "result.json", native_result(self.entry).model_dump(mode="json"))
+        write(self.output / "result.json", native_result(self.entry, **self.evidence).model_dump(mode="json"))
         self.done = True
-        return 0
+        return 0 if self.evidence.get("state", "completed") == "completed" else 3
 
 
 def test_a_native_plan_is_pinned_by_its_native_bundle_and_launches_with_it(native_prepared):
@@ -531,5 +551,51 @@ def test_native_terminal_evidence_must_prove_the_server_stopped(native_prepared)
     with pytest.raises(ValueError, match="how its llama-server exited"):  # started, but its exit is unproven
         judged(server_exit=None)
     # Refused at admission: no server was ever started, so there is no exit to record.
-    rejected = judged(attempted=False, server_exit=None, state="rejected")
+    rejected = judged(attempted=False, server_exit=None, state="rejected", start=None)
     assert rejected["status"] == "failed" and rejected["server_exit"] is None
+
+
+UNSTARTABLE = {"server_exit": None, "state": "failed", "start": "failed",
+               "reason": "llama-server could not be started: [Errno 2] No such file or directory"}
+
+
+def test_a_native_server_that_could_not_be_launched_is_a_failure_not_uncertain_cleanup(native_prepared):
+    """The runner marks the start attempted before it launches llama-server, so a launch that fails still runs the
+    attempted cleanup, and that cleanup has no process whose exit it could record. Its recorded failed start and
+    missing pid say so; the absence proof is still required."""
+    entry = sweep.read_plan(native_prepared[0])["entries"][0]
+    output = Path(entry["output"])
+    output.mkdir()
+
+    def judged(**change):
+        write(output / "result.json", native_result(entry, **{**UNSTARTABLE, **change}).model_dump(mode="json"))
+        return sweep.terminal(entry, 3)
+
+    failed = judged()
+    assert failed["status"] == "failed" and failed["result_state"] == "failed" and failed["server_exit"] is None
+    with pytest.raises(ValueError, match="how its llama-server exited"):  # a pid was recorded: that server ran
+        judged(pids=("pid:4242",))
+    with pytest.raises(ValueError, match="how its llama-server exited"):  # nothing records how the start went
+        judged(start=None)
+    with pytest.raises(ValueError, match="how its llama-server exited"):  # the start succeeded
+        judged(start="ok", pids=())
+    with pytest.raises(ValueError, match="cleanup is uncertain"):  # never excuses a process still present
+        judged(remaining=("pid:4243",))
+
+
+def test_a_native_launch_failure_does_not_block_the_sweep_or_its_resume(native_prepared):
+    plan = sweep.read_plan(native_prepared[0])
+    children = []
+
+    class Unstartable(NativeProcess):
+        evidence = UNSTARTABLE
+
+    factories = iter([Unstartable, NativeProcess])
+    assert sweep.run_plan(plan, process_guard=lambda: None,
+                          popen=lambda argv, **kwargs: next(factories)(argv, children, **kwargs)) == 3
+    assert len(children) == 2  # the next candidate still ran
+    saved = state(native_prepared)["entries"]
+    assert saved["e1"]["status"] == "failed" and saved["e1"]["server_exit"] is None
+    assert saved["e2"]["status"] == "completed"
+    assert sweep.run_plan(sweep.read_plan(native_prepared[0]), resume=True, process_guard=lambda: None,
+                          popen=lambda *a, **k: pytest.fail("terminal entries are never relaunched")) == 3

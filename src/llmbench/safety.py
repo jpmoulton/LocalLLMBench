@@ -14,6 +14,8 @@ class OperationForbidden(RuntimeError):
 
 
 PERMISSIONS = ("allow_model_operations", "allow_inference", "allow_container_execution", "allow_native_execution")
+# What an evaluator container's policy copy may carry: the permissions that existed before the native runtime.
+EVALUATOR_PERMISSIONS = PERMISSIONS[:3]
 
 
 @dataclass(frozen=True)
@@ -67,8 +69,19 @@ class SessionLock:
 
     def to_json(self) -> dict:
         """The policy as a runtime-policy.json object. `allow_native_execution` is written only when granted, so
-        the policy handed to an evaluator container built from an older wheel is exactly what it always was."""
+        a policy that never granted it reads exactly as it did before the native runtime existed."""
         data = {name: getattr(self, name) for name in PERMISSIONS}
         if not data["allow_native_execution"]:
             data.pop("allow_native_execution")
         return {**data, "reason": self.reason}
+
+    def evaluator_json(self) -> dict:
+        """The copy handed to an evaluator CONTAINER: the pre-native permissions and the reason, whatever this host
+        grants.
+
+        The evaluator only ever checks `inference` and cannot launch a host binary, so the native grant means
+        nothing inside it. It is left out even when granted because an evaluator image built from an older wheel
+        refuses any key it does not know: a policy that also authorizes metal-native on this host would otherwise
+        fail every container evaluation with exit 2 before a single request. For a policy without the native
+        grant this is exactly `to_json()`."""
+        return {**{name: getattr(self, name) for name in EVALUATOR_PERMISSIONS}, "reason": self.reason}

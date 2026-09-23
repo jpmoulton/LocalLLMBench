@@ -131,9 +131,27 @@ as on NVIDIA: the benchmark definitions, datasets, scorers, the stage machine, t
 and the reports. Model-written code still runs only in the sandboxed Docker worker, never on the Mac itself; without
 Docker the coding suites are recorded as **blocked**.
 
-Select it with `--runtime metal-native` together with the `native-bundle.json` that pins the server
-(`--native-bundle`). A candidate config says which runtime it is (`"runtime": "metal-native"`, a `native_server`
-and `native_limits`, no `inference_image`); a config that names no runtime is an NVIDIA config, unchanged.
+A config or a session states its own runtime. A candidate config says `"runtime": "metal-native"` (with a
+`native_server` and `native_limits`, no `inference_image`), a session carries it in its base config, and a config
+that names no runtime is an NVIDIA config, unchanged. `--runtime metal-native` *chooses* the runtime only where
+no config exists yet; everywhere else it is at most a check, and several commands have no such flag:
+
+| Command | `--runtime` | `--native-bundle` |
+|---|---|---|
+| `tune --model`, `scripts/sweep_models.py` | chooses; `metal-native` requires `--native-bundle` | required with `--runtime metal-native`, refused without it |
+| `prepare` | chooses what to prepare | none (prepare writes the bundle) |
+| `capabilities` | without `--config`, chooses which prepared capture to read; with it, must agree with the config | none |
+| `validate`, `plan`, `candidate` | must agree with the config, which decides | `candidate` only, optional: its pins must equal the config's |
+| `sample` | no such flag | optional: its pins must equal the config's |
+| `tune --config` | refused: the session config states its runtime | refused |
+| `resume` | no such flag | no such flag: a moved native bundle is passed as `--image-bundle` |
+| `optimize` | no such flag | no such flag |
+| `doctor` | no such flag | optional: whether the bundle's executable and libraries are still the pinned files |
+
+`candidate` and `sample` run a metal-native config without a bundle too: before the server starts, admission checks
+the config's own `native_server` pins against the files on disk (the executable and library hashes, the linkage
+proof, and the build and help the executable's own `--version` and `--help` report). A bundle adds the comparison
+with what `prepare` recorded.
 
 ### 1. Authorise native execution
 
@@ -171,8 +189,11 @@ checked **before** anything is extracted; unsafe members (absolute paths, `..`, 
 refused; the `com.apple.quarantine` attribute is removed; and the executable's own `--version` must report build
 11011, commit `aa39d7a3e`. The result is `artifacts/native-runtime/llama-b11011/` (`--output` changes the root) with
 an `install-manifest.json` recording the asset, its hash, the upstream build flags and every file's SHA-256. An
-existing install directory is reused only when its files match; it is never overwritten. Running the executable,
-even as `--version`, is native execution, so the installer needs `allow_native_execution` too.
+existing install directory is reused only when its files match; it is never overwritten, and one that holds
+anything the release does not (a model file kept beside `llama-server`, say) is refused without that file being
+read. `--download` is bounded in time as well as size: every socket read gets at most 120 s and never more than
+what is left of 30 minutes for the whole transfer, however slowly the server sends. Running the executable, even
+as `--version`, is native execution, so the installer needs `allow_native_execution` too.
 
 ### 3. Prepare: pin the executable
 
@@ -181,8 +202,12 @@ llmbench prepare --runtime metal-native \
   --llama-server artifacts/native-runtime/llama-b11011/llama-server --output artifacts/native-prep
 ```
 
-`prepare` refuses anything but macOS on Apple Silicon. It hashes the executable and every `lib*.dylib` beside it
-(the Metal backend lives in `libggml-metal`, so the executable alone would not pin what runs), checks the
+`prepare` refuses anything but macOS on Apple Silicon. It hashes the executable and every `lib*.dylib`/`lib*.so`
+beside it (the Metal backend lives in `libggml-metal`, so the executable alone would not pin what runs), plus any
+Metal shader library a build without `GGML_METAL_EMBED_LIBRARY` loads from that directory (`*.metallib`,
+`*.metal` and the `ggml-common.h`/`ggml-metal-impl.h` headers; the pinned release embeds its shaders and has
+none). It proves from the Mach-O load commands, read at the arm64 slice an arm64 process loads, that those hashed
+files are the only non-system code the executable loads (a Homebrew-style `../lib` layout is refused), checks the
 directory against its `install-manifest.json` when there is one, runs the executable **only** as `--version`,
 `--help` and `--list-devices` (with a scrubbed environment and a timeout), refuses unless a Metal (`MTL`) device is
 listed, checks that every flag the harness can pass exists in this build, and writes `native-bundle.json` last. An
@@ -248,8 +273,9 @@ llmbench doctor --native-bundle artifacts/native-prep/native-bundle.json
 
 For a Metal config `plan` prints the native server argv (the model's host path, `--host 127.0.0.1`, and a port
 placeholder; the real port is chosen when the server starts) and no Compose project. `doctor` adds a static
-runtime block: platform, total memory, whether `docker` is on the PATH, the GPU lease, and for a native bundle
-whether its executable still exists with the pinned SHA-256. None of them starts anything.
+runtime block: platform, total memory, whether `docker` is on the PATH, the GPU lease (see
+[A run that was killed](#a-run-that-was-killed)), and for a native bundle whether its executable and the library
+and shader files beside it are still exactly the pinned ones. None of them starts anything.
 
 ### 7. Tune, sweep, resume
 
@@ -267,14 +293,19 @@ llmbench candidate --config my-metal-candidate.json \
   --native-bundle artifacts/native-prep/native-bundle.json --output runs/one-candidate
 ```
 
-`--runtime metal-native` always needs `--native-bundle`, and a native bundle is never accepted without it. Without
+On `tune --model` and `scripts/sweep_models.py`, `--runtime metal-native` and `--native-bundle` go together and
+either one alone is refused. `candidate` takes the bundle alone, because its config already names the runtime,
+and `resume` needs neither: the session recorded its runtime and bundle (see the table in
+[Apple Silicon (Metal) native runtime](#apple-silicon-metal-native-runtime)). Without
 `--context-floor/--context-ceiling`, a Mac session is derived at 4096 usable input tokens (RULER's shortest
 length, so every suite can be planned); the NVIDIA defaults are unchanged. The per-item time estimates the plan
 uses were measured on the NVIDIA host, so a Mac plan multiplies them by a `planning_slowdown` of 3.0, recorded in
 `session-config.json` and printed with the plan. `candidate --native-bundle` refuses a bundle whose executable,
-library, build or help pins differ from the config's, and `resume` one whose executable, library or worker-image
-pins differ from the session's: a rebuilt server (or sandbox) is a new session. After each model the sweep
-checks that the GPU lease is released and that no process is still running the bundle's executable. A Metal
+library, build, help or worker-image pins differ from the config's, and `resume --image-bundle` (given a moved
+native bundle) one whose executable, library or worker-image pins differ from the session's: a rebuilt server (or
+sandbox) is a new session. Before its first model and after each one, a native sweep checks that the GPU lease is
+released and that no process is still running the bundle's executable, and an interrupted one names any such
+leftover before it exits; it never stops one itself. A Metal
 candidate's `runtime_revision` is prefixed `metal:`, so a CUDA and a Metal result of the same llama.cpp commit are
 never treated as the same backend.
 
@@ -341,9 +372,28 @@ pressure; the report does not claim it did).
   `limits.inference_cpus` are Docker cgroup limits a host process does not have (the admission and the watchdog
   apply instead; CPU use follows `engine.threads`/`engine.threads_batch`), and `limits.max_foreign_vram_mib` is
   NVIDIA-only (the GPU-utilisation admission replaces it).
-* **One Mac, one server at a time.** The same GPU lease as the NVIDIA runtime serialises every live run. If a run
-  was killed, `llmbench doctor` names the lease holder; for a native run it tells you to check that its
-  `llama-server` is gone (`ps -p <pid>` when the pid was recorded, else `pgrep -fl llama-server`), not `docker ps`.
+* **One Mac, one server at a time.** The same GPU lease as the NVIDIA runtime serialises every live run; see
+  [A run that was killed](#a-run-that-was-killed) for a lease left behind.
+
+### A run that was killed
+
+Every run removes the lease when it ends, Ctrl-C included, with one deliberate exception: a `candidate` or
+`sample` attempt whose cleanup could not be verified (`cleanup-uncertain`, exit code 4) keeps it, so nothing starts
+beside what it may have left. A run that was killed (SIGKILL, a closed terminal, macOS ending it under memory
+pressure) leaves the lease file behind too, and can leave its `llama-server` running, because the server has a
+process group of its own. Every later live run then refuses to start, and both that refusal and `llmbench doctor`
+name the lease's holder. Once the holder's process is gone, they say what to check before you delete the file.
+That depends on what the lease records, which depends on the command that wrote it:
+
+| Written by | Records | Check before deleting it |
+|---|---|---|
+| a session: `tune`, `resume`, each `optimize` stage, `scripts/sweep_models.py` | its pid and start time only: no runtime | both: `pgrep -fl llama-server` and `docker ps -a --filter name=llmbench-` |
+| a metal-native `candidate`, or one `sample` attempt | `native-run:<attempt>`, and the llama-server's `server_pid` once it started | `ps -p <server_pid>`, and stop it only if it is that llama-server (a pid can be reused); `pgrep -fl llama-server` if no pid was recorded |
+| an NVIDIA `candidate`, or one `sample` attempt | `container-run:<attempt>` | `docker ps -a --filter name=llmbench-` |
+
+`scripts/run_prepared_sweep.py --run` starts each entry as a `candidate`, so its lease is a candidate's, not a
+session's. While the holder's process still exists, the advice is to wait for that run or stop it first. Nothing
+ever deletes the lease for you.
 
 ### Results on a laptop
 

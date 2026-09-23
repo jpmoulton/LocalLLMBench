@@ -57,8 +57,8 @@ def _command(cmd: int, fixed: bytes, text: str) -> bytes:
 
 
 def macho(*, filetype=2, dylibs=(), rpaths=(), install_name=None, cputype=ARM64, weak=(), dylinker=None,
-          environment=()) -> bytes:
-    """A minimal 64-bit Mach-O header plus the load commands the linkage proof reads."""
+          environment=(), subtype=0) -> bytes:
+    """A minimal 64-bit Mach-O header plus the load commands the linkage proof reads (`subtype` 2 is arm64e)."""
     commands = []
     if dylinker:
         commands.append(_command(0xE, struct.pack("<I", 12), dylinker))
@@ -69,15 +69,17 @@ def macho(*, filetype=2, dylibs=(), rpaths=(), install_name=None, cputype=ARM64,
     commands += [_command(0x8000001C, struct.pack("<I", 12), path) for path in rpaths]
     commands += [_command(0x27, struct.pack("<I", 12), variable) for variable in environment]
     body = b"".join(commands)
-    header = struct.pack("<IiiIIIII", 0xFEEDFACF, cputype, 0, filetype, len(commands), len(body), 0, 0)
+    header = struct.pack("<IiIIIIII", 0xFEEDFACF, cputype, subtype, filetype, len(commands), len(body), 0, 0)
     return header + body + b"\x00" * 64
 
 
-def universal(slices: list[tuple[int, bytes]]) -> bytes:
-    """A fat (universal) binary: big-endian fat_arch table, slices aligned to 4 KiB."""
+def universal(slices: list[tuple]) -> bytes:
+    """A fat (universal) binary: big-endian fat_arch table, slices aligned to 4 KiB. A slice is (cputype, image) or
+    (cputype, subtype, image); the subtype is what the table claims, independent of the slice's own header."""
     offset, table, payload = 4096, b"", b""
-    for cputype, image in slices:
-        table += struct.pack(">iiIII", cputype, 0, offset + len(payload), len(image), 12)
+    for *kind, image in slices:
+        cputype, subtype = kind if len(kind) == 2 else (kind[0], 0)
+        table += struct.pack(">iIIII", cputype, subtype, offset + len(payload), len(image), 12)
         payload += image + b"\x00" * ((-len(image)) % 4096)
     header = struct.pack(">II", 0xCAFEBABE, len(slices)) + table
     return header + b"\x00" * (offset - len(header)) + payload
@@ -234,6 +236,50 @@ def test_hash_refuses_links_that_escape_and_executables_that_are_links(tmp_path)
 
 
 @POSIX
+@pytest.mark.parametrize("name", ["default.metallib", "ggml-metal.metal", "ggml-common.h", "ggml-metal-impl.h"])
+def test_a_metal_shader_library_beside_the_executable_is_pinned_like_a_library(tmp_path, name):
+    # a build without GGML_METAL_EMBED_LIBRARY loads (or compiles) its GPU kernels from these files at run time:
+    # rebuilding them in place must change the pin even though no dylib and not the executable changed
+    executable = release(tmp_path / "rel")
+    shader = write(executable.parent / name, b"kernels v1")
+    before = hash_native_server(executable)
+    assert before["libraries"][name] == hashlib.sha256(b"kernels v1").hexdigest()
+    shader.write_bytes(b"kernels v2")
+    after = hash_native_server(executable)
+    assert after["executable_sha256"] == before["executable_sha256"]
+    assert after["libraries_sha256"] != before["libraries_sha256"]
+    # ...and an embedded build (no such file) pins exactly the dylibs, as before
+    shader.unlink()
+    assert set(hash_native_server(executable)["libraries"]) == {
+        "libggml-metal.0.24.0.dylib", "libggml-metal.0.dylib", "libllama-cli-impl.dylib", "libllama.0.4.1.dylib",
+        "libllama.0.dylib", "libllama.dylib"}
+
+
+@POSIX
+def test_doctor_and_prepare_agree_on_a_pinned_metal_shader_library(tmp_path):
+    from llmbench.evidence_cli import native_bundle_state
+    executable = release(tmp_path / "rel")
+    shader = write(executable.parent / "default.metallib", b"kernels v1")
+    prepare(tmp_path, executable)
+    state = native_bundle_state(tmp_path / "prep" / NATIVE_BUNDLE_NAME)
+    assert state["libraries"]["default.metallib"] == "matches" and state["libraries_sha256_matches"] is True
+    shader.write_bytes(b"kernels v2")
+    state = native_bundle_state(tmp_path / "prep" / NATIVE_BUNDLE_NAME)
+    assert state["libraries"]["default.metallib"] == "differs" and state["libraries_sha256_matches"] is False
+
+
+@POSIX
+def test_a_metal_shader_library_the_install_did_not_record_is_refused(tmp_path):
+    executable = release(tmp_path / "rel")
+    install_manifest(executable)
+    write(executable.parent / "default.metallib", b"dropped in after the install")
+    server = FakeServer(executable)
+    with pytest.raises(ValueError, match="default.metallib is not part of the recorded install"):
+        prepare(tmp_path, executable, executor=server)
+    assert server.calls == []
+
+
+@POSIX
 def test_hash_refuses_a_fifo_library_without_blocking(tmp_path):
     executable = release(tmp_path / "rel")
     os.mkfifo(executable.parent / "libggml-fifo.dylib")
@@ -337,9 +383,68 @@ def test_macho_reader_selects_the_arm64_slice_and_refuses_malformed_images(tmp_p
 @pytest.mark.skipif(sys.platform != "darwin", reason="reads a real system Mach-O image")
 def test_macho_reader_reads_a_real_system_binary():
     info = read_macho_linkage("/bin/ls")  # a universal binary with an arm64(e) slice on every supported macOS
-    assert info["cpu"] == "arm64" and info["filetype"] == "execute"
+    # a platform binary ships x86_64 + arm64e: its only arm64-family slice is read, and the result says which
+    assert info["cpu"] in ("arm64", "arm64e") and info["filetype"] == "execute"
     assert "/usr/lib/libSystem.B.dylib" in info["dylibs"]
     assert info["dylinker"] == "/usr/lib/dyld" and info["environment"] == []
+
+
+ARM64E = 2
+ARM64E_PTRAUTH = 0x80000002  # arm64e with the pointer-authentication ABI capability bit, as Apple's toolchain writes it
+HOMEBREW = "/opt/homebrew/lib/libggml-metal.dylib"
+METAL_FRAMEWORK = "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"
+
+
+@pytest.mark.parametrize("arm64e_first", [True, False])
+def test_macho_reader_reads_the_arm64_slice_an_arm64_process_loads_not_the_first_arm64_type(tmp_path, arm64e_first):
+    # arm64 and arm64e share CPU_TYPE_ARM64; the arm64 process that runs llama-server loads the arm64 slice
+    arm64e = (ARM64, ARM64E_PTRAUTH, macho(filetype=6, subtype=ARM64E_PTRAUTH, dylibs=(METAL_FRAMEWORK,)))
+    arm64 = (ARM64, 0, macho(filetype=6, dylibs=(HOMEBREW,)))
+    fat = write(tmp_path / "fat", universal([arm64e, arm64] if arm64e_first else [arm64, arm64e]))
+    info = read_macho_linkage(fat)
+    assert info["cpu"] == "arm64" and info["dylibs"] == [HOMEBREW]
+
+
+@POSIX
+def test_linkage_proof_is_not_fooled_by_an_arm64e_slice_listed_before_the_arm64_one(tmp_path):
+    # the arm64e slice only loads Metal; the arm64 slice dyld really loads pulls in an unpinned Homebrew library
+    metal = universal([(ARM64, ARM64E, macho(filetype=6, subtype=ARM64E, install_name="@rpath/libggml-metal.0.dylib",
+                                             dylibs=(METAL_FRAMEWORK,))),
+                       (ARM64, 0, macho(filetype=6, install_name="@rpath/libggml-metal.0.dylib",
+                                        dylibs=(METAL_FRAMEWORK, HOMEBREW)))])
+    executable = release(tmp_path / "rel", metal=metal)
+    with pytest.raises(ValueError, match=f"libggml-metal.0.24.0.dylib loads {HOMEBREW}, which is not a hashed"):
+        check_native_linkage(executable, hash_native_server(executable)["libraries"])
+
+
+def test_an_arm64e_slice_is_read_only_when_it_is_the_only_one_and_is_reported_as_arm64e(tmp_path):
+    only = write(tmp_path / "only", universal([(X86_64, macho(cputype=X86_64)),
+                                               (ARM64, ARM64E_PTRAUTH, macho(subtype=ARM64E_PTRAUTH))]))
+    assert read_macho_linkage(only)["cpu"] == "arm64e"
+    assert read_macho_linkage(write(tmp_path / "thin", macho(subtype=ARM64E_PTRAUTH)))["cpu"] == "arm64e"
+    assert read_macho_linkage(write(tmp_path / "v8", macho(subtype=1)))["cpu"] == "arm64"  # CPU_SUBTYPE_ARM64_V8
+
+
+@pytest.mark.parametrize("slices, fragment", [
+    ([(ARM64, 0, macho()), (ARM64, 1, macho(subtype=1))], "2 arm64 slices; which one loads is ambiguous"),
+    ([(ARM64, ARM64E, macho(subtype=ARM64E)), (ARM64, ARM64E, macho(subtype=ARM64E))],
+     "2 arm64e slices and no arm64 slice"),
+    ([(ARM64, 0, macho(subtype=ARM64E))], "lists an arm64 slice whose header says arm64e"),
+    ([(ARM64, 7, macho(subtype=7))], "unknown CPU subtype 0x7"),
+])
+def test_an_ambiguous_or_inconsistent_universal_binary_is_refused(tmp_path, slices, fragment):
+    with pytest.raises(ValueError, match="universal binary|unknown CPU subtype") as caught:
+        read_macho_linkage(write(tmp_path / "fat", universal(slices)))
+    assert fragment in str(caught.value)
+
+
+@POSIX
+def test_linkage_proof_refuses_an_arm64e_executable(tmp_path):
+    # it would run only under the arm64e preview ABI, where each library's arm64e slice loads instead
+    server = macho(subtype=ARM64E, dylibs=("@rpath/libllama.0.dylib",), rpaths=("@loader_path",))
+    executable = release(tmp_path / "rel", server=server)
+    with pytest.raises(ValueError, match="llama-server is an arm64e executable; the proof covers an arm64 process"):
+        check_native_linkage(executable, hash_native_server(executable)["libraries"])
 
 
 # ------------------------------------------------------------------------------------------ NativeProcessExecutor

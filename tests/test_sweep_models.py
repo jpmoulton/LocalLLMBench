@@ -1,7 +1,14 @@
-"""The multi-model sweep driver: what it selects and how it names things. It never starts anything here."""
+"""The multi-model sweep driver: what it selects and how it names things. It never starts a model here; one test
+starts two tiny Python processes to show how a terminal interrupt reaches the session."""
 
 import importlib.util
 import json
+import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -95,21 +102,163 @@ def test_a_native_leftover_stops_the_sequence_and_is_never_killed(tmp_path, monk
     executable = tmp_path / "llama-server"
     bundle = native_bundle_file(tmp_path, executable)
     lease = tmp_path / "llmbench-gpu-resource.lock"
-    if leftover == "lease":
-        lease.write_text("{}", encoding="utf-8")
     launched, asked = [], []
-    monkeypatch.setattr(sweep_models, "run_session", lambda argv, log: launched.append(argv) or 0)
+
+    def session(argv, log):  # the first model's session is what leaves the leftover behind
+        launched.append(argv)
+        if leftover == "lease":
+            lease.write_text("{}", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(sweep_models, "run_session", session)
     monkeypatch.setattr(sweep_models, "lease_path", lambda: lease)
     monkeypatch.setattr(sweep_models, "running_servers", lambda path, processes=None: asked.append(path) or (
-        ["pid:4242"] if leftover == "server" else []))
+        ["pid:4242"] if leftover == "server" and launched else []))
     monkeypatch.setattr(sweep_models, "leaked_containers", lambda: ["llmbench-" + "0" * 32]
-                        if leftover == "container" else [])
+                        if leftover == "container" and launched else [])
     assert sweep_models.main(["--models", *map(str, models), "--output", str(tmp_path / "sweep"), "--runtime",
                               "metal-native", "--native-bundle", str(bundle)]) == 4
-    assert len(launched) == 1 and asked == [str(executable)]  # the bundle's own executable is what is looked for
+    # Looked for before the first model and after it; the bundle's own executable is what is looked for.
+    assert len(launched) == 1 and asked == [str(executable)] * 2
     err = capsys.readouterr().err
     assert "native runtime resources were left behind" in err
     assert {"lease": "GPU lease", "server": "pid:4242", "container": "llmbench-"}[leftover] in err
+
+
+@pytest.mark.parametrize("leftover", [None, "lease", "server"])
+def test_an_interrupted_native_sweep_still_checks_for_leftovers_before_it_exits(tmp_path, monkeypatch, capsys,
+                                                                                 leftover):
+    """What an interrupted session left behind is named on the way out, while the person who interrupted is still
+    looking; nothing after it is launched."""
+    models = [tmp_path / "a.gguf", tmp_path / "b.gguf"]
+    for item in models:
+        item.write_bytes(b"x")
+    executable = tmp_path / "llama-server"
+    bundle = native_bundle_file(tmp_path, executable)
+    lease = tmp_path / "llmbench-gpu-resource.lock"
+    launched, asked = [], []
+
+    def interrupted(argv, log):  # the interrupted session is what leaves the leftover behind
+        launched.append(argv)
+        if leftover == "lease":
+            lease.write_text("{}", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sweep_models, "run_session", interrupted)
+    monkeypatch.setattr(sweep_models, "lease_path", lambda: lease)
+    monkeypatch.setattr(sweep_models, "running_servers", lambda path, processes=None: asked.append(path) or (
+        ["pid:4242"] if leftover == "server" and launched else []))
+    monkeypatch.setattr(sweep_models, "leaked_containers", lambda: [])
+    assert sweep_models.main(["--models", *map(str, models), "--output", str(tmp_path / "sweep"), "--runtime",
+                              "metal-native", "--native-bundle", str(bundle)]) == 130
+    # Looked for before the first model and after the interrupt; nothing after it was launched.
+    assert len(launched) == 1 and asked == [str(executable)] * 2
+    err = capsys.readouterr().err
+    if leftover is None:
+        assert "no native runtime resources were left behind" in err
+    else:
+        assert "native runtime resources are still present" in err
+        assert {"lease": "GPU lease", "server": "pid:4242"}[leftover] in err
+
+
+@pytest.mark.parametrize("leftover", ["lease", "server", "container"])
+def test_a_native_rerun_never_starts_its_first_model_beside_a_leftover(tmp_path, monkeypatch, capsys, leftover):
+    """A re-run skips the model an interrupted or killed run left and would start the next one at once. An idle
+    orphaned llama-server that still holds its weights passes the session's lock check and native admission alike,
+    so the sweep itself looks before its first model, and only looks: nothing is stopped or removed from here."""
+    models = [tmp_path / "a.gguf", tmp_path / "b.gguf"]
+    for item in models:
+        item.write_bytes(b"x")
+    executable = tmp_path / "llama-server"
+    bundle = native_bundle_file(tmp_path, executable)
+    output = tmp_path / "sweep"
+    (output / "a" / "run").mkdir(parents=True)  # the model the earlier run was interrupted in
+    lease = tmp_path / "llmbench-gpu-resource.lock"
+    if leftover == "lease":
+        lease.write_text("{}", encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(sweep_models, "run_session", lambda argv, log: launched.append(argv) or 0)
+    monkeypatch.setattr(sweep_models, "lease_path", lambda: lease)
+    monkeypatch.setattr(sweep_models, "running_servers", lambda path, processes=None: (
+        ["pid:4242"] if leftover == "server" else []))
+    monkeypatch.setattr(sweep_models, "leaked_containers", lambda: ["llmbench-" + "0" * 32]
+                        if leftover == "container" else [])
+    assert sweep_models.main(["--models", *map(str, models), "--output", str(output), "--runtime", "metal-native",
+                              "--native-bundle", str(bundle)]) == 4
+    assert launched == [] and not (output / "b").exists()
+    err = capsys.readouterr().err
+    assert "stopping before b: native runtime resources are already present" in err
+    assert {"lease": "GPU lease", "server": "pid:4242", "container": "llmbench-"}[leftover] in err
+    assert lease.exists() == (leftover == "lease")  # read-only: the lease is reported, never removed
+
+
+def test_an_interrupted_nvidia_sweep_exits_exactly_as_before(tmp_path, monkeypatch, capsys):
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"x")
+
+    def interrupted(argv, log):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sweep_models, "run_session", interrupted)
+    monkeypatch.setattr(sweep_models, "native_leftovers", lambda executable: pytest.fail("NVIDIA path changed"))
+    monkeypatch.setattr(sweep_models, "leaked_containers", lambda: pytest.fail("NVIDIA path changed"))
+    assert sweep_models.main(["--models", str(model), "--output", str(tmp_path / "sweep")]) == 130
+    assert capsys.readouterr().err == ""
+
+
+SESSION = textwrap.dedent("""
+    import pathlib, signal, sys, time
+    record, received = pathlib.Path(sys.argv[1]), []
+
+    def interrupted(signum, frame):
+        received.append(signum)
+        record.write_text(str(len(received)))
+
+    signal.signal(signal.SIGINT, interrupted)
+    record.with_name("ready").write_text("")
+    deadline = time.monotonic() + 20
+    while not received and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(1.5)  # the session's cleanup: far longer than the 0.25 s Popen.wait grants before a re-send
+""")
+
+SWEEP = textwrap.dedent("""
+    import importlib.util, pathlib, signal, sys
+    # A terminal's foreground job raises KeyboardInterrupt on SIGINT. Python only installs that handler when SIGINT
+    # is not ignored, and a test run started in the background (``pytest &``, nohup) passes on an ignored SIGINT.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    spec = importlib.util.spec_from_file_location("sweep_models", sys.argv[1])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.run_session([sys.executable, sys.argv[2], sys.argv[3]], pathlib.Path(sys.argv[4]))
+    except KeyboardInterrupt:
+        sys.exit(130)
+""")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX terminal process groups")
+def test_a_terminal_ctrl_c_reaches_the_session_exactly_once(tmp_path):
+    """A terminal Ctrl-C signals its whole foreground process group. The session must get only the interrupt the
+    sweep forwards: had it also received the terminal's, the forwarded one would land inside its cleanup."""
+    (tmp_path / "session.py").write_text(SESSION, encoding="utf-8")
+    (tmp_path / "sweep.py").write_text(SWEEP, encoding="utf-8")
+    record = tmp_path / "interrupts"
+    # The sweep leads a process group of its own, as a shell's foreground job does; os.killpg below is the Ctrl-C.
+    sweep = subprocess.Popen([sys.executable, str(tmp_path / "sweep.py"), str(SCRIPT), str(tmp_path / "session.py"),
+                              str(record), str(tmp_path / "tune.log")], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 20
+        while not (tmp_path / "ready").exists():
+            assert sweep.poll() is None and time.monotonic() < deadline, "the session never started"
+            time.sleep(0.02)
+        os.killpg(sweep.pid, signal.SIGINT)
+        assert sweep.wait(timeout=30) == 130
+    finally:
+        if sweep.poll() is None:
+            sweep.kill()
+            sweep.wait()
+    assert record.read_text() == "1"
 
 
 def test_contradictory_runtime_flags_are_refused_before_any_model_starts(tmp_path, monkeypatch):

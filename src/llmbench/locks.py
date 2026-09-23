@@ -53,13 +53,21 @@ def _native_holder(holder: dict) -> tuple[bool, int | None]:
 
     A native run's leftover is a host process, not a container, so pointing at ``docker ps`` would send the reader
     to the wrong place. The holder says so itself: ``runtime: "metal-native"``, or the ``native-run:`` owner the
-    native runner's lease is written with. Lock files written before runtimes existed carry neither and are
-    described exactly as before.
+    native runner's lease is written with (which also records ``server_pid`` once the server has started).
     """
     owner = holder.get("owner")
     native = holder.get("runtime") == "metal-native" or (isinstance(owner, str) and owner.startswith("native-run:"))
     server = holder.get("server_pid")
     return native, server if native and type(server) is int and server > 0 else None
+
+
+def _container_holder(holder: dict) -> bool:
+    """Whether the holder says it is a container run: the container runner's lease owner (``container-run`` or
+    ``container-run:<attempt>``, the shape every lease had before runtimes existed) or ``runtime:
+    "nvidia-container"``. Those texts are unchanged."""
+    owner = holder.get("owner")
+    return holder.get("runtime") == "nvidia-container" or (
+        isinstance(owner, str) and (owner == "container-run" or owner.startswith("container-run:")))
 
 
 def _native_leftover(server_pid: int | None) -> str:
@@ -108,9 +116,17 @@ def describe_lock(path: str | Path) -> str:
     since = f", created {holder['created']}" if isinstance(holder.get("created"), str) else ""
     native, server_pid = _native_holder(holder)
     if alive is False:
-        leftover = (_native_leftover(server_pid) if native else
-                    "Check that no container was left behind (`docker ps -a --filter name=llmbench-`), then delete "
-                    "the file")
+        if native:
+            leftover = _native_leftover(server_pid)
+        elif _container_holder(holder):
+            leftover = ("Check that no container was left behind (`docker ps -a --filter name=llmbench-`), then "
+                        "delete the file")
+        else:
+            # A holder that names no runtime -- the campaign lock `tune`, `resume` and the sweeps take records only
+            # its pid -- may have run either one, so neither leftover is assumed and neither is left out.
+            leftover = ("It names no runtime, so check both: that no container was left behind (`docker ps -a "
+                        "--filter name=llmbench-`) and that no llama-server it started is still running (`pgrep -fl "
+                        "llama-server`), then delete the file")
         return f"{target} is held by {who}{since}, which is no longer running: the lock is stale. {leftover}"
     state = "is still running" if alive else "could not be checked"
     server = f"; its llama-server is pid {server_pid}" if server_pid is not None else ""

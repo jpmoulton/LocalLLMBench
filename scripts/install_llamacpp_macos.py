@@ -48,7 +48,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llmbench.config import RunMode  # noqa: E402
 from llmbench.containers.capabilities import parse_version  # noqa: E402
-from llmbench.containers.native_prep import INSTALL_MANIFEST, NativeProcessExecutor  # noqa: E402
+# _sha256_file: native preparation's own hash (no-follow, regular files only, 1 MiB blocks), so the installer
+# and `llmbench prepare` read an install directory the same way.
+from llmbench.containers.native_prep import INSTALL_MANIFEST, NativeProcessExecutor, _sha256_file  # noqa: E402
 from llmbench.safety import OperationForbidden, SessionLock  # noqa: E402
 
 # The pin. Values are the release asset as published and the upstream job that built it; changing any of them is a
@@ -88,6 +90,7 @@ VERSION_TIMEOUT_SECONDS = 60
 # indefinitely while every single read stays inside the per-read timeout. 11 MB in 30 minutes is ~6 KB/s.
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_DEADLINE_SECONDS = 1800
+DOWNLOAD_BLOCK_BYTES = 1024 * 1024
 VERSION_LINE = re.compile(r"version: \S+ \(build \d+, commit [0-9a-f]+\)")  # capabilities.parse_version's match
 
 
@@ -148,26 +151,84 @@ def read_archive(path: Path, pin: ReleasePin) -> bytes:
     return data
 
 
+class DownloadDeadline:
+    """One download's wall-clock deadline, enforced as the socket timeout of every read.
+
+    A per-read socket timeout alone bounds nothing: a server that sends one byte just inside it, again and again,
+    never trips it, and one buffered `read(n)` of an HTTP response keeps receiving until it has n bytes, so a
+    deadline checked between such reads can be overrun by as long as the server likes. Here every read on every TLS
+    connection the download opens (the handshake, the status line and headers of a redirect and of the asset, the
+    chunk framing, each body read) first sets its socket's timeout to what is left of the deadline, capped at the
+    per-operation `timeout`, and fails with `TimeoutError` once nothing is left. A TCP connect is not a read: it
+    has the per-operation timeout, and name resolution has none of its own.
+    """
+
+    def __init__(self, seconds: float, timeout: float, clock: Callable[[], float]) -> None:
+        self.seconds, self.timeout, self.clock = seconds, timeout, clock
+        self.at = clock() + seconds
+
+    def remaining(self) -> float:
+        """The timeout the next socket operation gets; `TimeoutError` once the deadline has passed."""
+        left = self.at - self.clock()
+        if left <= 0:
+            raise TimeoutError(f"the download did not finish within {self.seconds:g} s")
+        return min(self.timeout, left)
+
+    def arm(self, sock) -> None:
+        sock.settimeout(self.remaining())
+
+    def context(self):
+        """The default certificate- and hostname-verifying TLS context, whose sockets arm themselves before every
+        read and handshake. `SSLSocket.recv`, `recv_into` (what an HTTP response's buffered reader calls) and
+        `read` all read through `read`."""
+        import ssl
+        deadline = self
+
+        class DeadlineSocket(ssl.SSLSocket):
+            def do_handshake(self, *args, **kwargs):
+                deadline.arm(self)
+                return super().do_handshake(*args, **kwargs)
+
+            def read(self, *args, **kwargs):
+                deadline.arm(self)
+                return super().read(*args, **kwargs)
+
+        context = ssl.create_default_context()
+        context.sslsocket_class = DeadlineSocket  # this context only; the ssl module's default is untouched
+        return context
+
+
 def fetch_url(url: str, max_bytes: int, *, timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
               deadline_seconds: float = DOWNLOAD_DEADLINE_SECONDS, clock: Callable[[], float] = time.monotonic,
               opener=None) -> bytes:
     """HTTPS download bounded to `max_bytes` (one byte more is an error), `timeout` per socket operation and
-    `deadline_seconds` in total. Only ever called for --download. `opener` (urlopen-like) is for tests."""
+    `deadline_seconds` in total (`DownloadDeadline`). The body is read with `read1`, one socket read per call, and
+    the deadline is checked before each. Only ever called for --download. `opener` (urlopen-like, given `timeout`
+    and `context`) is for tests."""
     import urllib.request
     if not url.startswith("https://"):
         raise ValueError(f"refusing a non-HTTPS download URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "llmbench-install-llamacpp"})
-    chunks, total, deadline = [], 0, clock() + deadline_seconds
-    with (opener or urllib.request.urlopen)(request, timeout=timeout) as response:  # noqa: S310 - https above
-        if not str(response.geturl()).startswith("https://"):
-            raise ValueError(f"the download was redirected off HTTPS: {response.geturl()}")
-        while block := response.read(1024 * 1024):
-            total += len(block)
-            if total > max_bytes:
-                raise ValueError(f"the download exceeds the pinned {max_bytes} bytes")
-            if clock() > deadline:
-                raise ValueError(f"the download did not finish within {deadline_seconds:g} s ({total} bytes read)")
-            chunks.append(block)
+    deadline = DownloadDeadline(deadline_seconds, timeout, clock)
+    chunks, total = [], 0
+    try:
+        with (opener or urllib.request.urlopen)(request, timeout=deadline.remaining(),  # noqa: S310 - https above
+                                                context=deadline.context()) as response:
+            if not str(response.geturl()).startswith("https://"):
+                raise ValueError(f"the download was redirected off HTTPS: {response.geturl()}")
+            while True:
+                deadline.remaining()
+                block = response.read1(DOWNLOAD_BLOCK_BYTES)
+                if not block:
+                    break
+                total += len(block)
+                if total > max_bytes:
+                    raise ValueError(f"the download exceeds the pinned {max_bytes} bytes")
+                chunks.append(block)
+    except OSError as exc:  # TimeoutError, or urllib's URLError around one: past the deadline, say that
+        if clock() >= deadline.at:
+            raise ValueError(f"the download did not finish within {deadline_seconds:g} s ({total} bytes read)") from exc
+        raise
     return b"".join(chunks)
 
 
@@ -272,27 +333,76 @@ def archive_contents(archive: tarfile.TarFile, members: list[tarfile.TarInfo], p
     return {"files": files, "links": links, "directories": sorted(directories)}
 
 
-def tree_contents(directory: Path) -> dict:
-    """The same shape as `archive_contents`, read from disk without following links; the install manifest at
-    the top level is the installer's own addition and is left out."""
-    files, links, directories = {}, {}, []
-    for root, dirnames, filenames in os.walk(directory):
+class TreeTooLarge(ValueError):
+    """A directory holds more than any archive `validated_members` accepts, so it cannot be that release."""
+
+
+def _raise(error: OSError) -> None:
+    raise error  # os.walk skips a directory it cannot list unless told otherwise; a skipped one is not "equal"
+
+
+def _tree_entries(directory: Path) -> tuple[dict[str, int], dict[str, str], list[str]]:
+    """({relative file: size}, {relative link: target}, [relative directories]) from `lstat` alone: no link is
+    followed and no file is opened. The install manifest at the top level is the installer's own addition and is
+    left out.
+
+    Bounded like the archive: more than MAX_MEMBERS entries, or more than MAX_UNPACKED_BYTES in regular files, is
+    `TreeTooLarge` as soon as the walk sees it, before any file is read. A multi-GB model kept in an install
+    directory is therefore refused by its size, not loaded into memory to be hashed.
+    """
+    sizes, links, directories, total = {}, {}, [], 0
+    for root, dirnames, filenames in os.walk(directory, onerror=_raise):
         base = Path(root)
         for name in sorted(dirnames + filenames):
             path = base / name
             relative = path.relative_to(directory).as_posix()
             if relative == INSTALL_MANIFEST:
                 continue
-            mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            if len(sizes) + len(links) + len(directories) >= MAX_MEMBERS:
+                raise TreeTooLarge(f"{directory} holds more than {MAX_MEMBERS} entries")
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
                 links[relative] = os.readlink(path)
-            elif stat.S_ISDIR(mode):
+            elif stat.S_ISDIR(info.st_mode):
                 directories.append(relative)
-            elif stat.S_ISREG(mode):
-                files[relative] = _sha256(path.read_bytes())
+            elif stat.S_ISREG(info.st_mode):
+                total += info.st_size
+                if total > MAX_UNPACKED_BYTES:
+                    raise TreeTooLarge(f"{directory} holds more than {MAX_UNPACKED_BYTES} bytes of files")
+                sizes[relative] = info.st_size
             else:
                 raise ValueError(f"{path} is not a regular file, directory or link")
-    return {"files": files, "links": links, "directories": sorted(directories)}
+    return sizes, links, sorted(directories)
+
+
+def _hash_files(directory: Path, names) -> dict[str, str]:
+    """Each file streamed through native preparation's reader: opened without following a link or blocking on a
+    FIFO, refused unless it is still a regular file, hashed in 1 MiB blocks. Memory stays bounded whatever the
+    file is."""
+    return {relative: _sha256_file(directory / relative) for relative in names}
+
+
+def tree_contents(directory: Path) -> dict:
+    """The same shape as `archive_contents`, read from disk without following links (`_tree_entries`, then
+    `_hash_files`)."""
+    sizes, links, directories = _tree_entries(directory)
+    return {"files": _hash_files(directory, sizes), "links": links, "directories": directories}
+
+
+def same_tree(directory: Path, contents: dict) -> bool:
+    """Whether an existing install directory is exactly `contents` (from `archive_contents`).
+
+    The shape is compared first, from `lstat` alone: file names, link targets and directories. A file is hashed
+    only once every name matched, so a directory that also holds something the release does not (a model kept
+    beside llama-server, say) is refused without a byte of it being read, as is one too large to be the release.
+    """
+    try:
+        sizes, links, directories = _tree_entries(directory)
+    except TreeTooLarge:
+        return False
+    if set(sizes) != set(contents["files"]) or links != contents["links"] or directories != contents["directories"]:
+        return False
+    return _hash_files(directory, sizes) == contents["files"]
 
 
 def remove_quarantine(directory: Path, *, runner=subprocess.run) -> list[str]:
@@ -387,7 +497,7 @@ def install(archive_bytes: bytes, output: Path, *, pin: ReleasePin, executor_fac
         if reused:
             if target.is_symlink() or not target.is_dir():
                 raise ValueError(f"{target} exists and is not a directory")
-            if tree_contents(target) != contents:
+            if not same_tree(target, contents):
                 raise ValueError(f"{target} exists and differs from the pinned {pin.asset}; remove it or choose "
                                  "another --output (an install is never overwritten)")
             manifest_path, version, removed = _finish(target, pin, contents, executor_factory=executor_factory,

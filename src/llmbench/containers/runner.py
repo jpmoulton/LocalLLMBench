@@ -289,13 +289,18 @@ class _Attempt:
                 self.reasons.extend(self.deferred_reasons)
             finally:
                 # Owned resources must be reconciled even when a dependency exits the interpreter or cancels.
+                before = self.cleanup  # whatever was set before this stage proves nothing the stage did
                 try:
                     self._stage("cleanup", self._cleanup)
                 except BaseException as exc:
                     if not isinstance(exc, Exception):
                         interrupted = exc
-                    self.cleanup = self.cleanup.model_copy(update={
-                        "verified": False, "error": f"{type(exc).__name__}: {exc}"})
+                    if self._keeps_proven_cleanup(exc, before):
+                        self._fail("cancelled", f"{type(exc).__name__} during cleanup, after owned-resource "
+                                                f"absence was proven: {exc}")
+                    else:
+                        self.cleanup = self.cleanup.model_copy(update={
+                            "verified": False, "error": self._cleanup_error_after(exc, before)})
                 if not self.cleanup.verified:
                     self.state, self.failure_stage = "cleanup-uncertain", "cleanup"
                     self.reasons.append("owned_resource_absence_unverified: " + (self.cleanup.error or "unknown"))
@@ -423,7 +428,8 @@ class _Attempt:
             "environment": {}, "project": self.plan.project_name, "labels": dict(self.plan.labels)})
         if self.container_mode:
             config_bytes = (canonical_json(self.config.model_dump(mode="json")) + "\n").encode("utf-8")
-            policy_bytes = (canonical_json(self._lock().to_json()) + "\n").encode("utf-8")
+            # Never the native grant: the evaluator does not need it and an older evaluator image refuses it.
+            policy_bytes = (canonical_json(self._lock().evaluator_json()) + "\n").encode("utf-8")
             self.artifacts.write("plan/evaluator-config.json", config_bytes)
             self.artifacts.write("plan/runtime-policy.json", policy_bytes)
             self.artifacts.write_json("plan/evaluator-grant.json", self.grant.model_dump(mode="json"))
@@ -811,6 +817,34 @@ class _Attempt:
                                                        "telemetry": self._telemetry(deadline)})
         except Exception as exc:
             self.warnings.append(f"cleanup_telemetry_unavailable: {type(exc).__name__}: {exc}")
+
+    # An interruption (not an error) that reaches the cleanup stage after this attempt's cleanup already recorded
+    # verified absence leaves that evidence standing when this is True, and an unverified one keeps its own reason
+    # (`_cleanup_error_after`). The container runtime keeps its original rule -- anything escaping cleanup makes it
+    # uncertain, with that exception as the reason -- so its results stay exactly what they were.
+    KEEPS_PROVEN_CLEANUP_ON_INTERRUPT = False
+
+    def _keeps_proven_cleanup(self, exc: BaseException, before: CleanupEvidence) -> bool:
+        """Whether `exc`, escaping the cleanup stage, arrived after this stage had already recorded verified absence.
+
+        Only evidence the stage itself recorded counts: `before` is what `self.cleanup` held when the stage began (the
+        constructor's placeholder, which proves nothing). A later interrupt cannot un-stop a server whose absence was
+        already shown, so discarding that proof would retain the lease and block a resume for nothing; an interrupt
+        that arrives before the proof exists still leaves the cleanup uncertain."""
+        return (self.KEEPS_PROVEN_CLEANUP_ON_INTERRUPT and not isinstance(exc, Exception)
+                and self.cleanup is not before and self.cleanup.verified)
+
+    def _cleanup_error_after(self, exc: BaseException, before: CleanupEvidence) -> str:
+        """The error an uncertain cleanup records when `exc` escaped the stage.
+
+        The container runtime records `exc` alone, as it always has. Where an interrupt is held until the absence
+        proof is recorded (the same flag), a proof that failed on its own -- a process or the port still there --
+        already says why, and what escaped after it did not cause that: the stage's own reason comes first and `exc`
+        after it, so a Ctrl-C never replaces the evidence of what is still running."""
+        error = f"{type(exc).__name__}: {exc}"
+        if self.KEEPS_PROVEN_CLEANUP_ON_INTERRUPT and self.cleanup is not before and self.cleanup.error:
+            return f"{self.cleanup.error}; then {error}"
+        return error
 
     def _cancel_broker(self) -> str | None:
         """Broker workers are owned resources too: unverified cancellation makes the whole cleanup uncertain."""

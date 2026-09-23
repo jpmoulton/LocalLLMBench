@@ -583,6 +583,71 @@ def test_watchdog_sample_errors_are_bounded_and_deduplicated(no_kill):
     assert summary["errors"][0] == "gpu: TimeoutExpired 0" and summary["errors_dropped"] == 20
 
 
+AC = {"power_source": "ac", "power_source_label": "AC Power", "battery_percent": 100, "charging": False}
+
+
+def battery(percent):
+    return {"power_source": "battery", "power_source_label": "Battery Power", "battery_percent": percent,
+            "charging": False}
+
+
+def test_watchdog_records_every_change_of_power_source(no_kill):
+    """Loaded on AC, unplugged mid-evaluation, plugged back in: the one after-load reading says AC, and only the
+    watchdog's readings show the evaluation ran partly on battery."""
+    powers = [AC, AC, battery(90), None, battery(85), AC]  # None: that sample's pmset probe failed
+    dog = MemoryWatchdog(42, interval=1.0, limits=NativeLimits(), on_violation=lambda reason: None,
+                         baseline=unified(),  # on battery at admission; the baseline is not a watchdog reading
+                         sampler=Sequence(*[watched(100, t=float(index + 1)) | {"power": power}
+                                            for index, power in enumerate(powers)]))
+    for _ in powers:
+        dog.sample_once()
+    summary = dog.stop()
+    assert summary["power_readings"] == 5 and summary["power_first"] == AC and summary["power_last"] == AC
+    assert summary["power_sources_seen"] == ["ac", "battery"]
+    # A failed probe is no reading: the change is dated by the first sample that showed it, and none is invented.
+    assert [(item["from"], item["to"], item["monotonic_seconds"]) for item in summary["power_changes"]] == [
+        ("ac", "battery", 3.0), ("battery", "ac", 6.0)]
+    assert summary["power_changes"][0]["reading"] == battery(90)
+    assert summary["min_battery_percent_on_battery"] == 85 and summary["power_changes_dropped"] == 0
+    json.dumps(summary, allow_nan=False)
+
+
+def test_watchdog_power_on_one_source_records_no_change_and_no_reading_records_nothing(no_kill):
+    steady = MemoryWatchdog(42, interval=1.0, limits=NativeLimits(), on_violation=lambda reason: None,
+                            sampler=Sequence(watched(100, t=1.0), watched(100, t=2.0) | {"power": battery(70)}))
+    steady.sample_once()
+    steady.sample_once()
+    summary = steady.summary()
+    assert summary["power_changes"] == [] and summary["power_sources_seen"] == ["battery"]
+    assert summary["min_battery_percent_on_battery"] == 70  # battery percentages are not sources
+    # A low charge read while plugged in is not a battery reading: only readings ON battery set the minimum.
+    charging = MemoryWatchdog(42, interval=1.0, limits=NativeLimits(), on_violation=lambda reason: None,
+                              sampler=Sequence(watched(100, t=1.0) | {"power": {**AC, "battery_percent": 20,
+                                                                                "charging": True}},
+                                               watched(100, t=2.0) | {"power": battery(70)}))
+    charging.sample_once()
+    charging.sample_once()
+    assert charging.summary()["min_battery_percent_on_battery"] == 70
+    blind = MemoryWatchdog(42, interval=1.0, limits=NativeLimits(), on_violation=lambda reason: None,
+                           sampler=Sequence(watched(100) | {"power": None}))
+    blind.sample_once()
+    summary = blind.summary()
+    assert (summary["power_readings"], summary["power_first"], summary["power_sources_seen"]) == (0, None, [])
+    assert summary["min_battery_percent_on_battery"] is None
+
+
+def test_watchdog_power_changes_are_bounded_and_the_rest_counted(no_kill):
+    samples = [watched(100, t=float(index)) | {"power": AC if index % 2 == 0 else battery(50)}
+               for index in range(apple.MAX_POWER_CHANGES + 4)]
+    dog = MemoryWatchdog(42, interval=1.0, limits=NativeLimits(), on_violation=lambda reason: None,
+                         sampler=Sequence(*samples))
+    for _ in samples:
+        dog.sample_once()
+    summary = dog.summary()
+    assert len(summary["power_changes"]) == apple.MAX_POWER_CHANGES and summary["power_changes_dropped"] == 3
+    assert summary["power_last"] == battery(50) and summary["power_readings"] == len(samples)
+
+
 def test_watchdog_thread_samples_until_stopped(no_kill):
     sampled = threading.Event()
     sampler = Sequence(watched(100))

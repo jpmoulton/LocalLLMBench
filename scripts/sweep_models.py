@@ -7,6 +7,8 @@ share one), strictly sequential because they share a GPU. Works the same on Linu
 
 Interrupting this script forwards the interrupt to the running session and WAITS for it: the session removes its
 own containers on the way out. Killing the session outright is what leaks a container that keeps holding VRAM.
+On macOS and Linux the session runs in a session of its own, so a Ctrl-C at the terminal reaches only this script,
+which forwards exactly one interrupt: a second one would land inside the session's cleanup and cut it short.
 
 On an Apple Silicon Mac the same sweep runs the pinned native llama-server instead:
 
@@ -16,7 +18,9 @@ On an Apple Silicon Mac the same sweep runs the pinned native llama-server inste
 After every model the sweep checks that nothing was left behind before the next one is measured beside it:
 llmbench-owned containers for NVIDIA; for the native runtime, the shared GPU lease file and any running process
 whose executable is the bundle's llama-server (plus sandbox worker containers when Docker can be asked). The
-checks only read; a leftover stops the sweep for a human to look at, it is never killed from here.
+checks only read; a leftover stops the sweep for a human to look at, it is never killed from here. A native sweep
+also checks before its first model, so a re-run never starts beside what an interrupted or killed run left behind,
+and an interrupted native sweep checks before it exits, so such a leftover is named at once.
 """
 
 from __future__ import annotations
@@ -123,6 +127,23 @@ def native_leftovers(executable: str) -> list[str]:
     return found + leaked_containers()
 
 
+def interrupted_leftovers(executable: str) -> list[str]:
+    """After an interrupt, name what the native session still holds before the sweep exits. Read-only, as always.
+
+    Neither the session's lock check nor native admission notices an idle llama-server that still holds its
+    weights. A re-run's own check before its first model refuses to start beside one; this names it now, while the
+    person who interrupted is still looking. The session may still be stopping (it was left running if it
+    outlived the cleanup wait).
+    """
+    leaked = native_leftovers(executable)
+    if leaked:
+        print("interrupted: native runtime resources are still present; nothing here stops them, so make sure they "
+              "are gone before running the sweep again: " + ", ".join(leaked), file=sys.stderr)
+    else:
+        print("interrupted: no native runtime resources were left behind", file=sys.stderr)
+    return leaked
+
+
 def _runtime_arguments(args, parser) -> str | None:
     """The native bundle's executable for a metal-native sweep, None for NVIDIA; contradictions are refused the way
     ``llmbench tune`` refuses them, before any model is started."""
@@ -143,8 +164,16 @@ def _runtime_arguments(args, parser) -> str | None:
 
 
 def run_session(argv: list[str], log: Path) -> int:
-    """Run one session to completion. An interrupt is forwarded so the session can clean up after itself."""
-    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    """Run one session to completion. An interrupt is forwarded so the session can clean up after itself.
+
+    The forwarded interrupt must be the only one the session gets. A child left in this script's process group
+    also receives the terminal's own SIGINT; ``Popen.wait`` then gives it 0.25 s before this script sees the
+    interrupt and sends another, which lands inside the session's cleanup (the native llama-server stop and its
+    absence proof) and leaves that cleanup skipped or unverified. So on POSIX the child starts in a session of its
+    own, out of reach of the terminal's signals; on Windows ``CREATE_NEW_PROCESS_GROUP`` already keeps Ctrl-C away.
+    """
+    options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+               else {"start_new_session": True})
     with log.open("wb") as stream:
         child = subprocess.Popen(argv, cwd=str(ROOT), stdout=stream, stderr=subprocess.STDOUT, **options)
         try:
@@ -188,12 +217,23 @@ def main(argv=None) -> int:
     (output / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
 
     outcomes = []
+    # A native sweep also looks before its first model. A re-run skips the model an interrupted or killed run left
+    # and would start the next one beside that run's llama-server, which no session lock or admission check sees.
+    # The NVIDIA sweep checks after each model only, exactly as before.
+    look_first = executable is not None
     for slug, meta in index.items():
         run_dir = output / slug / "run"
         if run_dir.exists():
             print(f"{slug}: {run_dir} exists; skipped (use `llmbench resume --output` to continue it)")
             outcomes.append({"model": slug, "exit": None, "skipped": True})
             continue
+        if look_first:
+            look_first = False
+            leaked = native_leftovers(executable)
+            if leaked:  # the same read-only check as after a model: nothing here stops them
+                print(f"stopping before {slug}: native runtime resources are already present: " + ", ".join(leaked),
+                      file=sys.stderr)
+                return 4
         run_dir.parent.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, "-B", str(ROOT / "run.py"), "tune", "--model", meta["model"], "--output",
                    str(run_dir), "--budget-seconds", str(args.budget_seconds), "--policy", args.policy]
@@ -208,6 +248,8 @@ def main(argv=None) -> int:
         try:
             code = run_session(command, run_dir.parent / "tune.log")
         except KeyboardInterrupt:
+            if executable is not None:
+                interrupted_leftovers(executable)
             return 130
         minutes = round((time.monotonic() - started) / 60, 1)
         print(f"{slug}: exit {code} after {minutes} min", flush=True)
