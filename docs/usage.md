@@ -258,9 +258,10 @@ selected, and the base config's `broker` is dropped. Starting Colima later does 
 into a new directory. To actually run the coding suites, also give `tune` a base config with a `broker` block
 (copy `examples/candidate-coding.json`, point `worker_image` at the arm64 image, pass it with `--base-config`). A
 candidate whose config carries a broker probes the sandbox again before evaluating; if it has gone away, the coding
-rows are recorded as `environment_error` with reason `sandbox_unavailable: ...`; the candidate, session,
-cross-model and coding reports print the category as `blocked`, never as a score of zero (the rows still count as
-failures in the denominator, so such a candidate cannot meet a coding floor).
+rows are recorded as `environment_error` with reason `sandbox_unavailable: ...`; they never enter a score, and
+the candidate, session, campaign, cross-model and coding reports print the category as `blocked`, never as a score
+of zero. The session's campaign analysis still counts them as failures when it judges eligibility (a known gap,
+see [benchmarks.md](benchmarks.md)), so keep the sandbox running for the whole session.
 
 ### 6. Check before running (free)
 

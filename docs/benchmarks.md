@@ -20,9 +20,12 @@ EvalPlus, Aider Polyglot and the `coding` fixtures execute generated code, which
 worker container. When that sandbox is unavailable (a Mac without Docker, for example) they are never run on the
 host instead. A plan that already knows it lists them as `blocked` with the reason and does not select them; a
 candidate whose sandbox probe fails at run time records their rows as `environment_error` with a
-`sandbox_unavailable: <reason>` reason. Those rows stay in the denominator like every other failure (so the
-candidate cannot meet a `minimum_coding_score` above zero), but the candidate, session, cross-model and coding
-reports print the category as `blocked`, never as a coding score of zero.
+`sandbox_unavailable: <reason>` reason. Those rows never enter a score: the candidate result, the candidate,
+session, campaign, cross-model and coding reports and the sampling report leave them out of the category and print
+it as `blocked` (unmeasured), never as a coding score of zero. One known gap: the campaign analysis behind a
+session's eligibility (`controller`/`analysis`) still counts such rows as failures, so a candidate whose sandbox
+disappeared mid-session cannot meet a coding floor there. Derived sessions never select blocked suites, so this
+only arises when Docker goes away during a run.
 
 ## Where this differs from upstream, on purpose
 
