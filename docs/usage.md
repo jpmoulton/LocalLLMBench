@@ -405,28 +405,13 @@ on battery or under memory pressure should be read as such. Swap growth is host-
 application. Compare Mac results with Mac results measured the same way; a Mac tok/s and an NVIDIA tok/s measure
 different hardware, and a unified-memory footprint is never a VRAM figure.
 
-On September 23, 2026, a MacBook Pro (M1, 8 GB unified memory, macOS 14.2.1, AC power) ran the pinned llama.cpp
-`b11011` Metal server with two Q4_K_M GGUFs. The local run is at `runs/mac/sweep-main/` (ignored by Git); these
-figures are from its cross-model report. Each model completed four candidates: baseline, q8_0 KV, q4_0 KV and
-reasoning on. Each completed candidate received 24 tool-calling and 8 retrieval items, plus three speed probes.
-
-| Model | GGUF SHA-256 | Baseline tok/s | Fastest measured tok/s | Baseline server footprint | BFCL baseline | RULER baseline |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3-1.7B Q4_K_M | `b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897` | 27.2 | 28.1 (q8_0 KV) | 1902 MiB | 0.708 | 0.250 |
-| Qwen3.5-2B Q4_K_M | `aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223` | 29.3 | 30.7 (reasoning on) | 1815 MiB | 0.500 | 0.750 |
-
-The server footprint includes Metal allocations in unified memory. The sweep did not validate a preset: the
-default 50 tok/s floor exceeded every measured speed, the item counts could not establish close quality
-differences, and no holdout passed. Some candidates verified a 4096-token usable input; higher context tiers were
-planned but did not run before the budget expired. EvalPlus and Aider Polyglot were unmeasured because the sweep's
-base config omitted the broker, even though a Linux/arm64 coding worker was separately built and calibrated. These
-results show a functioning native runtime and its observed tradeoffs, not a cross-model winner.
-
-A later attempt to add one EvalPlus and one Aider Polyglot coding item used the already calibrated worker in a
-1 GiB Colima VM, with no downloads. Native admission refused the first Qwen3-1.7B candidate before model load:
-1250 MiB of host unified memory was available, below the model-plus-reserve requirement of 1568 MiB. The candidate
-cleaned up and the VM was stopped. No Mac coding score resulted from that attempt; reducing the reserve to force a
-run would discard the memory guard that kept the laptop stable.
+The first live Metal runs (MacBook Pro, M1, 8 GB, macOS 14.2.1, llama.cpp `b11011`, Qwen3-1.7B and Qwen3.5-2B
+`Q4_K_M`) are written up, with every setting, pin and caveat, in
+[docs/results/apple-m1-2026-09-23.md](results/apple-m1-2026-09-23.md). In short: all layers ran on Metal and every
+required setting was read back verified; generation measured about 23-31 tok/s depending on context and host memory
+state; the server's unified-memory footprint was 1.5-2.4 GiB; Qwen3.5-2B verified a 16384-token usable input on
+this machine. Scores are per suite on small item counts (for example BFCL 14/21 and 10/21 at the two baselines) and
+separate nothing; no candidate met the packaged speed floor, so nothing there is a validated preset.
 
 ## Screen, measure interactions, then confirm
 

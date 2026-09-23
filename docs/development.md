@@ -49,13 +49,18 @@ The two runtimes are covered differently, and a change should say which kind of 
   things in `pytest` are real on purpose: darwin-only reads of the test process's own `phys_footprint`, and a
   harmless Python child standing in for `llama-server` so process groups, signals and the proof of absence are
   tested for real (POSIX only). No test starts `llama-server`, Metal, Docker or Colima.
-On an M1 Mac the pinned installer, native preparation, Metal candidate process, smoke runs, `tune` and the
-two-model sweep have been exercised live. A Linux/arm64 coding worker was built and calibrated in Colima: all 83
-Aider Polyglot references passed and all 83 unchanged stubs failed. The two-model sweep did not select coding
-benchmarks because its base config had no broker. A separate coding candidate with the worker was refused by native
-admission when only 1250 MiB was available against 1568 MiB required, before model load; no live Mac coding score
-is claimed. See
-[the measured Mac results](usage.md#results-on-a-laptop).
+On an M1 Mac (8 GB) these native paths have been exercised live: the pinned installer, native `prepare` with the
+worker image, `candidate`, `tune` from `--config` and from a derived session, `scripts/sweep_models.py` with the
+cross-model report, admission refusals on memory, the memory watchdog (sampling only: it never had to stop a
+server), and all four public suites. The
+`linux/arm64` coding worker was built in Colima and calibrated at 2 GiB and again at 1 GiB of VM memory (83 of 83
+Aider Polyglot references pass, 83 of 83 stubs fail), and EvalPlus, Aider Polyglot and the private coding fixtures
+then ran through the host broker in that sandbox. A session was interrupted with SIGINT while its first candidate
+was evaluating (cancelled, server stopped, absence proven, lease released) and `resume` then completed it, and
+`doctor --native-bundle` re-checked the pinned server. Not exercised live: `optimize`, `sample`,
+`run_prepared_sweep.py`, partial offload and KV-in-RAM candidates. The NVIDIA runtime was not run live on
+the Mac; its coverage there is the unit suite. See
+[the measured Mac results](results/apple-m1-2026-09-23.md).
 
 When a real run disagrees with a fixture, capture the new output into `tests/data/` (with machine-specific paths
 replaced) and fix the parser against it; do not edit a capture to fit the parser.
