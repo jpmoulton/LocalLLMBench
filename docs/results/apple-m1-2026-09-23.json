@@ -32,6 +32,10 @@
     "cut_off": 0,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 1
@@ -140,6 +144,10 @@
     "cut_off": 0,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 1
@@ -247,6 +255,10 @@
    "bfcl": {
     "cut_off": 0,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 9
    },
    "ruler": {
     "cut_off": 0,
@@ -359,6 +371,10 @@
     "cut_off": 14,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 4,
+    "responses": 9
+   },
    "ruler": {
     "cut_off": 2,
     "responses": 2
@@ -466,6 +482,10 @@
    "bfcl": {
     "cut_off": 4,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
    },
    "ruler": {
     "cut_off": 0,
@@ -575,6 +595,10 @@
     "cut_off": 2,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 2
@@ -682,6 +706,10 @@
    "bfcl": {
     "cut_off": 2,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
    },
    "ruler": {
     "cut_off": 0,
@@ -791,6 +819,10 @@
     "cut_off": 6,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 6,
+    "responses": 11
+   },
    "ruler": {
     "cut_off": 2,
     "responses": 2
@@ -898,6 +930,10 @@
    "bfcl": {
     "cut_off": 0,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
    }
   },
   "run_dir": "runs/mac/sessions/2k-qwen3-1.7b/candidates/000-baseline",
@@ -992,6 +1028,10 @@
    "bfcl": {
     "cut_off": 4,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
    }
   },
   "run_dir": "runs/mac/sessions/2k-qwen3.5-2b/candidates/000-baseline",
@@ -1094,6 +1134,10 @@
    "evalplus": {
     "cut_off": 0,
     "responses": 10
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
    }
   },
   "run_dir": "runs/mac/sessions/coding-qwen3-1.7b/candidates/000-baseline",
@@ -1216,6 +1260,10 @@
    "evalplus": {
     "cut_off": 0,
     "responses": 10
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
    }
   },
   "run_dir": "runs/mac/sessions/coding-qwen3.5-2b/candidates/000-baseline",
@@ -1331,6 +1379,10 @@
     "cut_off": 0,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 1
@@ -1438,6 +1490,10 @@
    "bfcl": {
     "cut_off": 0,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 11
    },
    "ruler": {
     "cut_off": 0,
@@ -1547,6 +1603,10 @@
     "cut_off": 4,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 2
@@ -1655,6 +1715,10 @@
     "cut_off": 4,
     "responses": 42
    },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
+   },
    "ruler": {
     "cut_off": 0,
     "responses": 2
@@ -1762,6 +1826,10 @@
    "bfcl": {
     "cut_off": 4,
     "responses": 42
+   },
+   "local-fixtures": {
+    "cut_off": 0,
+    "responses": 10
    },
    "ruler": {
     "cut_off": 0,

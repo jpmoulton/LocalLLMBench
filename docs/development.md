@@ -54,8 +54,10 @@ worker image, `candidate`, `tune` from `--config` and from a derived session, `s
 cross-model report, admission refusals on memory, the memory watchdog (sampling only: it never had to stop a
 server), and all four public suites. The
 `linux/arm64` coding worker was built in Colima and calibrated at 2 GiB and again at 1 GiB of VM memory (83 of 83
-Aider Polyglot references pass, 83 of 83 stubs fail), and EvalPlus, Aider Polyglot and the private coding fixtures
-then ran through the host broker in that sandbox. A session was interrupted with SIGINT while its first candidate
+Aider Polyglot references pass; 82 of 83 stubs fail, the 83rd being the known-passing `ledger` refactoring stub), and EvalPlus and the private coding fixtures
+then executed model-written code through the host broker in that sandbox (Aider Polyglot ran too, but every
+response was refused by its edit parser before a test ran, so its execution path was exercised only by the
+calibration). A session was interrupted with SIGINT while its first candidate
 was evaluating (cancelled, server stopped, absence proven, lease released) and `resume` then completed it, and
 `doctor --native-bundle` re-checked the pinned server. Not exercised live: `optimize`, `sample`,
 `run_prepared_sweep.py`, partial offload and KV-in-RAM candidates. The NVIDIA runtime was not run live on

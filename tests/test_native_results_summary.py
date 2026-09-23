@@ -78,8 +78,11 @@ def test_cut_off_responses_are_counted_per_suite_once_even_when_two_files_hold_t
     response(aider / "request-1.json", "stop")
     response(run / "evaluator" / "benchmarks" / "bfcl" / "request-0.json", "length")  # transport-only suite
     response(run / "evaluator" / "coding" / "python-chunks" / "response-1.json", "stop")
+    response(run / "evaluator" / "quality" / "quality-request-0.json", "length")  # a local NIAH/tool fixture
     (run / "evaluator" / "benchmarks" / "bfcl" / "metrics.json").write_text(json.dumps({"items": 1}))
     [row] = summary.collect([tmp_path])
     assert row["responses_cut_off"] == {"aider-polyglot": {"cut_off": 1, "responses": 2},
                                         "bfcl": {"cut_off": 1, "responses": 1},
-                                        "coding": {"cut_off": 0, "responses": 1}}
+                                        "coding": {"cut_off": 0, "responses": 1},
+                                        "local-fixtures": {"cut_off": 1, "responses": 1}}
+    assert summary.markdown([row]).splitlines()[-1].endswith("| 1/1 |")

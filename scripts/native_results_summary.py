@@ -73,7 +73,8 @@ def _suite_rows(samples: list[dict]) -> dict:
 
 def _responses_cut_off(run_dir: Path) -> dict:
     """Per suite, how many recorded model RESPONSES hit the output cap, read from the raw response files the
-    evaluator persists (``evaluator/benchmarks/<suite>/...`` and ``evaluator/coding/...``). Multi-attempt suites
+    evaluator persists (``evaluator/benchmarks/<suite>/...``, ``evaluator/coding/...`` and, for the local NIAH and
+    tool fixtures together, ``evaluator/quality/...``). Multi-attempt suites
     (Aider Polyglot, the coding fixtures) record the finish reason per response, not on the scored row, so a row-level
     count alone would miss a capped attempt. An adapter's own ``response*.json`` and the transport's ``request-*.json``
     hold the same completion, so a suite's adapter files are used when it wrote any and its transport files otherwise
@@ -82,13 +83,14 @@ def _responses_cut_off(run_dir: Path) -> dict:
     root = run_dir / "evaluator"
     for path in sorted(root.rglob("*.json")) if root.is_dir() else ():
         parts = path.relative_to(root).parts
-        if len(parts) < 2 or parts[0] not in ("benchmarks", "coding"):
+        if len(parts) < 2 or parts[0] not in ("benchmarks", "coding", "quality"):
             continue
         body = _load(path)
         choices = body.get("choices") if isinstance(body, dict) else None
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             continue
-        suite = parts[1] if parts[0] == "benchmarks" else "coding"
+        # The local NIAH and tool fixtures share one transport directory, so they are one group here.
+        suite = {"benchmarks": parts[1], "coding": "coding", "quality": "local-fixtures"}[parts[0]]
         kind = "adapter" if path.name.startswith("response") else "transport"
         found.setdefault(suite, {"adapter": [], "transport": []})[kind].append(choices[0].get("finish_reason"))
     result = {}
@@ -180,11 +182,15 @@ def _suite_cell(suites: dict, name: str) -> str:
     return text + (f" ({', '.join(notes)})" if notes else "")
 
 
+def _cut_cell(entry) -> str:
+    return "-" if not entry else f"{entry['cut_off']}/{entry['responses']}"
+
+
 def markdown(rows: list[dict]) -> str:
     out = ["| Model | Candidate | ctx | KV | reasoning | state | tok/s median (min-max) | prefill tok/s | first token s "
            "| footprint MiB after load / peak | Metal MiB | swap growth MiB | pressure max | settings ok | ctx ok "
-           "| BFCL | RULER | NIAH strict (lenient) | tool fixtures |",
-           "|---|---|---:|---|---|---|---|---:|---:|---|---:|---:|---:|---|---|---|---|---|---|"]
+           "| BFCL | RULER | NIAH strict (lenient) | tool fixtures | local-fixture responses cut off |",
+           "|---|---|---:|---|---|---|---|---:|---:|---|---:|---:|---:|---|---|---|---|---|---|---|"]
     for row in rows:
         suites = row["suites"]
         niah = suites.get("niah")
@@ -199,7 +205,8 @@ def markdown(rows: list[dict]) -> str:
             f"{_fmt(row['server_footprint_after_load_mib'], 0)} / {_fmt(row['server_footprint_peak_mib'], 0)}",
             _fmt(row["metal_buffers_mib"], 0), _fmt(row["host_swap_growth_mib"], 0),
             _fmt(row["memory_pressure_max"]), _fmt(row["settings_verified"]), _fmt(row["context_verified"]),
-            _suite_cell(suites, "bfcl"), _suite_cell(suites, "ruler"), niah_cell, tool_cell]) + " |")
+            _suite_cell(suites, "bfcl"), _suite_cell(suites, "ruler"), niah_cell, tool_cell,
+            _cut_cell(row["responses_cut_off"].get("local-fixtures"))]) + " |")
     return "\n".join(out) + "\n"
 
 
