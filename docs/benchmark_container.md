@@ -76,7 +76,7 @@ Code sandbox: `ghcr.io/generality-labs/inspect-eval-bigcodebench:2026-07-28@sha2
 
 ## Adding a benchmark
 
-When adding/registering a benchmark or changing a module interface, follow [Adding a benchmark](docs/add_benchmark_instruct.md). It covers the definition/runtime contract, configuration and path handling, dependencies/sandboxes, registration, and end-to-end verification.
+When adding/registering a benchmark or changing a module interface, follow [Adding a benchmark](add_benchmark_instruct.md). It covers the definition/runtime contract, configuration and path handling, dependencies/sandboxes, registration, and end-to-end verification.
 
 Benchmarks own their preparation, Inspect task, and result interpretation. The shared runner owns suite execution and status; another benchmark fitting the existing contract requires no shared-runner or Dockerfile change.
 

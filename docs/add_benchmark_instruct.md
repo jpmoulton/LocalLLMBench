@@ -13,7 +13,7 @@ Read the existing implementation for patterns, not as a universal benchmark prot
 - [BigCodeBench definition](../benchmarks/bigcodebench/definition.py): options, local inputs, deterministic selection, provenance.
 - [BigCodeBench runtime](../benchmarks/bigcodebench/task.py): Inspect task and coverage-aware summary.
 - [Shared configuration](../benchmarks/config.py), [registry](../benchmarks/registry.py), and [runner](../benchmarks/run.py): actual shared contracts.
-- [Container documentation](../benchmark_container.md): inference prerequisites, build/run setup, security limits, and existing verification.
+- [Container documentation](benchmark_container.md): inference prerequisites, build/run setup, security limits, and existing verification.
 
 ## 1. Establish the evaluation protocol
 
@@ -128,6 +128,6 @@ Completion checklist:
 - Exercise an appropriate failure/truncation case and verify incomplete coverage is visible rather than reported as a complete score. Add deterministic regression tests for meaningful selection/scoring/error boundaries.
 - Confirm `results/<run>/<name>/manifest.json`, `inspect/`, and `summary.json`, plus the root suite summary, describe the actual run. Preparation failure may produce only a diagnostic summary.
 - For code execution, inspect the actual sandbox's permissions, mounts, network, and limits; a YAML declaration alone is not verification.
-- Keep smoke outputs as evidence, remove temporary configurations/scripts, and update [progress.md](../progress.md) with the protocol, exercised checks, and remaining limits. Update the container documentation if shared behavior changed.
+- Keep smoke outputs as evidence, remove temporary configurations/scripts, and update [progress.md](progress.md) with the protocol, exercised checks, and remaining limits. Update the container documentation if shared behavior changed.
 
 Adding a benchmark does not authorize implementing a sweep manager, UI, new inference backend, or unrelated benchmark. Stop after the requested integration and its verification.
