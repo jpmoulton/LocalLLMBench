@@ -33,13 +33,13 @@ A 64-problem unweighted pass rate changes by about 1.56 percentage points per pr
 
 ## Generation and deployment configuration
 
-Run settings live in `benchmark_config.json`. Shared defaults/validation live in `benchmarks/config.py`; each benchmark owns its own defaults/validation. Unknown keys fail rather than silently being ignored. Host input/output paths are relative to the configuration file unless absolute.
+Standalone settings live in `benchmark_config.json`; [orchestrator recipes](recipe.md) use the same defaults and benchmark-owned options. Shared defaults/validation live in `benchmarks/config.py`. Unknown keys fail rather than silently being ignored. Standalone host input/output paths are relative to the configuration file unless absolute.
 
 | Section | Settings and initial defaults |
 | --- | --- |
 | `benchmarks` | Omitted or `null`: all registered benchmarks, in registry order. Explicit nonempty list: only those benchmarks, in the supplied order. Unknown names and duplicates fail. |
 | `benchmark_options.bigcodebench` | `dataset_path`: local asset directory above; `selection: {"count": 64, "seed": 42}`; `test_timeout: 60` seconds |
-| `inference` | `container: "localllmbench-inference-128k"`, `model: "local-model"`, `minimum_context: 131072` |
+| `inference` | `container: "localllmbench-inference-128k"`, `model: "local-model"` for standalone attachment |
 | `generation` | `thinking: true`, `max_tokens: 8192`, `temperature: 1.0`, `top_p: 0.95`, `top_k: 20`, `min_p: 0.05`, `seed: 42` |
 | `execution` | `concurrency: 1`, `request_timeout: 900` seconds |
 | `output_dir` | `"results"` |
@@ -50,7 +50,7 @@ The former root-level `dataset_path`/`selection` and `execution.test_timeout` ha
 
 The user approved reasoning-enabled benchmarking at intended high deployment contexts, rather than extrapolating from small-context configurations. The first verified server uses Q4_K_M weights, context 131072, q8_0 K/V caches, Flash Attention, and full layer offload. Inference image defaults remain unchanged.
 
-The benchmark only attaches to an existing server. It verifies the per-slot context reported by `/props` is at least `minimum_context`; it does not start or reconfigure the inference server. `generation.max_tokens` limits reasoning plus final code and must leave room for the prompt within the server context. It does not allocate context or restrict thinking separately.
+The benchmark controller attaches to its configured server; it does not reconfigure inference. It records server-reported context from `/props`, with no separate minimum-context threshold. The host orchestrator starts each trial's server with the requested `--ctx-size`. `generation.max_tokens` caps reasoning plus final code; prompt and output still need to fit the deployed context.
 
 Sampling values were made explicit from the model's observed defaults. They are a starting operating profile, not a universal best preset or an official BigCodeBench leaderboard protocol. Temperature zero remains configurable. A fixed generation seed does not guarantee identical outputs across quantizations, runtimes, hardware, or concurrency.
 
@@ -208,7 +208,7 @@ Viewing saved logs does not require starting the inference server or benchmark c
 
 The trusted controller mounts selected benchmark inputs read-only and a unique output directory read/write. For BigCodeBench it also mounts the host Docker socket. Docker-daemon access is powerful; only trusted project/controller code may run there.
 
-Generated code runs in per-sample siblings: user `1000:1000`, network disabled, no host mounts/socket/GPU, all Linux capabilities dropped, `no-new-privileges`, 1 CPU, 2 GiB memory, and 256-process limit. Its writable filesystem is disposable. Inspect removes sample sandboxes; the launcher removes the controller when it exits.
+Generated code runs in per-sample siblings: user `1000:1000`, network disabled, no host mounts/socket/GPU, all Linux capabilities dropped, `no-new-privileges`, 1 CPU, 2 GiB memory, and 256-process limit. Its writable filesystem is disposable. Inspect removes sample sandboxes; the launcher removes the controller when it exits. Orchestrated controllers/sandboxes carry run/trial ownership labels so the host can remove leftovers after an interrupted controller.
 
 These are Docker isolation measures, not a hardened VM security boundary or protection against container/kernel exploits. No secrets are intentionally passed into the execution sandboxes. Some benchmark tasks can fail due to dependency/version assumptions or resource limits; reference preflight exposes these rather than quietly treating them as model errors.
 
@@ -226,13 +226,13 @@ Each run gets a unique `results/<UTC timestamp>-<suffix>/` directory, printed by
 | `summary.json` | Suite status and each selected benchmark's status/summary location; no cross-benchmark aggregate score |
 | `<benchmark>/manifest.json` | Benchmark-owned preparation provenance; BigCodeBench records selected IDs, count/seed, algorithm, and dataset fingerprints |
 | `<benchmark>/inspect/*.eval` | Native Inspect samples, reasoning, final answers, test results, errors, model API records |
-| `<benchmark>/summary.json` | Benchmark-owned metrics and diagnostics; BigCodeBench includes coverage, optional pass rate, and per-task outcomes/token usage |
+| `<benchmark>/summary.json` | Benchmark-owned scores/coverage plus shared `score_metrics`, `performance`, and per-call `generation_samples` |
 
 Paths beginning `/results` inside logs refer to that run's host output directory. Startup failures also retain an incomplete summary when the controller reached its runner. An interrupted container can leave an unfinished/incomplete run; there is no resume mechanism yet.
 
 The run records the model path and inference image, not a cryptographic hash of the multi-gigabyte model artifact. Do not overwrite a model file in place between comparisons and assume its filename proves identity. A stronger model-artifact identity policy is still open.
 
-No TTFT/TPOT performance pipeline, sweep manager, comparison UI, or results database is implemented. Inspect token usage is retained; missing reasoning-token counts remain null rather than being invented. Short coding prompts at a 128K server allocation do not establish long-input performance or long-context quality.
+The [host orchestrator](orchestrator.md) now manages sweeps and spreadsheet export. Shared performance extraction retains request latency, native prompt/decode timings, and coverage; missing values remain null. Client TTFT/streaming TPOT, comparison UI, and a results database remain unimplemented. Short coding prompts at a 128K allocation do not establish long-input performance or quality.
 
 ## Verification — 2026-11-03
 
@@ -246,3 +246,5 @@ No TTFT/TPOT performance pipeline, sweep manager, comparison UI, or results data
 - Earlier pre-refactor success and intentional two-truncation outputs remain at `results/20261103T183309Z-01608898/` and `results/20261103T183600Z-12fc9b40/`. These historical runs retain their older flat artifact layout.
 
 The full 64-task generation run has not been executed. Two passes establish the integration path, not a useful quality estimate. The high-context server was exercised with short prompts, not a filled 128K context. No Linux-host or other-model run has been tested.
+
+The orchestrator integration subsequently passed 61 CPU regression tests and a CPU-only Docker/Inspect smoke; see [its verification record](orchestrator.md#exercised-verification). That smoke used synthetic responses/tasks, not new model inference. Shared runtime changes include frozen manifest checks before generation, timing extraction, and removal of the legacy minimum-context guard.

@@ -9,8 +9,7 @@
   "output_dir": "results",
   "inference": {
     "container": "localllmbench-inference-128k",
-    "model": "local-model",
-    "minimum_context": 131072
+    "model": "local-model"
   },
   "generation": {
     "thinking": true,

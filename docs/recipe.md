@@ -1,8 +1,8 @@
 # YAML recipes
 
-**Status: recipe format and defaults specified; orchestrator CLI not implemented yet.** The current `inference.py` and `benchmark.py` launchers do not consume recipes. This iteration changes the schema, example, and documentation only.
+Run this format with `python orchestrate.py --recipe PATH`. Add `--plan-only` to resolve/preview without Docker or inference. See [orchestrator setup, lifecycle, and verification](orchestrator.md).
 
-The existing standalone `benchmark_config.json` remains unchanged; this YAML format is the input for the future orchestrator, not a replacement parser for the current benchmark launcher.
+The standalone `benchmark.py` still consumes `benchmark_config.json`; YAML recipes belong to the host orchestrator.
 
 - [JSON Schema](../recipes/recipe.schema.json): version 1, JSON Schema Draft 2020-12, validating the data parsed from YAML.
 - [Complete YAML example](../recipes/qwen-kv-sweep.yaml): Q4_K_M and Q6_K models, with a three-choice 128K group and a single-configuration 256K group.
@@ -10,9 +10,9 @@ The existing standalone `benchmark_config.json` remains unchanged; this YAML for
 
 Recipes use YAML for readability, comments, and named groups. The example's `# yaml-language-server: $schema=./recipe.schema.json` comment provides editor schema association; `schema_version` identifies the recipe format. The schema remains JSON because it describes the parsed data, not the source syntax.
 
-Use safe, single-document YAML parsing. The future loader must reject duplicate mapping keys rather than silently overwrite settings. Quote native string values such as `"on"` and `"off"`: some YAML parsers otherwise turn them into booleans. Use literal `true`/`false` for actual booleans, and `null` for default-all benchmark selection. No executable YAML tags, includes, or environment interpolation are part of this format.
+The loader safely parses one YAML document and rejects duplicate/nonstring keys, recursive aliases, nonfinite values, and executable tags. Quote native string values such as `"on"` and `"off"` so YAML preserves strings; use `true`/`false` for actual booleans and `null` for default-all benchmark selection. Includes and environment interpolation are not supported.
 
-JSON Schema `default` annotations do not insert values. Shared recipe defaults must be resolved by the future loader; benchmark defaults come from each module; unspecified native server settings continue to use image defaults. These are specified defaults, not an implemented recipe-loading pipeline.
+JSON Schema `default` annotations do not insert values. `orchestrator/recipe.py` resolves shared defaults using benchmark configuration; modules own their defaults, and unspecified native settings use image defaults.
 
 ## Sections and ownership
 
@@ -66,7 +66,7 @@ Value rules:
 
 The inner list is literal arguments, not a sweep axis. This illustrates encoding only; an actual control-vector experiment also needs its assets configured.
 
-Pass the eventual arguments as tokens, not through a shell. String values containing commas or spaces remain one argument. Host-path translation applies only to model paths and benchmark-declared input paths; arbitrary native file arguments are container paths. The existing inference launcher mounts the selected model's parent directory at `/models`; this proposal does not add arbitrary extra asset mounts.
+Arguments are passed as tokens, not through a shell. String values containing commas or spaces remain one argument. Host-path translation applies only to model paths and benchmark-declared input paths; arbitrary native file arguments are container paths. The inference launcher mounts the selected model's parent directory at `/models`; arbitrary extra asset mounts are not supported.
 
 The orchestrator owns model selection, container identity, transport, and the API alias `local-model`. Sampling/reasoning controls belong in `generation`. The schema rejects common conflicting native options, but is not a complete llama.cpp grammar or semantic validator: additional sampling or prompt-protocol overrides must not be hidden in serving-setting axes. Unknown native options are ultimately the pinned server's responsibility. We are not adding comprehensive compatibility validation here.
 
@@ -104,7 +104,7 @@ Every configuration group explicitly specifies `--ctx-size`: this is the request
 
 `--ctx-size` retains native server semantics. With multiple parallel slots, do not assume every request gets the full allocation. Record the server-reported context with results rather than adding another user-configured threshold.
 
-Integration note: the current standalone benchmark still has its earlier `inference.minimum_context` guard. Remove that legacy setting/check when implementing the recipe-consuming orchestrator so it cannot silently reject intentionally smaller context configurations. This schema change does not modify the working benchmark runtime.
+The legacy standalone benchmark `inference.minimum_context` setting/check has been removed. Server-reported context remains recorded as deployment evidence.
 
 `--parallel` controls server slots. `execution.concurrency` controls benchmark sample/request concurrency. Neither is trial concurrency, and increasing one does not automatically change the other. Keep request concurrency fixed across a run; varying slot count is still a valid serving experiment but must be interpreted alongside actual request load.
 
@@ -130,7 +130,7 @@ Models, format version, configuration groups, and each group's context size are 
 
 Explicit shared recipe values override their defaults. Benchmark overrides merge into the selected modules' existing defaults. Groups do not inherit from earlier groups.
 
-Native schema defaults document the existing image behavior: **do not blindly fill `parameters` with them and emit extra CLI options**. Emit only explicitly requested native options plus the K/V arguments derived from an explicit `kv_quantization`. This avoids overriding an alternate native flag or colliding with the KV shorthand. Omitted native options remain the image/server's responsibility; neither the image defaults nor standalone benchmark defaults were changed.
+Native schema defaults document image behavior: the loader emits only explicitly requested native options plus the K/V arguments derived from an explicit `kv_quantization`. Omitted options remain image/server-owned, avoiding unintended overrides or KV shorthand conflicts. Image defaults are unchanged.
 
 In particular, `kv_quantization` itself has no injected default. With it omitted, an explicit native K or V setting wins, and an unspecified side retains `f16`. With it supplied, both sides come from that choice and native K/V overrides in the same group are rejected. The example explicitly chooses q8_0/q4_0/bf16; none of those choices replaces the image's default cache precision.
 
@@ -140,8 +140,8 @@ Bind address defaults to `127.0.0.1`, port to 8080. The published host address i
 
 The JSON Schema checks document structure, scalar/list distinctions, nonempty axes, obvious duplicates within an axis, known cache names, and a few ownership conflicts. It deliberately leaves registered benchmark names and options to the existing registry/modules so a new benchmark does not require editing this schema.
 
-It does not check GPU memory, model architecture support, native option combinations, whether files exist, benchmark population limits, or whether expanded trials can successfully run. Additional validation and fast-fail behavior remain deferred. No execution, retry, resource monitoring, or UI code is included.
+The schema does not establish GPU fit, architecture support, or native option compatibility. The loader separately checks model paths and prepares selected benchmark inputs/manifests before execution; module validation catches invalid sample counts. Actual serving failures are recorded and execution continues after cleanup.
 
-Verification exercised safe YAML parsing, schema validation, eight-trial group expansion, multi-axis expansion with atomic K/V/argument mappings, and defaults against the existing Dockerfile and benchmark configuration. Ten malformed/conflicting variants were rejected, including YAML-coerced boolean values for native on/off options. No model trials were executed.
+Expansion and malformed-input regression tests, both CLI input previews, and a CPU-only container workflow smoke passed. Details and hardware-verification limits are in [orchestrator.md](orchestrator.md). Real orchestrator/GPU testing is deferred until the user permits loading models again.
 
-A first real orchestrator smoke should use one model, one configuration, and two problems—not the full example run. The next implementation step is the recipe-consuming CLI; it is not part of this schema/documentation change.
+For the first hardware smoke, use one model, a small number of configurations, and two problems—not the full example run.

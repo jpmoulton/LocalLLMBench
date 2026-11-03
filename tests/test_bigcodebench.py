@@ -111,7 +111,7 @@ class BigCodeBenchTests(unittest.TestCase):
                     "top_p": 0.5,
                     "min_p": 0,
                 },
-                "inference": {"model": "a-different-model", "minimum_context": 262144},
+                "inference": {"model": "a-different-model"},
             }
         )
         self.assertNotEqual(baseline["generation"], changed["generation"])

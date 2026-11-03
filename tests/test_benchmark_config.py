@@ -9,7 +9,7 @@ from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
 
-from benchmarks.config import DEFAULT_CONFIG, load_config
+from benchmarks.config import DEFAULT_CONFIG, load_config, resolve_config
 from benchmarks import registry
 
 
@@ -130,6 +130,19 @@ class SharedConfigTests(ConfigTestCase):
         self.assertEqual(DEFAULT_CONFIG, original_defaults)
         self.assertEqual(self.alpha.DEFAULT_OPTIONS, original_options)
 
+    def test_in_memory_resolution_does_not_retain_override_references(self) -> None:
+        self.alpha.DEFAULT_OPTIONS["labels"] = []
+        overrides = {
+            "benchmarks": ["beta", "alpha"],
+            "benchmark_options": {"alpha": {"labels": ["first", "second"]}},
+        }
+        original = copy.deepcopy(overrides)
+        resolved = resolve_config(overrides)
+        resolved["benchmarks"].clear()
+        resolved["benchmark_options"]["alpha"]["labels"].clear()
+        self.assertEqual(overrides, original)
+        self.assertEqual(resolve_config(overrides), self.load_overrides(overrides))
+
     def test_unknown_keys_fail_at_root_and_nested_levels(self) -> None:
         for overrides in (
             {"benchmrks": []},
@@ -159,8 +172,6 @@ class SharedConfigTests(ConfigTestCase):
             {"output_dir": " "},
             {"inference": {"model": ""}},
             {"inference": {"container": None}},
-            {"inference": {"minimum_context": 0}},
-            {"inference": {"minimum_context": True}},
             {"generation": {"thinking": 1}},
             {"generation": {"max_tokens": 0}},
             {"generation": {"seed": False}},
@@ -190,12 +201,10 @@ class SharedConfigTests(ConfigTestCase):
                 "top_k": 0, "temperature": 0, "top_p": 1, "min_p": 0,
             },
             "execution": {"concurrency": 1, "request_timeout": 0.5},
-            "inference": {"minimum_context": 262144},
         }
         config = self.load_overrides(overrides)
         self.assertEqual(config["generation"], overrides["generation"])
         self.assertEqual(config["execution"], overrides["execution"])
-        self.assertEqual(config["inference"]["minimum_context"], 262144)
 
     def test_unselected_inputs_are_never_read_and_runtime_is_not_imported(self) -> None:
         path = self.root / "config.json"

@@ -8,6 +8,32 @@ import subprocess
 IMAGE = "localllmbench-inference:local"
 
 
+def build_command(
+    model: Path, *, name: str, port: int = 8080, bind_address: str = "127.0.0.1",
+    server_args: list[str] | None = None, labels: dict[str, str] | None = None,
+    network: str | None = None,
+) -> list[str]:
+    """Build the same inference launch for standalone and orchestrated use."""
+    model = model.expanduser().resolve()
+    if not model.is_file():
+        raise ValueError(f"Model file does not exist: {model}")
+    address = bind_address
+    if ":" in address and not address.startswith("["):
+        address = f"[{address}]"
+    command = ["docker", "run", "--detach", "--init", "--name", name, "--gpus", "all"]
+    for key, value in (labels or {}).items():
+        command.extend(["--label", f"{key}={value}"])
+    if network:
+        command.extend(["--network", network])
+    command.extend([
+        "--mount", f"type=bind,source={model.parent},target=/models,readonly",
+        "--publish", f"{address}:{port}:8080",
+        IMAGE, *(server_args or []),
+        "--model", f"/models/{model.name}", "--host", "0.0.0.0", "--port", "8080",
+    ])
+    return command
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -26,32 +52,22 @@ def main() -> int:
     parser.add_argument("server_args", nargs=argparse.REMAINDER, help="Native llama-server options after --")
     args = parser.parse_args()
 
-    model = args.model.expanduser().resolve()
-    if not model.is_file():
-        parser.error(f"Model file does not exist: {model}")
+    model = args.model
 
     server_args = args.server_args
     if server_args[:1] == ["--"]:
         server_args = server_args[1:]
 
+    try:
+        command = build_command(
+            model, name=args.name, port=args.port, bind_address=args.bind_address,
+            server_args=server_args,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     address = args.bind_address
     if ":" in address and not address.startswith("["):
         address = f"[{address}]"
-
-    # Mount the directory so adjacent GGUF shards are also available, read-only.
-    # No shell: spaces and native inference arguments remain separate argv entries.
-    command = [
-        "docker", "run", "--detach", "--init",
-        "--name", args.name,
-        "--gpus", "all",
-        "--mount", f"type=bind,source={model.parent},target=/models,readonly",
-        "--publish", f"{address}:{args.port}:8080",
-        IMAGE,
-        *server_args,
-        # Transport and model selection belong to the launcher, not the passthrough.
-        "--model", f"/models/{model.name}",
-        "--host", "0.0.0.0", "--port", "8080",
-    ]
     result = subprocess.run(command, check=False)
     if result.returncode == 0:
         print(f"Container started; model loading may still be in progress.", flush=True)

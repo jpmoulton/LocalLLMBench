@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=./recipe.schema.json
+# Live workflow smoke, not a statistically useful quality comparison.
+# One model x two cache choices x two problems = four benchmark answers.
+schema_version: 1
+name: qwen-27b-128k-smoke
+
+models:
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+
+inference:
+  bind_address: 127.0.0.1
+  port: 8080
+  configurations:
+    - name: 128k-kv-smoke
+      kv_quantization: [q8_0, q4_0]
+      parameters:
+        --ctx-size: 131072
+        --gpu-layers: all
+        --flash-attn: "on"
+        --parallel: 1
+
+# Explicit selection keeps this smoke small when more benchmarks are registered.
+benchmarks: [bigcodebench]
+benchmark_options:
+  bigcodebench:
+    selection:
+      count: 2
+      seed: 42  # The same two problems in both trials.
+
+# Keep the normal reasoning/output budget; shrinking it could truncate answers.
+generation:
+  thinking: true
+  max_tokens: 8192
+
+# Other generation, dataset, and timeout settings use existing defaults.
+output_dir: ../results

@@ -2,6 +2,9 @@ services:
   default:
     image: ghcr.io/generality-labs/inspect-eval-bigcodebench:2026-07-28@sha256:d7c88bf92782a7486d64bc1d07cd38ba9e735b5f58235fc0c0f36f8f692a1cfe
     init: true
+    labels:
+      localllmbench.run: "${LOCALLLMBENCH_RUN_ID:-standalone}"
+      localllmbench.trial: "${LOCALLLMBENCH_TRIAL_ID:-standalone}"
     command: ["sleep", "infinity"]
     user: "1000:1000"
     working_dir: /tmp

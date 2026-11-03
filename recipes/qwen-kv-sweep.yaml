@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=./recipe.schema.json
-# Recipe specification only: the orchestrator CLI is not implemented yet.
+# Preview safely: python orchestrate.py --recipe recipes/qwen-kv-sweep.yaml --plan-only
 # 2 models x (3 configurations + 1 configuration) = 8 sequential trials.
 # GPU fit is not guaranteed. For a first smoke, use one model/group/value and count: 2.
 

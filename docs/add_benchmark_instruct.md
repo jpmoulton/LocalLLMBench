@@ -4,7 +4,7 @@ Use this guide when adding/registering a benchmark or changing a benchmark modul
 
 ## How the pieces fit
 
-The host launcher, `benchmark.py`, resolves configuration and input mounts, then starts one controller container for the selected suite. Inside it, `benchmarks/run.py` executes benchmarks sequentially through Inspect AI. Each benchmark supplies input preparation, an Inspect `Task`, and result interpretation.
+The host orchestrator, `orchestrate.py`, resolves a recipe and starts fresh inference/benchmark containers for each trial. The standalone launcher, `benchmark.py`, attaches a suite to an existing inference server. Both reuse launch construction. Inside the controller, `benchmarks/run.py` executes benchmarks sequentially through Inspect AI. Each benchmark supplies preparation, an Inspect `Task`, and result interpretation.
 
 `benchmarks/registry.py` maps public names to Python import paths. The loader imports `<module>.definition` for configuration/preparation and `<module>.task` for Inspect execution. These are ordinary Python modules with agreed function names, not subclasses or separate services. Missing interface members fail at runtime; registration alone does not prove an implementation works.
 
@@ -36,17 +36,15 @@ Choose a stable lowercase Python identifier, using underscores if needed. Create
 | `NEEDS_DOCKER` | Boolean indicating whether the controller needs host Docker-daemon access, usually to create execution sandboxes. All benchmarks still run inside the controller container. |
 | `validate_options(options)` | Validate merged values and raise useful errors. Do not read datasets or require their paths to exist here. |
 | `prepare(options)` | Return `(payload, provenance)` after read-only input preparation. |
+| `SCORE_METRICS` (optional) | Map top-level numeric summary keys to `{label, direction, unit}` metadata. `direction` is `"higher"` or `"lower"`; only declared, finite scores from completed evaluations are eligible for per-benchmark leaders. |
 
 All registered definitions and their options are loaded/validated during configuration loading, including unselected benchmarks. Keep imports and validation free of dataset access, runtime imports, and side effects.
 
 Only selected input paths are checked and mounted. The launcher resolves relative paths against the configuration file's directory, mounts inputs read-only at `/datasets/<name>/<option>`, and rewrites those options for the controller. Use the supplied paths; do not reconstruct Windows paths inside the container. Nested path fields are not supported by `PATH_OPTIONS`.
 
-`prepare()` has two consumers:
+`prepare()` runs on the host for standalone `--select-only` and orchestrator planning, and inside each controller against mounted paths.
 
-- Normal execution: called inside the controller against mounted paths.
-- `--select-only`: called on the host to preview preparation without Docker or inference.
-
-The **payload** is benchmark-owned Python data passed in memory to `make_task()`. The shared runner does not inspect or serialize it. **Provenance** must be a JSON-serializable dictionary; it is written to the benchmark's `manifest.json`. Record the actual selection, input identity/version, and protocol details needed to interpret or reproduce the run. Perform required asset acquisition separately; preparation should not download or modify inputs.
+The **payload** is benchmark-owned Python data passed to `make_task()`. The shared runner does not inspect or serialize it. **Provenance** must be a JSON-serializable, path-independent dictionary recording selection, input identity/version, and protocol details. The orchestrator freezes it in `plan.json`; each controller writes `manifest.json` and compares it exactly before generation. Exclude host/container paths, timestamps, and other incidental values. A mismatch makes the evaluation incomplete rather than selecting replacement tasks. Preparation is read-only; acquire assets separately.
 
 **Definition complete:** it imports without Inspect installed, validates options without input access, and prepares reproducible inputs/provenance on host and container paths.
 
@@ -68,7 +66,17 @@ Return a JSON-serializable dictionary containing `status`, exactly `"completed"`
 
 Account for every expected sample, including missing/duplicate outcomes and execution errors. Ordinary incorrect answers are scored outcomes; infrastructure failures, exhausted budgets, or missing results must not silently improve an aggregate by shrinking its denominator. Report incomplete coverage explicitly and withhold any metric that would misleadingly look like a complete-run score. Preserve diagnostics and never silently substitute tasks or retry answers.
 
-The shared runner adds timestamps, saves the summary, and continues to later benchmarks after an incomplete result. It stops on interruption. Shared startup/configuration failures can prevent the suite from starting. The root summary records statuses and child-summary locations, not an average across unrelated metrics.
+Declare comparable numeric summary fields in `definition.SCORE_METRICS`, for example:
+
+```python
+SCORE_METRICS = {
+    "accuracy": {"label": "Accuracy", "direction": "higher", "unit": "fraction"},
+}
+```
+
+Return `accuracy` at the summary's top level and withhold it when incomplete coverage would make it misleading. Metadata is copied into `score_metrics`; reporting remains benchmark-agnostic. There is no cross-benchmark score average or generation-speed ranking.
+
+The shared runner adds timestamps, `score_metrics`, `performance`, and `generation_samples`; reserve those fields for shared code. Common performance comes from native model-call records, not benchmark wall time; see [measurement definitions](orchestrator.md#generation-measurements). It saves the summary and continues after an incomplete benchmark, stopping on interruption. Shared startup/configuration failures can prevent the suite from starting. The root summary records statuses and child-summary locations.
 
 **Runtime complete:** a real Inspect task can execute, and its summary distinguishes complete scoring from partial/error results without relying on BigCodeBench-specific assumptions.
 
@@ -77,6 +85,16 @@ The shared runner adds timestamps, saves the summary, and continues to later ben
 Put benchmark-specific controller dependencies in `benchmarks/<name>/requirements.txt`, with pinned direct versions. The Dockerfile installs the shared requirements plus each benchmark directory's requirements in one environment. A requirements file is optional; shared dependencies need not be repeated.
 
 For generated-code execution, use a benchmark-owned sandbox configuration and set `NEEDS_DOCKER = True`. Follow the existing isolation pattern: generated code runs in sibling non-root containers with no host mounts, Docker socket, GPU, or network unless explicitly approved, and with resource limits. Run only trusted benchmark implementation code in the controller; its Docker socket grants broad host privileges.
+
+Each Compose sandbox service must propagate orchestration ownership so cancellation can clean up siblings after the controller exits:
+
+```yaml
+labels:
+  localllmbench.run: "${LOCALLLMBENCH_RUN_ID:-standalone}"
+  localllmbench.trial: "${LOCALLLMBENCH_TRIAL_ID:-standalone}"
+```
+
+The host passes these environment variables to orchestrated controllers. Standalone sandboxes use the fallback labels; orchestrator cleanup matches only its unique run/trial values.
 
 For a benchmark without Docker sandbox needs, use `NEEDS_DOCKER = False` and omit sandbox configuration. The socket is mounted if any selected benchmark needs it.
 
@@ -124,6 +142,8 @@ Completion checklist:
 
 - The new name is listed; explicit selection excludes other benchmarks, while omitted selection includes all registered names. Preview default-all only when the required inputs are available; a full default-all evaluation is not necessary for a small integration smoke.
 - Selection/provenance are stable across repeated preparation and model/generation changes where sampling is supported. Input changes are distinguishable in provenance.
+- The same provenance compares equal after host paths are remapped into the container; deliberate input/protocol changes fail before generation.
+- Declared score directions/units describe the returned top-level metrics. Incomplete results retain diagnostics without becoming score leaders; missing timing is unavailable rather than zero.
 - A real model response reaches the intended scorer. Inspect logs and per-sample outcomes support the reported metrics; tests alone are insufficient evidence.
 - Exercise an appropriate failure/truncation case and verify incomplete coverage is visible rather than reported as a complete score. Add deterministic regression tests for meaningful selection/scoring/error boundaries.
 - Confirm `results/<run>/<name>/manifest.json`, `inspect/`, and `summary.json`, plus the root suite summary, describe the actual run. Preparation failure may produce only a diagnostic summary.

@@ -15,7 +15,6 @@ DEFAULT_CONFIG = {
     "inference": {
         "container": "localllmbench-inference-128k",
         "model": "local-model",
-        "minimum_context": 131072,
     },
     "generation": {
         "thinking": True,
@@ -42,7 +41,7 @@ def _merge(defaults: dict, overrides: dict, prefix: str = "") -> dict:
         if isinstance(defaults[key], dict):
             merged[key] = _merge(defaults[key], value, f"{prefix}{key}.")
         else:
-            merged[key] = value
+            merged[key] = copy.deepcopy(value)
     return merged
 
 
@@ -73,7 +72,7 @@ def _number(
         raise ValueError(f"{name} must be <= {maximum}")
 
 
-def load_config(path: Path) -> dict:
+def resolve_config(overrides: dict) -> dict:
     """Merge and validate shared settings and registered benchmark options.
 
     Omitted or null benchmark selection resolves to all current registry names.
@@ -81,7 +80,6 @@ def load_config(path: Path) -> dict:
     are loaded. Relative paths remain unresolved for the host launcher. Unknown
     keys and invalid values fail, and each returned configuration is independent.
     """
-    overrides = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(overrides, dict):
         raise ValueError("config must be a JSON object")
     selected = resolve_benchmarks(overrides.get("benchmarks"))
@@ -98,7 +96,6 @@ def load_config(path: Path) -> dict:
     for key in ("container", "model"):
         if not isinstance(inference[key], str) or not inference[key].strip():
             raise ValueError(f"inference.{key} must be a nonempty string")
-    _integer(inference["minimum_context"], "inference.minimum_context", 1)
     generation = config["generation"]
     if type(generation["thinking"]) is not bool:
         raise ValueError("generation.thinking must be a boolean")
@@ -114,3 +111,8 @@ def load_config(path: Path) -> dict:
     for name, definition in definitions.items():
         definition.validate_options(config["benchmark_options"][name])
     return config
+
+
+def load_config(path: Path) -> dict:
+    """Read a standalone JSON configuration and resolve its shared defaults."""
+    return resolve_config(json.loads(path.read_text(encoding="utf-8")))

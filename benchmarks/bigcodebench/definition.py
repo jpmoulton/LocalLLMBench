@@ -14,6 +14,9 @@ DEFAULT_OPTIONS = {
 }
 PATH_OPTIONS = ("dataset_path",)
 NEEDS_DOCKER = True
+SCORE_METRICS = {
+    "pass_rate": {"label": "Pass rate", "direction": "higher", "unit": "fraction"},
+}
 
 
 def _integer(value: object, name: str, minimum: int | None = None) -> None:

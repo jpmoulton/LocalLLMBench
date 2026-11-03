@@ -104,7 +104,7 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 ## First benchmark integration
 
 - User approved simple seeded task selection, Complete prompts, reasoning-enabled evaluation, and host-Docker access for the trusted benchmark controller to create sibling execution sandboxes.
-- User specifically wants testing at intended deployment contexts (128K+) rather than extrapolating from small-context configurations. The benchmark verifies a configurable minimum server context, initially 131072, without altering the inference server.
+- User specifically wants benchmarking at intended deployment contexts (128K+) rather than extrapolating from small contexts. The initial minimum-context guard was removed during orchestrator integration; requested `--ctx-size` controls allocation and reported context is retained as evidence.
 - Implemented `benchmark.py`, `benchmark_config.json`, and `benchmarks/` controller/configuration/scoring/sandbox files. Configurable count, subset seed, thinking mode, output budget, sampling, generation seed, concurrency, and timeouts.
 - Defaults use 64 tasks / subset seed 42, thinking on, 8192 total output tokens, temperature 1.0, top-p 0.95, top-k 20, min-p 0.05, generation seed 42, concurrency 1. Sampling reflects the observed model defaults and can be changed; not a universal preset.
 - Hash-ranked task IDs make selection independent of row order, model, and generation settings. Selection manifests retain exact IDs and raw/canonical dataset fingerprints. Do not use the pre-existing stratified sample as this project's sample.
@@ -149,9 +149,22 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 - `kv_quantization` pairs K/V by default, with optional atomic asymmetric pairs. Native independent K/V axes are also possible, but cannot be mixed with that shorthand in the same group.
 - Checked the pinned image's actual server help: cache type names include `q8_0`, `q4_0`, and `bf16`; the recipe uses exact names rather than `q8`, `q4`, or uppercase aliases. The two example GGUF filenames were verified on disk.
 - Schema/default checks passed against safely parsed YAML, existing benchmark defaults, and eight native image defaults. The example expands into eight ordered trials: two models times three 128K cache choices plus one 256K/q4 configuration per model. Atomic K/V and multi-argument mappings were verified; ten malformed/conflicting variants were rejected, including YAML on/off boolean coercion.
-- Defaults are specified, not implemented by a recipe loader: schema annotations do not populate fields. Shared defaults mirror existing benchmark behavior; native defaults remain image-owned rather than being blindly injected as CLI arguments. Context size stays explicit, and KV shorthand has no injected default that could override native K/V settings.
+- At schema-review time, defaults were specified rather than implemented. The orchestrator now resolves shared/module defaults; native defaults remain image-owned, context stays explicit, and KV shorthand has no injected default that could override native K/V settings.
 - The example selects all registered benchmarks by default; currently this means 64 BigCodeBench problems per trial. No model trials were launched and feasibility of the example combinations is not established. No orchestrator, new runtime dependency, or changes to existing launchers/image defaults were added.
-- User rejected a separate recipe minimum-context threshold as redundant. The YAML example and schema now use only each group's `--ctx-size` for context configuration. Existing standalone benchmark `inference.minimum_context` code/configuration is intentionally unchanged during schema review; remove that legacy guard during orchestrator integration so smaller requested contexts are not rejected by a hidden default.
+- User rejected a separate minimum-context threshold as redundant. The YAML schema and runtime now use each group's `--ctx-size`; the legacy standalone `inference.minimum_context` setting/check was removed during integration.
+
+## Orchestrator — implemented; real integration smoke passed
+
+- User approved the implementation and clarified that speed should be shown as generation metrics, not a “fastest” ranking. Reference: [orchestrator.md](orchestrator.md).
+- `orchestrate.py` accepts YAML recipes or model paths through one resolved-plan path; `--plan-only` prepares/previews without Docker or inference. Model-only defaults use context 8192 and otherwise native image/shared benchmark defaults.
+- Implemented safe YAML/schema validation, deterministic expansion, fixed benchmark preparation identities, sequential fresh-container lifecycle, readiness/Hello world probe, live CLI output, atomic status, per-benchmark score leaders, generation metrics, and XLSX export.
+- Benchmark controllers compare prepared manifests against the frozen plan before generation. Common timing extraction uses Inspect call latency and native prompt/decode timings; client TTFT/streaming TPOT remain unavailable. No speed ranking or combined winner.
+- Cleanup filters owned run/trial labels, including code sandboxes. Fail-and-continue, cancellation, partial-result retention, cleanup failure, and report/status-write failures are covered. Uncertain cleanup stops scheduling rather than overlapping trials.
+- Added host `requirements.txt`; standalone launchers remain supported through shared launch construction. Updated module-authoring contracts for stable provenance, score metadata, and sandbox ownership labels. Future read-only UI can consume `run.json`; no UI added.
+- Verification: 61 CPU regressions passed; both real-path CLI previews passed; benchmark image rebuilt. A disposable CPU Docker/Inspect smoke produced one intentional startup failure followed by two completed synthetic-task evaluations, with fixed identities, reasoning/probe separation, timing export, XLSX readback, and complete owned cleanup.
+- New telemetry collector also read the existing real two-sample Inspect log: 9,880 generated tokens / 141.95804 summed decode seconds, approximately 69.598 decode tok/s. No new model inference was needed.
+- User completed `recipes/qwen-smoke.yaml`: Q4_K_M, 128K, q8_0/q4_0 K/V, the same two problems per trial. Both probes and both evaluations succeeded, with 2/2 passes per configuration and no recorded generation errors/truncation. Reviewed persisted evidence under `results/20261103T210559-31669ea5/`: two completed trials, no incomplete/cancelled trials, total 500.664 seconds. Detailed measurements and limitations are in [orchestrator.md](orchestrator.md#real-gpu-integration-smoke--2026-11-03). Linux-host execution and the large example sweep remain unverified.
+- Added `--verbose_logging`: live, labelled llama.cpp stdout/stderr alongside benchmark/Inspect console output. Saved inference logs remain cleanup snapshots; full Inspect records remain `.eval` files. Verified 62 CPU regressions and an isolated CPU log-streaming/cleanup smoke without touching the user's live run.
 
 ## Progress
 
@@ -167,7 +180,9 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 - Recorded the requested future localhost sweep-status/results UI; no UI implementation started.
 - Implemented and smoke-tested the first benchmark container; moved the active inference deployment to 131072 context with q8_0 caches and documented the new workflow.
 - Refactored benchmarks into independent modules and added configurable/default-all suite selection; verified shared dispatch and the real BigCodeBench path.
+- Implemented the host orchestrator and completed CPU-only regression/container verification; deferred real GPU integration at the user's request.
+- Completed and reviewed the first real two-trial GPU integration smoke; retain its recipe and documented evidence in version control, not generated result dumps.
 
 ## Next step
 
-Use the YAML recipe specification for the next orchestrator CLI iteration when the user directs implementation. Current launchers do not consume recipes yet. Keep deferred monitoring, UI, advanced compatibility validation, and retry machinery outside the initial implementation.
+The basic end-to-end integration step is successful; let the user choose the next component. The proposed three-stream, verbose-only file-logging redesign was stopped before code changes and remains unimplemented. Current verbose console streaming is included. Keep future UI, VRAM monitoring, advanced compatibility validation, and retry machinery outside this implementation.

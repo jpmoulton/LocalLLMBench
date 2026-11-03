@@ -8,14 +8,15 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.request import urlopen
 
-from inspect_ai import eval as inspect_eval
-from inspect_ai.log import EvalLog, read_eval_log
-from inspect_ai.model import GenerateConfig, get_model
+if TYPE_CHECKING:
+    from inspect_ai.log import EvalLog
+    from inspect_ai.model import GenerateConfig
 
 from .config import load_config
+from .performance import collect_generation_metrics
 from .registry import get_definition, get_runtime
 
 
@@ -34,7 +35,7 @@ def now() -> str:
 
 
 
-def server_provenance(base_url: str, minimum_context: int, output: Path, timeout: int) -> dict:
+def server_provenance(base_url: str, output: Path, timeout: int) -> dict:
     base_url = base_url.rstrip("/")
     if not base_url.endswith("/v1"):
         raise ValueError("--base-url must end in /v1")
@@ -51,40 +52,46 @@ def server_provenance(base_url: str, minimum_context: int, output: Path, timeout
     if isinstance(context, bool) or not isinstance(context, int):
         raise RuntimeError("Server /props does not report default_generation_settings.n_ctx; deployed context cannot be verified.")
     server["deployment_context"] = context
-    server["minimum_context"] = minimum_context
     save_json(output / "server.json", server)
-    if context < minimum_context:
-        raise RuntimeError(f"Server context {context} is below required {minimum_context}; restart inference with the approved context.")
     return server
 
 
 
 
-def run_benchmark(name: str, options: dict, model: Any, generation: GenerateConfig,
-                  execution: dict, output: Path) -> dict:
+def run_benchmark(name: str, options: dict, model: Any, generation: "GenerateConfig",
+                  execution: dict, output: Path, expected_manifests: dict | None = None) -> dict:
     """Keep one benchmark's data, scoring, and failures inside its own result directory."""
     output.mkdir(parents=True, exist_ok=False)
     started = now()
     save_json(output / "summary.json", {
         "status": "incomplete", "phase": "preparing", "started_at": started,
     })
-    logs: list[EvalLog] = []
+    logs: list["EvalLog"] = []
     provenance: dict = {}
     prepared = False
     runtime = None
+    score_metrics = {}
     error = None
     interrupted = False
     log_dir = output / "inspect"
     try:
         definition = get_definition(name)
-        runtime = get_runtime(name)
+        score_metrics = getattr(definition, "SCORE_METRICS", {})
+        # Freeze identity before loading runtime code or allowing any generation.
         payload, provenance = definition.prepare(options)
         prepared = True
         save_json(output / "manifest.json", provenance)
+        if expected_manifests is not None and (
+            name not in expected_manifests or provenance != expected_manifests[name]
+        ):
+            raise ValueError(f"{name} prepared manifest does not match the expected plan identity")
+        runtime = get_runtime(name)
         task = runtime.make_task(payload, provenance, options, generation)
         save_json(output / "summary.json", {
             "status": "incomplete", "phase": "evaluating", "started_at": started,
         })
+        from inspect_ai import eval as inspect_eval
+
         logs = inspect_eval(
             task,
             model=model,
@@ -111,6 +118,8 @@ def run_benchmark(name: str, options: dict, model: Any, generation: GenerateConf
         if not logs:
             for path in sorted(log_dir.glob("*.eval")):
                 try:
+                    from inspect_ai.log import read_eval_log
+
                     logs.append(read_eval_log(str(path)))
                 except Exception as read_error:
                     error.setdefault("unreadable_logs", []).append({"path": str(path), "error": str(read_error)})
@@ -126,6 +135,12 @@ def run_benchmark(name: str, options: dict, model: Any, generation: GenerateConf
                 "summary_error": {"type": type(exc).__name__, "message": str(exc),
                                   "traceback": traceback.format_exc()},
             }
+    # Runtime-owned summaries cannot turn a preparation/evaluation error into success.
+    if error is not None:
+        summary["status"] = "incomplete"
+        summary["run_error"] = error
+    summary.update(collect_generation_metrics(logs))
+    summary["score_metrics"] = score_metrics
     summary.update(started_at=started, finished_at=now())
     if interrupted:
         summary["interrupted"] = True
@@ -139,6 +154,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
+    parser.add_argument("--expected-manifests", type=Path,
+                        help="JSON map of frozen benchmark preparation identities")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     suite: dict[str, Any] = {
@@ -148,6 +165,13 @@ def main() -> int:
     try:
         config = load_config(args.config)
         names = config["benchmarks"]
+        expected_manifests = None
+        if args.expected_manifests is not None:
+            expected_manifests = json.loads(args.expected_manifests.read_text(encoding="utf-8"))
+            if not isinstance(expected_manifests, dict) or any(
+                not isinstance(value, dict) for value in expected_manifests.values()
+            ):
+                raise ValueError("--expected-manifests must contain a JSON object of benchmark manifests")
         suite["benchmarks"] = {
             name: {"status": "pending", "summary": f"{name}/summary.json"} for name in names
         }
@@ -159,8 +183,9 @@ def main() -> int:
                          for distribution in importlib.metadata.distributions()},
         })
         execution = config["execution"]
-        server_provenance(args.base_url, config["inference"]["minimum_context"],
-                          args.output, execution["request_timeout"])
+        server_provenance(args.base_url, args.output, execution["request_timeout"])
+        from inspect_ai.model import GenerateConfig, get_model
+
         generation = config["generation"]
         generate_config = GenerateConfig(
             max_tokens=generation["max_tokens"],
@@ -191,7 +216,7 @@ def main() -> int:
         for name in names:
             result = run_benchmark(
                 name, config["benchmark_options"][name], model, generate_config,
-                execution, args.output / name,
+                execution, args.output / name, expected_manifests,
             )
             suite["benchmarks"][name]["status"] = result["status"]
             save_json(args.output / "summary.json", suite)

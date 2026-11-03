@@ -2,14 +2,14 @@
 
 ## Scope and design
 
-One llama.cpp inference server, with configurable startup settings. The separate BigCodeBench runner is documented in `benchmark_container.md`; no sweep orchestrator or multi-backend framework is implemented.
+One llama.cpp inference server, with configurable startup settings. The separate benchmark controller is documented in [benchmark_container.md](benchmark_container.md); the host sweep CLI is documented in [orchestrator.md](orchestrator.md). Multiple inference backends remain future work.
 
 - `Dockerfile`: a thin image based on the official CUDA server image, with our agreed defaults and a readiness health check. No model weights or application framework are copied into it.
 - `inference.py`: a standard-library Python launcher. It mounts the model directory read-only, publishes a host port, and launches one detached container. Native llama-server arguments after `--` pass through unchanged.
 - `.dockerignore`: excludes everything except the Dockerfile from the build context.
 - Defaults live in the image, not in a second Python configuration schema. Native command-line options override image environment defaults. Request-level generation options can override server generation defaults.
 
-This launcher is not the future orchestrator. Docker commands handle logs, stop/start, and removal for now. A successful launcher exit means Docker started the container, not that the model is ready.
+Standalone `inference.py` leaves lifecycle management to Docker commands. A successful launcher exit means Docker started the container, not that the model is ready. The orchestrator reuses its launch construction and additionally owns readiness, probing, sequential execution, and cleanup.
 
 ## Pinned runtime
 

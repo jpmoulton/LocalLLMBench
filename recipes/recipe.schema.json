@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "LocalLLMBench YAML recipe — version 1",
-  "description": "Schema for data parsed from a YAML recipe. The existing launchers do not yet consume recipes. Serving-setting arrays expand into trials; benchmark and generation settings remain fixed. Default annotations do not insert values.",
+  "description": "Schema for data parsed from a YAML recipe by the host orchestrator. Serving-setting arrays expand into trials; benchmark and generation settings remain fixed. Default annotations do not insert values.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "models", "inference"],
@@ -125,7 +125,7 @@
       "properties": {
         "concurrency": {"type": "integer", "minimum": 1, "default": 1, "description": "Benchmark sample/request concurrency, not concurrent trials. Does not create inference slots."},
         "request_timeout": {"type": "number", "exclusiveMinimum": 0, "default": 900, "description": "Per-request timeout in seconds, as in the existing benchmark configuration."},
-        "startup_timeout": {"type": "number", "exclusiveMinimum": 0, "default": 300, "description": "Maximum wait in seconds for each inference server to become ready. Not a retry count; applied by the future orchestrator."}
+        "startup_timeout": {"type": "number", "exclusiveMinimum": 0, "default": 300, "description": "Maximum wait in seconds for each inference server to become ready. Not a retry count."}
       }
     },
     "output_dir": {"$ref": "#/$defs/nonemptyString", "default": "results", "description": "Parent directory for unique run outputs, relative to the recipe file unless absolute."}
