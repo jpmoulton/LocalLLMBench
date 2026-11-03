@@ -8,6 +8,9 @@ LocalLLMBench compares local model and serving-configuration combinations using 
 The complete end-to-end workflow evaluating multiple model and serving-configuration combinations under fixed benchmark protocols and answer-generation settings. Results describe those combinations without isolating the cause of a difference when several settings change together.
 _Avoid_: Sweep (as a competing name for the complete execution); run (for an individual model/configuration evaluation within it)
 
+**Recipe**:
+A reusable specification of the models, serving-configuration choices, benchmarks, and fixed evaluation settings for a run. A recipe describes the requested experiment, not its execution or results.
+
 **Trial**:
 One execution of one model with one serving configuration against all benchmarks selected for a run. Separate executions of the same model/configuration combination are separate trials.
 _Avoid_: Run (for this nested unit)

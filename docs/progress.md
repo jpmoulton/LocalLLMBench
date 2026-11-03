@@ -137,10 +137,21 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 - Evaluate current workloads at intended deployment context capacity. Short-prompt measurements at a high allocation are useful for those workloads, but do not establish long-input speed or retrieval quality. The user plans separate long-context benchmarks later; those do not block the first end-to-end workflow.
 - Feasibility classification, VRAM monitoring, and automated resource safeguards are deferred. Existing execution failures remain visible as incomplete results; successful startup alone does not establish full-context feasibility.
 - Canonical hierarchy: **Run** is the complete end-to-end workflow; **Trial** is one model/serving-configuration execution across all selected benchmarks; **Benchmark evaluation** is one benchmark's execution/results within a trial. Earlier notes and current implementation use run/sweep more loosely; code/output terminology has not yet been migrated.
-- Initial run planning uses every model against every explicitly listed serving configuration (Cartesian product). Parameter-range expansion is deferred. Do not automatically remove combinations based on predicted GPU fit.
+- Run planning evaluates every model against every requested serving configuration. The user subsequently requested per-setting value arrays and automatic configuration expansion in the recipe, superseding the earlier decision to defer parameter grids. The proposed recipe preserves explicit configurations as all-scalar blocks. Do not automatically remove combinations based on predicted GPU fit.
 - User deferred additional validation, fast-fail checks, and complicated retry/error-handling machinery. On execution failure, retain available diagnostics/results, mark the affected work incomplete, and continue with the remaining work. No automatic retries.
 - Each trial uses fresh inference and benchmark-controller containers, reusing built images. Keep that trial's inference server alive across its selected benchmarks, then clean up trial containers before starting the next trial. Trials execute sequentially.
 - The user confirmed the comparison model and minimal trial lifecycle. The design interview is complete; the user will choose the next implementation step.
+
+## YAML recipe specification
+
+- User selected YAML for readable, commented recipes and approved named configuration groups. References: [recipe format and defaults](recipe.md), [JSON Schema](../recipes/recipe.schema.json), and [YAML example](../recipes/qwen-kv-sweep.yaml). The obsolete JSON example was removed.
+- Configuration groups accept scalar native llama.cpp settings or lists of alternatives. Expand each group independently, concatenate the resulting configurations, then evaluate every model against them. Groups do not inherit from each other; benchmark/generation settings remain fixed.
+- `kv_quantization` pairs K/V by default, with optional atomic asymmetric pairs. Native independent K/V axes are also possible, but cannot be mixed with that shorthand in the same group.
+- Checked the pinned image's actual server help: cache type names include `q8_0`, `q4_0`, and `bf16`; the recipe uses exact names rather than `q8`, `q4`, or uppercase aliases. The two example GGUF filenames were verified on disk.
+- Schema/default checks passed against safely parsed YAML, existing benchmark defaults, and eight native image defaults. The example expands into eight ordered trials: two models times three 128K cache choices plus one 256K/q4 configuration per model. Atomic K/V and multi-argument mappings were verified; ten malformed/conflicting variants were rejected, including YAML on/off boolean coercion.
+- Defaults are specified, not implemented by a recipe loader: schema annotations do not populate fields. Shared defaults mirror existing benchmark behavior; native defaults remain image-owned rather than being blindly injected as CLI arguments. Context size stays explicit, and KV shorthand has no injected default that could override native K/V settings.
+- The example selects all registered benchmarks by default; currently this means 64 BigCodeBench problems per trial. No model trials were launched and feasibility of the example combinations is not established. No orchestrator, new runtime dependency, or changes to existing launchers/image defaults were added.
+- User rejected a separate recipe minimum-context threshold as redundant. The YAML example and schema now use only each group's `--ctx-size` for context configuration. Existing standalone benchmark `inference.minimum_context` code/configuration is intentionally unchanged during schema review; remove that legacy guard during orchestrator integration so smaller requested contexts are not rejected by a hidden default.
 
 ## Progress
 
@@ -159,4 +170,4 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 
 ## Next step
 
-Let the user choose the next component to build under the confirmed design. The recommended next slice is a minimal host orchestrator connecting existing inference and benchmark components into sequential trials; it has not yet been implemented or requested as the next task. Keep deferred validation, monitoring, UI, and retry machinery out of that initial slice.
+Use the YAML recipe specification for the next orchestrator CLI iteration when the user directs implementation. Current launchers do not consume recipes yet. Keep deferred monitoring, UI, advanced compatibility validation, and retry machinery outside the initial implementation.

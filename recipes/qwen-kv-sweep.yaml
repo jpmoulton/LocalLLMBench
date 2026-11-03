@@ -1,0 +1,80 @@
+# yaml-language-server: $schema=./recipe.schema.json
+# Recipe specification only: the orchestrator CLI is not implemented yet.
+# 2 models x (3 configurations + 1 configuration) = 8 sequential trials.
+# GPU fit is not guaranteed. For a first smoke, use one model/group/value and count: 2.
+
+schema_version: 1
+name: qwen-27b-context-and-kv-comparison
+
+# Every model is evaluated against every expanded configuration.
+models:
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf
+
+inference:
+  # Optional connection settings. Defaults: localhost only, port 8080.
+  bind_address: 127.0.0.1
+  port: 8080
+
+  # Each group is independent. Lists try every combination within that group.
+  # The resulting configurations from all groups are then collected into one run.
+  configurations:
+    - name: 128k-kv-comparison
+      kv_quantization: [q8_0, q4_0, bf16]  # Each choice applies to both K and V.
+      parameters:
+        --ctx-size: 131072  # Start this configuration with a 128K-token context.
+        --gpu-layers: all   # Default: all model layers offloaded to the GPU.
+        --flash-attn: "on"  # Default: on. Quote on/off so YAML keeps them as strings.
+        --batch-size: 2048  # Default: 2048 tokens per logical processing batch.
+        --ubatch-size: 512  # Default: 512 tokens per physical processing batch.
+        --parallel: 1      # Default: one server slot (one active generation request).
+
+    - name: 256k-q4-cache
+      kv_quantization: q4_0
+      parameters:
+        --ctx-size: 262144  # Start this configuration with a 256K-token context.
+        # Other settings use image defaults, NOT values from the preceding group.
+        # Omitted cache choices would use f16 for K and V; this group explicitly uses q4_0.
+
+# Controls how the model generates its answers. All trials use these SAME values
+# so differences in sampling do not get mixed into the model/server comparison.
+# Each value below is the default: omit any field, or this entire section, to keep it.
+# Use a single value per setting, not a list of alternatives.
+# This is a top-level section beside inference, not part of a configuration group.
+generation:
+  thinking: true   # Default: allow reasoning before the final answer.
+  max_tokens: 8192 # Default: maximum output tokens, including reasoning and final answer.
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.05
+  seed: 42         # Generation seed; separate from the seed used to select problems.
+
+# Optional. Omit this field or use null to run all registered benchmarks (the default).
+# To select a subset instead: benchmarks: [bigcodebench]
+benchmarks: null
+
+# Optional benchmark overrides: this example uses module defaults without specifying them.
+# BigCodeBench defaults: 64 problems, selection seed 42, and a 60-second timeout
+# for each reference-solution/generated-code test execution.
+# Its default dataset_path is already configured for this PC in the benchmark module.
+# Uncomment the following only to override those defaults (e.g. count: 2 for a smoke run).
+# On another PC, set dataset_path to wherever that machine stores the dataset.
+#
+# benchmark_options:
+#   bigcodebench:
+#     dataset_path: C:/Users/hocke/Documents/LLM-Reusable-Assets/benchmarks/datasets/current/bigcodebench
+#     selection:
+#       count: 64
+#       seed: 42
+#     test_timeout: 60
+
+# Optional execution settings; all three values shown are their defaults.
+execution:
+  concurrency: 1       # Concurrent benchmark requests; trials still run one at a time.
+  request_timeout: 900 # Seconds per model request.
+  startup_timeout: 300 # Seconds waiting for server readiness; no retries.
+
+# Relative paths resolve against this recipe file's directory.
+# The generic default is results/ beside the recipe; this targets the project root.
+output_dir: ../results

@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LocalLLMBench YAML recipe — version 1",
+  "description": "Schema for data parsed from a YAML recipe. The existing launchers do not yet consume recipes. Serving-setting arrays expand into trials; benchmark and generation settings remain fixed. Default annotations do not insert values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "models", "inference"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "name": {"$ref": "#/$defs/nonemptyString", "description": "Optional human-readable run label, not a unique run ID."},
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/nonemptyString"},
+      "description": "Local GGUF paths, in execution order. Relative paths resolve against the recipe directory. Every model is evaluated against every expanded serving configuration."
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configurations"],
+      "properties": {
+        "bind_address": {"$ref": "#/$defs/nonemptyString", "default": "127.0.0.1"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 8080},
+        "configurations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Ordered blocks. Expand each block independently, then concatenate; do not multiply different blocks together. All-scalar blocks are explicit configurations.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["parameters"],
+            "properties": {
+              "name": {"$ref": "#/$defs/nonemptyString", "description": "Optional configuration-block label; expanded trials still have distinct identities."},
+              "kv_quantization": {
+                "$ref": "#/$defs/kvAxis",
+                "description": "One KV precision or an array of alternatives. A string applies to both K and V; an object specifies one atomic K/V pair. Omission leaves native cache settings/image defaults in control."
+              },
+              "parameters": {
+                "type": "object",
+                "required": ["--ctx-size"],
+                "description": "Native llama-server long options. Scalars are fixed; arrays are sweep axes. Context allocation is explicit. Native default annotations document image defaults, not extra arguments to inject; emit only requested options to preserve aliases and paired KV choices.",
+                "propertyNames": {
+                  "pattern": "^--[a-z][a-z0-9-]*$",
+                  "not": {
+                    "enum": [
+                      "--model", "--model-url", "--hf-repo", "--hf-repo-draft", "--hf-file", "--docker-repo",
+                      "--host", "--port", "--alias", "--api-key", "--api-key-file", "--models-dir", "--models-preset",
+                      "--seed", "--temp", "--temperature", "--top-k", "--top-p", "--min-p", "--samplers", "--sampler-seq", "--sampling-seq",
+                      "--predict", "--n-predict", "--reasoning", "--reasoning-budget", "--reasoning-effort", "--chat-template-kwargs"
+                    ]
+                  }
+                },
+                "properties": {
+                  "--ctx-size": {"$ref": "#/$defs/positiveIntegerAxis"},
+                  "--parallel": {"$ref": "#/$defs/positiveIntegerAxis", "default": 1},
+                  "--gpu-layers": {"$ref": "#/$defs/nativeAxis", "default": "all"},
+                  "--flash-attn": {"$ref": "#/$defs/flashAttentionAxis", "default": "on"},
+                  "--batch-size": {"$ref": "#/$defs/positiveIntegerAxis", "default": 2048},
+                  "--ubatch-size": {"$ref": "#/$defs/positiveIntegerAxis", "default": 512},
+                  "--threads": {"$ref": "#/$defs/nativeAxis", "default": -1},
+                  "--fit": {"$ref": "#/$defs/onOffAxis", "default": "off"},
+                  "--spec-type": {"$ref": "#/$defs/nativeAxis", "default": "none"},
+                  "--cache-type-k": {"$ref": "#/$defs/precisionAxis", "description": "Image default: f16. Do not insert when kv_quantization supplies the cache type."},
+                  "--cache-type-v": {"$ref": "#/$defs/precisionAxis", "description": "Image default: f16. Do not insert when kv_quantization supplies the cache type."}
+                },
+                "additionalProperties": {"$ref": "#/$defs/nativeAxis"}
+              }
+            },
+            "allOf": [
+              {
+                "if": {"required": ["kv_quantization"]},
+                "then": {
+                  "properties": {
+                    "parameters": {
+                      "not": {
+                        "anyOf": [
+                          {"required": ["--cache-type-k"]},
+                          {"required": ["--cache-type-v"]}
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "benchmarks": {
+      "description": "Omitted or null selects all registered benchmarks once for the run. An explicit nonempty list selects only those names, in order. Registry membership is checked by the benchmark layer, not this schema.",
+      "default": null,
+      "oneOf": [
+        {"type": "null"},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/benchmarkName"}}
+      ]
+    },
+    "benchmark_options": {
+      "type": "object",
+      "default": {},
+      "propertyNames": {"$ref": "#/$defs/benchmarkName"},
+      "additionalProperties": {"type": "object"},
+      "description": "Fixed options keyed by registered benchmark name. Each module owns defaults and validation; this schema deliberately does not embed BigCodeBench's option schema. Nested arrays here are ordinary benchmark data, never sweep axes."
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "description": "Fixed across all trials. Merge omitted fields from the existing benchmark generation defaults; arrays are not accepted.",
+      "properties": {
+        "thinking": {"type": "boolean", "default": true},
+        "max_tokens": {"type": "integer", "minimum": 1, "default": 8192},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2, "default": 1.0},
+        "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.95},
+        "top_k": {"type": "integer", "minimum": 0, "default": 20},
+        "min_p": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.05},
+        "seed": {"type": "integer", "default": 42}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "concurrency": {"type": "integer", "minimum": 1, "default": 1, "description": "Benchmark sample/request concurrency, not concurrent trials. Does not create inference slots."},
+        "request_timeout": {"type": "number", "exclusiveMinimum": 0, "default": 900, "description": "Per-request timeout in seconds, as in the existing benchmark configuration."},
+        "startup_timeout": {"type": "number", "exclusiveMinimum": 0, "default": 300, "description": "Maximum wait in seconds for each inference server to become ready. Not a retry count; applied by the future orchestrator."}
+      }
+    },
+    "output_dir": {"$ref": "#/$defs/nonemptyString", "default": "results", "description": "Parent directory for unique run outputs, relative to the recipe file unless absolute."}
+  },
+  "$defs": {
+    "nonemptyString": {"type": "string", "pattern": "\\S"},
+    "benchmarkName": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "flashAttentionAxis": {
+      "oneOf": [
+        {"enum": ["on", "off", "auto"]},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["on", "off", "auto"]}}
+      ],
+      "description": "Quote on/off in YAML; booleans are not valid values for this option."
+    },
+    "onOffAxis": {
+      "oneOf": [
+        {"enum": ["on", "off"]},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["on", "off"]}}
+      ],
+      "description": "Quote on/off in YAML; booleans are not valid values for this option."
+    },
+    "precision": {
+      "type": "string",
+      "enum": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+      "description": "Names advertised by the pinned llama.cpp b12063 server. Acceptance by this schema does not establish model/kernel compatibility or GPU fit."
+    },
+    "kvValue": {
+      "oneOf": [
+        {"$ref": "#/$defs/precision"},
+        {
+          "type": "object", "additionalProperties": false, "required": ["k", "v"],
+          "properties": {"k": {"$ref": "#/$defs/precision"}, "v": {"$ref": "#/$defs/precision"}}
+        }
+      ]
+    },
+    "kvAxis": {
+      "oneOf": [
+        {"$ref": "#/$defs/kvValue"},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/kvValue"}}
+      ]
+    },
+    "precisionAxis": {
+      "oneOf": [
+        {"$ref": "#/$defs/precision"},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/precision"}}
+      ]
+    },
+    "positiveIntegerAxis": {
+      "oneOf": [
+        {"type": "integer", "minimum": 1},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 1}}
+      ]
+    },
+    "nativeValue": {
+      "oneOf": [
+        {"type": ["string", "number", "boolean"]},
+        {
+          "type": "object", "additionalProperties": false, "required": ["args"],
+          "properties": {"args": {"type": "array", "minItems": 1, "items": {"type": "string"}}},
+          "description": "Atomic argument-token bundle for one native option taking multiple arguments. Its inner array is not a sweep axis."
+        }
+      ],
+      "description": "String/number: one argument token. True: emit a valueless flag. False: omit the flag, NOT its logical inverse; image defaults remain active."
+    },
+    "nativeAxis": {
+      "oneOf": [
+        {"$ref": "#/$defs/nativeValue"},
+        {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/nativeValue"}}
+      ]
+    }
+  }
+}
