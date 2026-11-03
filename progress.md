@@ -129,6 +129,19 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 - A throwaway second registration of the real module verified multi-benchmark dispatch, isolated outputs, continuation after a missing-corpus failure, explicit-selection exclusion, and incomplete/null-score handling after a deliberate one-token cap. No extra benchmark was added.
 - BigCodeBench is still the only registered benchmark. No sweep manager, UI, new metrics pipeline, or additional benchmark was implemented.
 
+## Comparison design — confirmed
+
+- Settled terminology is recorded in [GLOSSARY.md](GLOSSARY.md). The user confirmed shared understanding at the end of the interview; these are agreed design decisions, not implemented orchestration behavior.
+- Runs may vary models and multiple serving settings freely. No controlled/deployment comparison modes or restrictions are required. Preserve each combination's exact model/settings and outcomes without attributing differences to an isolated variable.
+- Each benchmark's protocol and selected problems remain the same across every model/serving combination in a run. Sampling parameters, generation seed, reasoning mode, and output-token budget also remain fixed across those combinations.
+- Evaluate current workloads at intended deployment context capacity. Short-prompt measurements at a high allocation are useful for those workloads, but do not establish long-input speed or retrieval quality. The user plans separate long-context benchmarks later; those do not block the first end-to-end workflow.
+- Feasibility classification, VRAM monitoring, and automated resource safeguards are deferred. Existing execution failures remain visible as incomplete results; successful startup alone does not establish full-context feasibility.
+- Canonical hierarchy: **Run** is the complete end-to-end workflow; **Trial** is one model/serving-configuration execution across all selected benchmarks; **Benchmark evaluation** is one benchmark's execution/results within a trial. Earlier notes and current implementation use run/sweep more loosely; code/output terminology has not yet been migrated.
+- Initial run planning uses every model against every explicitly listed serving configuration (Cartesian product). Parameter-range expansion is deferred. Do not automatically remove combinations based on predicted GPU fit.
+- User deferred additional validation, fast-fail checks, and complicated retry/error-handling machinery. On execution failure, retain available diagnostics/results, mark the affected work incomplete, and continue with the remaining work. No automatic retries.
+- Each trial uses fresh inference and benchmark-controller containers, reusing built images. Keep that trial's inference server alive across its selected benchmarks, then clean up trial containers before starting the next trial. Trials execute sequentially.
+- The user confirmed the comparison model and minimal trial lifecycle. The design interview is complete; the user will choose the next implementation step.
+
 ## Progress
 
 ### 2026-11-03
@@ -146,4 +159,4 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 
 ## Next step
 
-Let the user inspect the benchmark configuration and sample outputs, then choose the next iteration or full subset run. Do not add benchmarks, sweeps, UI, or orchestration without direction.
+Let the user choose the next component to build under the confirmed design. The recommended next slice is a minimal host orchestrator connecting existing inference and benchmark components into sequential trials; it has not yet been implemented or requested as the next task. Keep deferred validation, monitoring, UI, and retry machinery out of that initial slice.
