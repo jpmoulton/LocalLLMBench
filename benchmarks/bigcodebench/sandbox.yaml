@@ -1,0 +1,18 @@
+services:
+  default:
+    image: ghcr.io/generality-labs/inspect-eval-bigcodebench:2026-07-28@sha256:d7c88bf92782a7486d64bc1d07cd38ba9e735b5f58235fc0c0f36f8f692a1cfe
+    init: true
+    command: ["sleep", "infinity"]
+    user: "1000:1000"
+    working_dir: /tmp
+    environment:
+      HOME: /tmp
+      MPLCONFIGDIR: /tmp/matplotlib
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    cpus: 1.0
+    mem_limit: 2g
+    pids_limit: 256
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]

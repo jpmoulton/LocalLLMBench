@@ -1,0 +1,2 @@
+inspect-ai==0.3.287
+openai==3.4.0
