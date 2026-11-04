@@ -32,6 +32,7 @@ class LifecycleBackend:
             raise AssertionError("Trial containers overlapped")
         self.current = trial["id"]
         self.started.append(self.current)
+        self.run_id = labels["localllmbench.run"]
         self.active[name] = labels
         if self.current == "0001" and self.failure == "start":
             raise RuntimeError("Container created, then startup failed")
@@ -43,8 +44,8 @@ class LifecycleBackend:
     def probe(self, base_url, timeout):
         return {"response": {"choices": [{"message": {"content": "Hello world"}}]}}
 
-    def run_benchmarks(self, command, log_path, tick):
-        directory = log_path.parent / "benchmarks"
+    def run_benchmarks(self, command, tick):
+        directory = self.root / self.run_id / "trials" / self.current / "benchmarks"
         if self.current == "0001" and self.failure == "interrupt":
             raise KeyboardInterrupt()
         incomplete = self.current == "0001" and self.failure == "benchmark"
@@ -56,8 +57,6 @@ class LifecycleBackend:
         save_json(directory / "summary.json", {"status": status})
         return 1 if incomplete else 0
 
-    def logs(self, name, output):
-        output.write_text("CPU lifecycle fixture", encoding="utf-8")
 
     def cleanup(self, labels):
         if self.cleanup_failure:
@@ -72,6 +71,7 @@ class OrchestratorTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        self.enterContext(patch("orchestrator.logging.LIVE_LOG_DIR", self.root / "logs"))
         config = resolve_config({"benchmark_options": {"bigcodebench": {"dataset_path": str(self.root)}}})
         self.plan = {
             "schema_version": 1, "name": "lifecycle", "source": "fixture", "output_dir": str(self.root),

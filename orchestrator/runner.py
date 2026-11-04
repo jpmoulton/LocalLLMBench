@@ -15,6 +15,7 @@ import uuid
 
 import benchmark
 import inference
+from orchestrator.logging import RunLogs
 from orchestrator.report import write_report
 from orchestrator.state import now, save_json, update_counts
 
@@ -22,14 +23,13 @@ from orchestrator.state import now, save_json, update_counts
 class DockerBackend:
     """Docker CLI and HTTP boundary; no model calls occur during construction."""
 
-    def __init__(self, *, verbose_logging: bool = False):
-        self.verbose_logging = verbose_logging
+    def __init__(self, *, logs: RunLogs | None = None):
+        self.log = logs if logs is not None else RunLogs()
         self._log_process = None
         self._log_reader = None
+        self._log_error = None
 
     def _follow_logs(self, name: str) -> None:
-        if not self.verbose_logging:
-            return
         process = subprocess.Popen(
             ["docker", "logs", "--follow", "--timestamps", name],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -38,9 +38,14 @@ class DockerBackend:
         )
         self._log_process = process
 
+        self._log_error = None
+
         def collect():
-            for line in process.stdout:
-                print(f"[llama.cpp] {line}", end="", flush=True)
+            try:
+                for line in process.stdout:
+                    self.log.emit("llama.cpp", line)
+            except Exception as exc:
+                self._log_error = exc
 
         self._log_reader = threading.Thread(target=collect, daemon=True)
         self._log_reader.start()
@@ -51,17 +56,22 @@ class DockerBackend:
             return
         try:
             if process.poll() is None:
-                process.terminate()
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=2)  # Let the stopped container's final output drain.
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
             if self._log_reader is not None:
                 self._log_reader.join(timeout=5)
         finally:
             process.stdout.close()
             self._log_process = self._log_reader = None
+        if self._log_error is not None:
+            raise RuntimeError(f"Inference log stream failed: {self._log_error}") from self._log_error
 
     def command(self, args: list[str], *, check: bool = True, timeout: float = 60):
         result = subprocess.run(
@@ -109,8 +119,13 @@ class DockerBackend:
                     if not self.docker_json("inspect", name)[0]["State"]["Running"]:
                         raise RuntimeError(f"Inference container exited during startup: {name}")
                     return
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                pass  # Readiness polling while llama.cpp loads, not a failed-trial retry.
+            except urllib.error.HTTPError as exc:
+                # urlopen raises before entering the response context (e.g. HTTP 503).
+                exc.close()
+            except (urllib.error.URLError, ConnectionError, TimeoutError, json.JSONDecodeError):
+                # A published port can accept then drop connections before the server is ready.
+                # Keep polling within the startup deadline; never retry generation here.
+                pass
             time.sleep(min(.5, max(0, deadline - time.monotonic())))
         raise TimeoutError(f"Inference readiness timed out after {timeout:g}s: {name}")
 
@@ -129,12 +144,12 @@ class DockerBackend:
             result = json.load(response)
         return {"request": body, "response": result, "latency_seconds": time.monotonic() - started}
 
-    def run_benchmarks(self, command: list[str], log_path: Path, tick) -> int:
-        """Stream controller output while periodically persisting elapsed progress."""
+    def run_benchmarks(self, command: list[str], tick) -> int:
+        """Save controller stdout/stderr without forwarding it to the main terminal."""
         messages = queue.Queue()
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            command, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
 
@@ -149,21 +164,18 @@ class DockerBackend:
         reader.start()
         heartbeat = time.monotonic()
         try:
-            with log_path.open("w", encoding="utf-8") as log:
-                while True:
-                    try:
-                        line = messages.get(timeout=1)
-                    except queue.Empty:
-                        line = ""
-                    if line is None:
-                        break
-                    if line:
-                        print(f"[benchmark] {line}" if self.verbose_logging else line, end="", flush=True)
-                        log.write(line)
-                        log.flush()
-                    if time.monotonic() - heartbeat >= 15:
-                        tick()
-                        heartbeat = time.monotonic()
+            while True:
+                try:
+                    line = messages.get(timeout=1)
+                except queue.Empty:
+                    line = ""
+                if line is None:
+                    break
+                if line:
+                    self.log.emit("benchmarks", line)
+                if time.monotonic() - heartbeat >= 15:
+                    tick()
+                    heartbeat = time.monotonic()
             return process.wait()
         finally:
             if process.poll() is None:
@@ -176,9 +188,6 @@ class DockerBackend:
             reader.join(timeout=5)
             process.stdout.close()
 
-    def logs(self, name: str, output: Path) -> None:
-        result = self.command(["docker", "logs", name], check=False)
-        output.write_text(result.stdout + result.stderr, encoding="utf-8")
 
     def cleanup(self, labels: dict) -> None:
         try:
@@ -211,16 +220,16 @@ def _error(phase: str, exc: BaseException) -> dict:
     return {"phase": phase, "type": type(exc).__name__, "message": str(exc), "at": now()}
 
 
-def _show_results(directory: Path, plan: dict) -> None:
+def _show_results(directory: Path, plan: dict, logs: RunLogs) -> None:
     for name in plan["benchmarks"]:
         path = directory / name / "summary.json"
         if not path.is_file():
-            print(f"  {name}: no benchmark summary", flush=True)
+            logs.print(f"  {name}: no benchmark summary")
             continue
         try:
             result = json.loads(path.read_text(encoding="utf-8"))
             metrics = {key: result.get(key) for key in result.get("score_metrics", {})}
-            print(f"  {name}: {result.get('status', 'unknown')} | scores: {json.dumps(metrics)}", flush=True)
+            logs.print(f"  {name}: {result.get('status', 'unknown')} | scores: {json.dumps(metrics)}")
             performance = result.get("performance", {})
             fields = (("decode_tokens_per_second", "decode tok/s"),
                       ("decode_ms_per_token", "decode ms/token"),
@@ -228,16 +237,22 @@ def _show_results(directory: Path, plan: dict) -> None:
                       ("request_latency_seconds_mean", "mean request seconds"))
             values = [f"{label}: {performance[key]:.3f}" for key, label in fields
                       if isinstance(performance.get(key), (int, float)) and not isinstance(performance[key], bool)]
-            print("    " + (" | ".join(values) if values else "Generation timing unavailable"), flush=True)
+            logs.print("    " + (" | ".join(values) if values else "Generation timing unavailable"))
         except (OSError, ValueError, TypeError) as exc:
-            print(f"  {name}: could not display summary: {exc}", flush=True)
+            logs.print(f"  {name}: could not display summary: {exc}")
 
 
-def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, dict, dict | None]:
-    backend = backend if backend is not None else DockerBackend()
+def execute(
+    plan: dict, *, backend=None, reporter=write_report, logs: RunLogs | None = None,
+) -> tuple[Path, dict, dict | None]:
+    if logs is None:
+        with RunLogs() as owned_logs:
+            return execute(plan, backend=backend, reporter=reporter, logs=owned_logs)
+    backend = backend if backend is not None else DockerBackend(logs=logs)
     run_id = now().replace("-", "").replace(":", "").split(".")[0] + "-" + uuid.uuid4().hex[:8]
     output = Path(plan["output_dir"]) / run_id
     output.mkdir(parents=True, exist_ok=False)
+    logs.open_run(output)
     started = time.monotonic()
     run = {
         "schema_version": 1, "run_id": run_id, "name": plan["name"], "status": "running",
@@ -268,15 +283,18 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
             failure = _error("report", exc)
             if not any(item["phase"] == "report" and item["message"] == failure["message"] for item in run["errors"]):
                 run["errors"].append(failure)
-            print(f"Report export failed; JSON results remain available: {exc}", flush=True)
+            logs.print(f"Report export failed; JSON results remain available: {exc}")
             persist()
 
     persist()
-    print(f"Run output: {output}", flush=True)
+    logs.print(f"Run output: {output}")
+    logs.print(f"Live logs (append across runs): {logs.live_dir}")
+    logs.print(f"This run's logs: {output / 'logging'}")
     interrupted = False
     try:
         backend.ensure_network()
         for index, trial in enumerate(run["trials"], 1):
+            logs.trial = trial["id"]
             directory = output / "trials" / trial["id"]
             directory.mkdir(parents=True, exist_ok=True)
             labels = {"localllmbench.run": run_id, "localllmbench.trial": trial["id"]}
@@ -286,8 +304,8 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
             trial.update(status="running", phase="load", started_at=now())
             run.update(current_trial=trial["id"], phase="load")
             persist(trial)
-            print(f"\nTrial {index}/{len(run['trials'])}: {Path(trial['model']).name} | {trial['group']}", flush=True)
-            print(f"  Parameters: {json.dumps(trial['parameters'], sort_keys=True)}", flush=True)
+            logs.print(f"\nTrial {index}/{len(run['trials'])}: {Path(trial['model']).name} | {trial['group']}")
+            logs.print(f"  Parameters: {json.dumps(trial['parameters'], sort_keys=True)}")
             phase_started = time.monotonic()
             cleanup_failed = False
             try:
@@ -305,7 +323,7 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
                 if not isinstance(content, str) or not content.strip():
                     raise RuntimeError("Hello world probe returned no assistant text")
                 trial["durations"]["probe"] = time.monotonic() - phase_started
-                print(f"  Probe: {content.strip()}", flush=True)
+                logs.print(f"  Probe: {content.strip()}")
                 trial["phase"] = run["phase"] = "benchmark"
                 phase_started = time.monotonic()
                 persist(trial)
@@ -323,10 +341,10 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
 
                 def tick():
                     persist(trial)
-                    print(f"  Trial {index}/{len(run['trials'])} running: {time.monotonic() - trial_started:.1f}s; "
-                          f"run elapsed {run['elapsed_seconds']:.1f}s", flush=True)
+                    logs.print(f"  Trial {index}/{len(run['trials'])} running: {time.monotonic() - trial_started:.1f}s; "
+                               f"run elapsed {run['elapsed_seconds']:.1f}s")
 
-                code = backend.run_benchmarks(command, directory / "benchmark.log", tick)
+                code = backend.run_benchmarks(command, tick)
                 trial["durations"]["benchmark"] = time.monotonic() - phase_started
                 summary_path = benchmark_output / "summary.json"
                 summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
@@ -337,11 +355,11 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
                 interrupted = True
                 trial["status"] = "cancelled"
                 trial["error"] = _error(trial["phase"], exc)
-                print("\nInterrupted. Cleaning up this trial's containers.", flush=True)
+                logs.print("\nInterrupted. Cleaning up this trial's containers.")
             except Exception as exc:
                 trial["status"] = "incomplete"
                 trial["error"] = _error(trial["phase"], exc)
-                print(f"  Trial incomplete during {trial['phase']}: {exc}", flush=True)
+                logs.print(f"  Trial incomplete during {trial['phase']}: {exc}")
             finally:
                 previous_phase = trial["phase"]
                 if previous_phase in trial["durations"] and trial["durations"][previous_phase] is None:
@@ -361,16 +379,12 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
                     except Exception as exc:
                         run["errors"].append(_error("status_write", exc))
                     try:
-                        backend.logs(inference_name, directory / "inference.log")
-                    except Exception as exc:
-                        run["errors"].append(_error("inference_log", exc))
-                    try:
                         backend.cleanup(labels)
                     except Exception as exc:
                         cleanup_failed = True
                         trial["status"] = "incomplete"
                         run["errors"].append(_error("cleanup", exc))
-                        print(f"  Cleanup failed; stopping the run rather than overlapping containers: {exc}", flush=True)
+                        logs.print(f"  Cleanup failed; stopping the run rather than overlapping containers: {exc}")
                 finally:
                     if previous_handler is not None:
                         signal.signal(signal.SIGINT, previous_handler)
@@ -380,9 +394,9 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
                 trial["phase"] = "finished"
                 run["current_trial"] = None
                 persist(trial)
-            _show_results(directory / "benchmarks", plan)
-            print(f"  {trial['status']}; trial {trial['duration_seconds']:.1f}s; "
-                  f"{len(run['trials']) - index} remaining; run elapsed {run['elapsed_seconds']:.1f}s", flush=True)
+            _show_results(directory / "benchmarks", plan, logs)
+            logs.print(f"  {trial['status']}; trial {trial['duration_seconds']:.1f}s; "
+                       f"{len(run['trials']) - index} remaining; run elapsed {run['elapsed_seconds']:.1f}s")
             report_results()
             if interrupted or cleanup_failed:
                 break
@@ -390,8 +404,9 @@ def execute(plan: dict, *, backend=None, reporter=write_report) -> tuple[Path, d
         interrupted = True
     except Exception as exc:
         run["errors"].append(_error(run["phase"], exc))
-        print(f"Run stopped: {exc}", flush=True)
+        logs.print(f"Run stopped: {exc}")
     finally:
+        logs.trial = None
         run["status"] = "cancelled" if interrupted else (
             "completed" if all(trial["status"] == "completed" for trial in run["trials"]) and not run["errors"]
             else "incomplete"

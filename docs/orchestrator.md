@@ -2,7 +2,7 @@
 
 The host CLI connects the existing inference and benchmark containers into a sequential **Run → Trial → Benchmark evaluation** workflow. See [terminology](GLOSSARY.md), [recipe semantics](recipe.md), and the [example recipe](../recipes/qwen-kv-sweep.yaml).
 
-**Verification status:** CPU regressions, an isolated Docker/Inspect workflow smoke, and one real two-trial Q4_K_M GPU run passed. The live run preceded verbose logging; that addition was verified separately with CPU regression and log-streaming checks.
+**Verification status:** CPU regressions, an isolated Docker/Inspect workflow smoke, and one real two-trial Q4_K_M GPU run passed. The live GPU run preceded the logging-mode changes; subsequent logging verification uses isolated CPU fixtures.
 
 ## Setup and commands
 
@@ -36,6 +36,7 @@ Model-only mode creates one configuration per model: context 8192, otherwise nat
 | `orchestrate.py` | Argument parsing, large plain-ASCII `LocalLLMBench` wordmark and plan preview, final results, exit code |
 | `orchestrator/recipe.py` | Safe YAML/schema validation, defaults, paths, deterministic expansion, frozen input manifests |
 | `orchestrator/runner.py` | Sequential lifecycle, readiness/probe, live controller output, cleanup and progress |
+| `orchestrator/logging.py` | Run-wide stream routing, live file writes, source/trial labels, and logging-mode ownership |
 | `orchestrator/state.py` | Atomic JSON state and status counts |
 | `orchestrator/report.py` | Persisted-evidence reporting and real Excel workbook |
 | `inference.py`, `benchmark.py` | Shared launch construction; standalone CLIs remain available |
@@ -47,11 +48,11 @@ Both input modes use the same resolved plan and execution path. Recipe-relative 
 
 1. Persist the plan/run state; show total trials, models, varying native arguments, and fixed benchmark/generation options.
 2. Start a uniquely named inference container on the shared `localllmbench` Docker network. Mount only its model directory read-only and publish the requested address/port.
-3. Poll `/health`, also checking that this container is still running, up to `execution.startup_timeout`.
+3. Poll `/health`, also checking that this container is still running, up to `execution.startup_timeout`. Connection refusals, resets/closures before an HTTP response, and loading responses such as HTTP 503 stay inside this readiness loop; HTTP error responses are closed to release their resources. Container exit still fails startup. This does not retry the Hello world probe or benchmark generation.
 4. Send one short Hello world probe: reasoning disabled, temperature 0, 32-token cap. Require usable assistant text, not an exact phrase match. Save it separately; exclude it from benchmark metrics.
 5. Start a fresh benchmark controller with the same options and frozen identities used by every trial. It talks to inference over Docker networking, not the published host address.
-6. Stream controller output; save elapsed status about every 15 seconds while it runs. On completion, read suite/per-benchmark summaries.
-7. Capture inference logs and phase durations, clean owned containers, print scores/generation metrics and remaining trials, and refresh reports.
+6. Route or discard controller text output according to the logging mode; save elapsed status about every 15 seconds while it runs. On completion, read suite/per-benchmark summaries.
+7. Retain phase durations and requested logs, clean owned containers, print scores/generation metrics and remaining trials, and refresh reports.
 8. Continue sequentially, then finalize reports/status and exit.
 
 Native launch arguments/image identity, reported server context, effective configuration, selected IDs/provenance, and Inspect logs are retained. `--ctx-size` is the context control; the old `minimum_context` setting/check has been removed. The model file is identified by path, not a multi-gigabyte content hash: do not overwrite it during a run.
@@ -84,15 +85,43 @@ The current non-streaming calls do not measure client TTFT or streaming TPOT. Pr
 
 ## Console and saved logs
 
-Enable live inference output on the next launch:
+Logging is automatic. The main terminal shows only LocalLLMBench's plan, progress, results, and failure notices. There is no logging flag or mode to select.
+
+Every executing run writes all three streams to two locations:
+
+| Stream | Stable live file, relative to the project directory | This run's archived copy |
+| --- | --- | --- |
+| LocalLLMBench | `logs/localllmbench.log` | `results/<run-id>/logging/localllmbench.log` |
+| llama.cpp stdout/stderr | `logs/llamacpp.log` | `results/<run-id>/logging/llamacpp.log` |
+| Benchmark controller / Inspect stdout/stderr | `logs/benchmarks.log` | `results/<run-id>/logging/benchmarks.log` |
+
+The stable files append across executions: they are not truncated or replaced, so a tail window can stay open between runs. Their directory is anchored to the project, independent of the current working directory or recipe's `output_dir`. Archived files contain only their own run and are written at the same time as the live files, not copied at shutdown. Both destinations are flushed after each entry so logs are available during execution and remain useful after an interrupted run.
+
+Directories and files are created automatically when execution begins, before model startup. `--plan-only` creates no run directory or log files. Start normally:
 
 ```powershell
-.\.venv\Scripts\python.exe orchestrate.py --recipe recipes/qwen-smoke.yaml --verbose_logging
+.\.venv\Scripts\python.exe orchestrate.py --recipe recipes/qwen-smoke.yaml
 ```
 
-This follows the current trial's inference stdout/stderr from startup with `[llama.cpp]` labels and Docker timestamps, alongside `[benchmark]`-labelled controller/Inspect console output. Without the flag, the existing progress and benchmark output remain unchanged. The flag changes console visibility, not native logging levels, generation settings, or which benchmark records are saved. Verbose terminal I/O can add overhead; prefer normal mode for timing comparisons.
+From the project directory, use separate PowerShell windows for any streams you want to follow:
 
-Each trial's `benchmark.log` is written live, with unprefixed controller stdout/stderr. `inference.log` is a snapshot collected at cleanup, not a live file. Detailed prompts, reasoning, answers, test/scoring output, and errors stay in `benchmarks/<name>/inspect/*.eval`; verbose mode does not expand those records into the console. The log-follower process is stopped during cleanup even if Docker removal fails. An already-running orchestrator does not pick up a newly added CLI flag.
+```powershell
+Get-Content .\logs\localllmbench.log -Tail 50 -Wait
+```
+
+```powershell
+Get-Content .\logs\llamacpp.log -Tail 50 -Wait
+```
+
+```powershell
+Get-Content .\logs\benchmarks.log -Tail 50 -Wait
+```
+
+Start tailing after the first execution has created the files. The CLI prints both the stable log directory and the current run's archive directory. Entries carry UTC timestamps, a run ID, a source label, and a trial ID or run-level marker. LocalLLMBench's files include the initial preview and final summary; inference output is followed live from startup through cleanup.
+
+Files are closed after final reporting. Inference followers are stopped during cleanup even if Docker removal fails. Live files are ignored by Git and currently have no automatic rotation; they grow across runs. Existing result archives are not modified or backfilled into the stable files.
+
+JSON status/scores, spreadsheets, and native Inspect `.eval` evidence remain unchanged. Inspect evidence includes prompts, reasoning, answers, test/scoring output, and errors; it is separate from the text streams. This behavior applies to the orchestrator, not standalone launchers, and does not change Docker's internal log retention or engine log levels.
 
 ## Results and future read-only UI
 
@@ -102,12 +131,14 @@ results/<run-id>/
   run.json
   report.json
   results.xlsx
+  logging/
+    localllmbench.log
+    llamacpp.log
+    benchmarks.log
   trials/0001/
     trial.json
     inference.json
-    inference.log
     probe.json
-    benchmark.log
     benchmarks/
       config.json
       container_config.json
@@ -122,18 +153,19 @@ results/<run-id>/
         inspect/*.eval
 ```
 
-Artifacts absent after an early failure are expected. `run.json` records current phase/trial, timestamps, counts, all planned trial states, errors, and result paths. `trial.json` records exact model/settings and load/probe/benchmark/cleanup durations. JSON state uses atomic replacement; a future read-only localhost UI can consume it without scraping terminal output. No web server or control UI is implemented.
+Artifacts absent after an early failure are expected. `run.json` records the current phase/trial, timestamps, counts, all planned trial states, errors, and result paths. `trial.json` records exact model/settings and load/probe/benchmark/cleanup durations. JSON state uses atomic replacement; a future read-only localhost UI can consume it without scraping terminal output. No web server or control UI is implemented.
 
 Workbook sheets: **Run**, **Trials**, **Benchmark results**, **Samples**. Include incomplete/unstarted trials, per-benchmark quality leaders, generation measurements/coverage, sample outcomes/model-call rows, and links to evidence. External strings are literal spreadsheet cells, not formulas. Full reasoning/answers remain in native Inspect logs.
 
 ## Exercised verification
 
-- `python -m unittest discover -s tests -q`: 62 tests passed, including expansion, manifest mismatch rejection, timing coverage, report safety, fail-and-continue, interruption, cleanup failure, status/export failures, and log-reader cleanup after Docker failure.
+- `python -m unittest discover -s tests -q`: 72 tests passed, including expansion, manifest mismatch rejection, timing coverage, report safety, lifecycle failures/cancellation, log routing, and readiness boundaries (disconnect recovery, timeout, container exit, and no generation-probe retry).
 - Both real-path CLI previews passed: the checked-in recipe resolves eight trials; model-only input resolves one default trial. Neither loads a model.
 - Rebuilt the benchmark image successfully.
 - Disposable CPU-only Docker smoke: one deliberately exited startup followed by two completed real Inspect/BigCodeBench sandbox evaluations of a synthetic one-problem corpus. Verified fixed manifests, probe versus benchmark reasoning settings, timing propagation, spreadsheet readback, and no remaining owned containers. The response service had no GPU device requests. These were workflow fixtures, not model scores or speed measurements; scripts/data/results were removed afterward.
 - Ran the new collector over the retained native evaluation at `results/20261103T184944Z-95d186f9/`: two measured calls, 9,880 generated tokens, 141.95804 summed decode seconds, approximately 69.598 server decode tokens/s. This reads existing evidence; no new inference request.
-- Verbose logging: isolated CPU Docker stdout/stderr streamed with source labels alongside a controller-process fixture; raw benchmark logs and nonzero exit code were preserved, and the follower/container were removed. CLI help exposes the flag. No GPU operations or changes to the user's active run were made.
+- Automatic logging smoke (2026-11-04): two executions of the actual CLI with a disposable CPU response service and real Inspect/BigCodeBench sandbox evaluation, one fixture problem per execution. An unchanged open tail handle saw the second execution's inference output. All three stable live files exactly matched the concatenated per-run archives, child streams stayed out of the main console, and native `.eval`/JSON/XLSX results were retained. Also verified file-free plan-only, rejection of the removed logging flag, and owned-container cleanup. Temporary fixtures/results were removed; no GPU/model was loaded and no image rebuild was required. The 72-test CPU suite covers live flushes, stream/trial isolation, append/archive boundaries, concurrent writers, subprocess failures, and follower cleanup.
+- Startup disconnect fix (2026-11-04): reproduced the reported `RemoteDisconnected` using a real local HTTP server before editing. The readiness poll now catches connection-level failures within its existing deadline. Verified with a CPU-only Docker service that closes the first health connection, returns HTTP 503 next, then becomes healthy and answers the probe. Owned fixture cleanup passed; no competing GPU/model work or interference with the user's active second trial. The running orchestrator retains its old code; the fix applies on the next launch.
 
 ### Real GPU integration smoke — 2026-11-03
 
