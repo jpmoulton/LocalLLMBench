@@ -1,4 +1,4 @@
-"""Export persisted trial evidence without running benchmarks or ranking speed."""
+"""Aggregate comparison exports and lightweight execution status; no sample exports."""
 
 from datetime import datetime
 import json
@@ -51,8 +51,7 @@ def _append(sheet: Any, values: list[Any]) -> None:
     row = []
     for value in values:
         value = _json_value(value)
-        if isinstance(value, (dict, list)):
-            value = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        # Rows contain only scalar comparison data, never serialized objects.
         if isinstance(value, str):
             value = ILLEGAL_CHARACTERS_RE.sub(lambda match: f"\\x{ord(match[0]):02x}", value)
         row.append(value)
@@ -71,14 +70,6 @@ def _table(sheet: Any, rows: list[dict], first_columns: tuple[str, ...]) -> None
     _append(sheet, columns)
     for row in rows:
         _append(sheet, [row.get(key) for key in columns])
-        for index, key in enumerate(columns, 1):
-            value = row.get(key)
-            if (key in {"summary_path", "manifest_path", "inspect_directory", "trial_path", "benchmark_summary"}
-                    and isinstance(value, str) and value.startswith("trials/")
-                    and ".." not in value.replace("\\", "/").split("/")):
-                cell = sheet.cell(sheet.max_row, index)
-                cell.hyperlink = value
-                cell.style = "Hyperlink"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     for cell in sheet[1]:
@@ -124,161 +115,141 @@ def _leaders(results: list[dict]) -> dict:
     return leaders
 
 
-def _collect(output: Path, plan: dict, run: dict) -> dict:
+def _cell(value: Any) -> Any:
+    value = _json_value(value)
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub(lambda match: f"\\x{ord(match[0]):02x}", value)
+    return value
+
+
+def _number(value: Any) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+
+def _settings(row: dict, prefix: str, value: Any) -> None:
+    """Flatten requested settings into scalar columns, including repeated native flags."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _settings(row, f"{prefix}.{key}", item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _settings(row, f"{prefix}.{index}", item)
+    else:
+        row[prefix] = _cell(value)
+
+
+def _error_text(error: Any) -> str | None:
+    if isinstance(error, dict):
+        error = error.get("message") or error.get("type")
+    return _cell(" ".join(error.split())[:500]) if isinstance(error, str) and error else None
+
+
+def _collect(output: Path, plan: dict, run: dict) -> tuple[list[dict], dict]:
     states = {str(trial["id"]): trial for trial in run.get("trials", [])}
-    trials = []
-    results = []
-    samples = []
-    errors = []
+    rows = []
+    leader_inputs = []
     for planned in plan.get("trials", []):
         trial_id = str(planned["id"])
-        trial = {**planned, "status": "pending", **states.get(trial_id, {})}
-        trial.setdefault("benchmark_summary", f"trials/{trial_id}/benchmarks/summary.json")
-        trial["trial_path"] = f"trials/{trial_id}/trial.json"
-        trials.append(trial)
+        trial: dict[str, Any] = {**planned, "status": "pending", **states.get(trial_id, {})}
         for benchmark in plan.get("benchmarks", []):
-            directory = Path("trials") / trial_id / "benchmarks" / benchmark
-            summary_path = (directory / "summary.json").as_posix()
-            status = "pending" if trial["status"] == "pending" else "incomplete"
+            summary_path = output / "trials" / trial_id / "benchmarks" / benchmark / "summary.json"
             summary = {}
+            read_error = None
             try:
-                summary = json.loads((output / summary_path).read_text(encoding="utf-8"))
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 if not isinstance(summary, dict):
                     raise ValueError("Benchmark summary must be a JSON object")
             except FileNotFoundError:
                 pass
             except (OSError, UnicodeError, ValueError) as exc:
-                errors.append({"path": summary_path, "type": type(exc).__name__, "message": str(exc)})
+                read_error = f"{type(exc).__name__}: {exc}"
                 summary = {}
-            if summary:
-                status = summary.get("status", "incomplete")
+            status = summary.get("status") or (
+                trial["status"] if trial["status"] in ("pending", "running", "cancelled") else "incomplete"
+            )
             try:
                 duration = (
-                    datetime.fromisoformat(summary.get("finished_at"))
-                    - datetime.fromisoformat(summary.get("started_at"))
+                    datetime.fromisoformat(summary["finished_at"])
+                    - datetime.fromisoformat(summary["started_at"])
                 ).total_seconds()
                 duration = duration if duration >= 0 else None
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 duration = None
-            result = {
-                "trial_id": trial_id, "benchmark": benchmark, "model": trial.get("model"),
-                "group": trial.get("group"), "parameters": trial.get("parameters", {}),
-                "trial_status": trial["status"], "status": status,
-                "summary_path": summary_path,
-                "manifest_path": (directory / "manifest.json").as_posix(),
-                "inspect_directory": (directory / "inspect").as_posix(),
-                "inspect_logs": summary.get("inspect_logs", []),
-                "expected_manifest": plan.get("manifests", {}).get(benchmark),
-                "request_concurrency": plan.get("execution", {}).get("concurrency"),
-                "parallel_slots": trial.get("parameters", {}).get("--parallel"),
-                "benchmark_duration_seconds": duration,
-                "summary": summary,
+            row = {
+                "trial_id": trial_id,
+                "model": _cell(Path(trial["model"]).name) if trial.get("model") else None,
+                "model_path": _cell(trial.get("model")),
+                "configuration": _cell(trial.get("group")),
+                "benchmark": _cell(benchmark),
+                "trial_status": trial["status"],
+                "benchmark_status": status,
             }
-            results.append(result)
-            for field, row_type in (("samples", "outcome"), ("generation_samples", "generation")):
-                rows = summary.get(field, [])
-                if not isinstance(rows, list):
-                    continue
-                for sample in rows:
-                    samples.append({
-                        "trial_id": trial_id, "benchmark": benchmark, "row_type": row_type,
-                        "summary_path": summary_path, "manifest_path": result["manifest_path"],
-                        "inspect_directory": result["inspect_directory"],
-                        "inspect_logs": result["inspect_logs"], "sample": sample,
-                    })
-    return _json_value({
-        "schema_version": 1, "run": {key: value for key, value in run.items() if key != "trials"},
-        "trials": trials, "benchmark_results": results, "samples": samples,
-        "benchmark_leaders": _leaders(results), "report_errors": errors,
-    })
+            _settings(row, "inference", trial.get("parameters", {}))
+            _settings(row, "generation", plan.get("generation", {}))
+            _settings(row, "benchmark_options", plan.get("benchmark_options", {}).get(benchmark, {}))
+            metadata = summary.get("score_metrics", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            for metric in metadata:
+                row[f"score.{metric}"] = _number(summary.get(metric))
+            performance = summary.get("performance") or {}
+            performance = performance if isinstance(performance, dict) else {}
+            for field in dict.fromkeys((*PERFORMANCE_FIELDS, *performance)):
+                row[f"performance.{field}"] = _number(performance.get(field))
+            durations = trial.get("durations") or {}
+            row.update({
+                "load_seconds": _number(durations.get("load")),
+                "probe_seconds": _number(durations.get("probe")),
+                "benchmark_seconds": duration,
+                "trial_benchmark_seconds": _number(durations.get("benchmark")),
+                "cleanup_seconds": _number(durations.get("cleanup")),
+                "trial_seconds": _number(trial.get("duration_seconds")),
+                "request_concurrency": plan.get("execution", {}).get("concurrency"),
+                "sample_count": _number(summary.get("denominator")),
+                "scored_count": _number(summary.get("scored")),
+            })
+            counts = summary.get("counts", {})
+            if isinstance(counts, dict):
+                row.update({f"count.{key}": _number(value) for key, value in counts.items()})
+            row["trial_error"] = _error_text(trial.get("error"))
+            row["benchmark_error"] = _error_text(
+                read_error or summary.get("run_error") or summary.get("summary_error")
+            )
+            rows.append(row)
+            # Keep only aggregate score evidence for console leaders, not sample arrays.
+            leader_inputs.append({
+                "trial_id": trial_id, "benchmark": benchmark, "status": status,
+                "summary": {"score_metrics": metadata, **{key: summary.get(key) for key in metadata}},
+            })
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    rows = [{column: row.get(column) for column in columns} for row in rows]
+    return rows, _leaders(leader_inputs)
 
 
-def _workbook(report: dict, plan: dict) -> Workbook:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Run"
-    run_rows = [{"Field": key, "Value": value} for key, value in report["run"].items()]
-    for key in ("name", "source", "output_dir", "inference", "benchmarks", "benchmark_options",
-                "generation", "execution", "manifests"):
-        run_rows.append({"Field": f"plan.{key}", "Value": plan.get(key)})
-    run_rows.extend([
-        {"Field": "plan_path", "Value": "plan.json"},
-        {"Field": "run_path", "Value": "run.json"},
-        {"Field": "report_path", "Value": "report.json"},
-        {"Field": "report_errors", "Value": report["report_errors"]},
-        {"Field": "generation_measurements", "Value": (
-            "Server decode rate is summed generated tokens / summed measured decode seconds; "
-            "not total system throughput. Timing counters show coverage; missing is unavailable. "
-            "No speed ranking. Probe timing is excluded."
-        )},
-        {"Field": "sample_rows", "Value": (
-            "Outcome rows preserve benchmark-owned sample identities and fields; generation rows "
-            "are individual model calls with native Inspect IDs. Do not count both as samples."
-        )},
-    ])
-    _table(sheet, run_rows, ("Field", "Value"))
-    sheet.auto_filter.ref = None
-    _append(sheet, [])
-    _append(sheet, ["Benchmark", "Metric", "Label", "Direction", "Value", "Trial IDs", "Unit"])
-    for benchmark, metrics in report["benchmark_leaders"].items():
-        if not metrics:
-            _append(sheet, [benchmark, None, "No eligible completed scores"])
-        for metric, leader in metrics.items():
-            _append(sheet, [benchmark, metric, leader["label"], leader["direction"],
-                            leader["value"], leader["trial_ids"], leader["unit"]])
-    sheet.column_dimensions["A"].width = 32
-    sheet.column_dimensions["B"].width = 80
-
-    trial_rows = []
-    for trial in report["trials"]:
-        row = {key: value for key, value in trial.items() if key != "durations"}
-        for phase in ("load", "probe", "benchmark", "cleanup"):
-            row[f"duration.{phase}_seconds"] = (trial.get("durations") or {}).get(phase)
-        trial_rows.append(row)
-    _table(workbook.create_sheet("Trials"), trial_rows,
-           ("id", "model", "group", "parameters", "status", "phase", "started_at", "finished_at",
-            "duration_seconds", "error", "benchmark_summary", "trial_path"))
-
-    result_rows = []
-    for result in report["benchmark_results"]:
-        row = {key: value for key, value in result.items() if key != "summary"}
-        summary = result["summary"]
-        for key, value in summary.items():
-            if key not in ("samples", "generation_samples", "performance"):
-                row[f"result.{key}"] = value
-        performance = summary.get("performance") or {}
-        for key in dict.fromkeys((*PERFORMANCE_FIELDS, *performance)):
-            row[f"performance.{key}"] = performance.get(key)
-        result_rows.append(row)
-    _table(workbook.create_sheet("Benchmark results"), result_rows,
-           ("trial_id", "benchmark", "model", "group", "status", "trial_status", "summary_path"))
-
-    sample_rows = []
-    for sample in report["samples"]:
-        row = {key: value for key, value in sample.items() if key != "sample"}
-        if isinstance(sample["sample"], dict):
-            row.update({f"sample.{key}": value for key, value in sample["sample"].items()})
-        else:
-            row["sample"] = sample["sample"]
-        sample_rows.append(row)
-    _table(workbook.create_sheet("Samples"), sample_rows,
-           ("trial_id", "benchmark", "row_type", "sample.id", "sample.epoch", "sample.call_index",
-            "summary_path", "manifest_path", "inspect_directory", "inspect_logs"))
-    return workbook
+def write_status(output: Path, run: dict) -> None:
+    """Persist progress without collecting benchmark data or regenerating exports."""
+    output.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema_version": 3,
+        "run": {key: value for key, value in run.items() if key != "trials"},
+        "trials": [
+            {key: trial.get(key) for key in ("id", "status", "phase", "started_at", "finished_at", "error")}
+            for trial in run.get("trials", [])
+        ],
+    }
+    _atomic_json(output / "execution_report.json", _json_value(report))
 
 
-def write_report(output: Path, plan: dict, run: dict) -> dict:
-    """Atomically save JSON first, then XLSX; leave authoritative JSON on export failure.
-
-    Completed benchmark evaluations alone may provide declared quality leaders,
-    even if a different benchmark made their trial incomplete. Generation metrics
-    are evidence only. Pending trials and absent outputs never imply zero scores.
-    """
+def write_results(output: Path, plan: dict, run: dict) -> dict:
+    """Write the same scalar rows to JSON and XLSX, retaining JSON if XLSX fails."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    report = _collect(output, plan, run)
-    _atomic_json(output / "report.json", report)
-    workbook = _workbook(report, plan)
+    rows, leaders = _collect(output, plan, run)
+    results = {"schema_version": 1, "results": rows}
+    _atomic_json(output / "results.json", results)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Results"
+    _table(sheet, rows, ("trial_id", "model", "model_path", "configuration", "benchmark", "trial_status", "benchmark_status"))
     with tempfile.NamedTemporaryFile(dir=output, suffix=".xlsx", delete=False) as file:
         temporary = Path(file.name)
     try:
@@ -287,4 +258,4 @@ def write_report(output: Path, plan: dict, run: dict) -> dict:
     finally:
         workbook.close()
         temporary.unlink(missing_ok=True)
-    return report
+    return {**results, "benchmark_leaders": leaders}

@@ -94,7 +94,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual([trial["status"] for trial in run["trials"]], ["incomplete", "completed"])
         self.assertEqual(backend.active, {"unrelated": {"owner": "user"}})
         self.assertEqual(report["benchmark_leaders"]["bigcodebench"]["pass_rate"]["trial_ids"], ["0002"])
-        self.assertEqual(json.loads((output / "run.json").read_text())["counts"], run["counts"])
+        self.assertEqual(json.loads((output / "execution_report.json").read_text())["run"]["counts"], run["counts"])
         self.assertEqual(run["counts"]["completed"], 1)  # Incorrect answers remain completed evaluations.
 
     def test_start_failure_after_container_creation_is_cleaned_before_next_trial(self):
@@ -111,7 +111,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual([trial["status"] for trial in run["trials"]], ["cancelled", "pending"])
         self.assertEqual(backend.started, ["0001"])
         self.assertEqual(backend.active, {"unrelated": {"owner": "user"}})
-        self.assertEqual(json.loads((output / "report.json").read_text())["run"]["status"], "cancelled")
+        self.assertEqual(json.loads((output / "execution_report.json").read_text())["run"]["status"], "cancelled")
 
     def test_interrupt_during_cleanup_finishes_cleanup_before_stopping_schedule(self):
         backend = LifecycleBackend(self.root, interrupt_cleanup=True)
@@ -130,13 +130,16 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_spreadsheet_failure_preserves_json_and_does_not_skip_later_trials(self):
         backend = LifecycleBackend(self.root)
-        def unavailable_report(*args):
-            raise PermissionError("Spreadsheet is open in Excel")
-        output, run, _ = self.execute(backend, reporter=unavailable_report)
+        with patch("orchestrator.report.Workbook.save", side_effect=PermissionError("Spreadsheet is open in Excel")):
+            output, run, _ = self.execute(backend)
         self.assertEqual(backend.started, ["0001", "0002"])
         self.assertEqual(run["status"], "incomplete")
         self.assertEqual(len(run["errors"]), 1)
-        self.assertEqual(json.loads((output / "run.json").read_text())["status"], "incomplete")
+        saved = json.loads((output / "execution_report.json").read_text())
+        self.assertEqual(saved["run"]["status"], "incomplete")
+        self.assertEqual(saved["run"]["errors"][0]["message"], "Spreadsheet is open in Excel")
+        results = json.loads((output / "results.json").read_text())
+        self.assertEqual(results["results"][1]["score.pass_rate"], 0)
 
     def test_status_write_failure_during_cleanup_does_not_skip_resource_removal(self):
         backend = LifecycleBackend(self.root)
@@ -149,6 +152,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(backend.active, {"unrelated": {"owner": "user"}})
         self.assertEqual(run["status"], "incomplete")
         self.assertTrue(any(error["phase"] == "status_write" for error in run["errors"]))
+
+    def test_report_tracks_active_trial_without_losing_completed_metrics(self):
+        backend = LifecycleBackend(self.root)
+        start = backend.start
+        snapshots = []
+
+        def observe_start(trial, plan, name, labels):
+            metadata = start(trial, plan, name, labels)
+            output = self.root / labels["localllmbench.run"]
+            snapshots.append(json.loads((output / "execution_report.json").read_text()))
+            self.assertEqual(json.loads((output / "execution_plan.json").read_text()), self.plan)
+            for name in ("run.json", "plan.json", "report.json"):
+                self.assertFalse((output / name).exists())
+            if trial["id"] == "0002":
+                results = json.loads((output / "results.json").read_text())
+                self.assertEqual(results["results"][0]["score.pass_rate"], 0)
+            return metadata
+
+        with patch.object(backend, "start", side_effect=observe_start):
+            output, run, report = self.execute(backend)
+        first, second = snapshots
+        self.assertEqual(first["run"]["current_trial"], "0001")
+        self.assertEqual(first["run"]["phase"], "load")
+        self.assertEqual([trial["status"] for trial in first["trials"]], ["running", "pending"])
+        self.assertEqual(second["run"]["current_trial"], "0002")
+        self.assertEqual(second["run"]["phase"], "load")
+        self.assertEqual(second["run"]["counts"]["completed"], 1)
+        self.assertNotIn("benchmark_results", second)
+        saved = json.loads((output / "execution_report.json").read_text())
+        self.assertEqual(saved["run"]["status"], "completed")
+        self.assertEqual(saved["run"]["counts"], run["counts"])
+        results = json.loads((output / "results.json").read_text())
+        self.assertEqual(results["results"], report["results"])
 
 
 if __name__ == "__main__":

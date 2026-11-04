@@ -37,7 +37,7 @@ def preview(plan: dict, logs: RunLogs | None = None) -> None:
     logs.print("  Unspecified native flags use the inference image's defaults.")
     logs.print(f"\nFixed generation settings: {json.dumps(plan['generation'], sort_keys=True)}")
     logs.print(f"Fixed benchmark execution settings: {json.dumps(plan['execution'], sort_keys=True)}")
-    logs.print("Benchmark options and prepared task identities are frozen in plan.json for every trial.")
+    logs.print("Benchmark options and prepared task identities are frozen in execution_plan.json for every trial.")
     for name in plan["benchmarks"]:
         logs.print(f"  {name}: {json.dumps(plan['benchmark_options'][name], sort_keys=True)}")
     logs.print("\nTrial schedule:")
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         logs.print(f"Results and status: {output}")
         if (output / "results.xlsx").is_file():
             logs.print(f"Spreadsheet: {output / 'results.xlsx'}")
-        logs.print("Generation metrics are in the benchmark summaries and spreadsheet; no speed ranking is applied.")
+        logs.print("Comparison scores and generation metrics are in results.json and results.xlsx; no speed ranking is applied.")
         return 130 if run["status"] == "cancelled" else (0 if run["status"] == "completed" else 1)
 
 

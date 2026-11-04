@@ -57,7 +57,7 @@ def _check_aliases(node: yaml.Node, ancestors: set[int]) -> None:
 
 
 def _check_json_data(value: object, ancestors: set[int] | None = None) -> None:
-    """Reject YAML values that cannot be represented faithfully in plan.json."""
+    """Reject YAML values that cannot be represented faithfully in execution_plan.json."""
     if ancestors is None:
         ancestors = set()
     if isinstance(value, (dict, list)):

@@ -51,8 +51,8 @@ Both input modes use the same resolved plan and execution path. Recipe-relative 
 3. Poll `/health`, also checking that this container is still running, up to `execution.startup_timeout`. Connection refusals, resets/closures before an HTTP response, and loading responses such as HTTP 503 stay inside this readiness loop; HTTP error responses are closed to release their resources. Container exit still fails startup. This does not retry the Hello world probe or benchmark generation.
 4. Send one short Hello world probe: reasoning disabled, temperature 0, 32-token cap. Require usable assistant text, not an exact phrase match. Save it separately; exclude it from benchmark metrics.
 5. Start a fresh benchmark controller with the same options and frozen identities used by every trial. It talks to inference over Docker networking, not the published host address.
-6. Route or discard controller text output according to the logging mode; save elapsed status about every 15 seconds while it runs. On completion, read suite/per-benchmark summaries.
-7. Retain phase durations and requested logs, clean owned containers, print scores/generation metrics and remaining trials, and refresh reports.
+6. Save controller text output to its live log and run archive; atomically refresh `execution_report.json` about every 15 seconds while benchmarks run. On completion, read suite/per-benchmark summaries.
+7. Retain phase durations and logs, clean owned containers, print scores/generation metrics and remaining trials, and refresh matching comparison exports in `results.json` and `results.xlsx`.
 8. Continue sequentially, then finalize reports/status and exit.
 
 Native launch arguments/image identity, reported server context, effective configuration, selected IDs/provenance, and Inspect logs are retained. `--ctx-size` is the context control; the old `minimum_context` setting/check has been removed. The model file is identified by path, not a multi-gigabyte content hash: do not overwrite it during a run.
@@ -127,9 +127,9 @@ JSON status/scores, spreadsheets, and native Inspect `.eval` evidence remain unc
 
 ```text
 results/<run-id>/
-  plan.json
-  run.json
-  report.json
+  execution_plan.json
+  execution_report.json
+  results.json
   results.xlsx
   logging/
     localllmbench.log
@@ -153,19 +153,52 @@ results/<run-id>/
         inspect/*.eval
 ```
 
-Artifacts absent after an early failure are expected. `run.json` records the current phase/trial, timestamps, counts, all planned trial states, errors, and result paths. `trial.json` records exact model/settings and load/probe/benchmark/cleanup durations. JSON state uses atomic replacement; a future read-only localhost UI can consume it without scraping terminal output. No web server or control UI is implemented.
+### Artifact responsibilities
 
-Workbook sheets: **Run**, **Trials**, **Benchmark results**, **Samples**. Include incomplete/unstarted trials, per-benchmark quality leaders, generation measurements/coverage, sample outcomes/model-call rows, and links to evidence. External strings are literal spreadsheet cells, not formulas. Full reasoning/answers remain in native Inspect logs.
+| File | Contents |
+| --- | --- |
+| `execution_plan.json` | Resolved configuration, fixed benchmark identities, and planned trials |
+| `execution_report.json` | Lightweight live execution status: run ID/name, phase/current trial, timestamps, elapsed time, counts, errors, and each trial's status/phase/timestamps/error |
+| `results.json` | A `results` array containing one flat comparison row per trial × benchmark |
+| `results.xlsx` | A single **Results** sheet with the same rows, field names, and scalar values as `results.json` |
+
+The execution report is written before model startup and atomically updated at phase changes, benchmark heartbeats, trial completion, and finalization. It does not collect benchmark results on every heartbeat. Comparison exports refresh after each trial and at finalization. JSON is saved before XLSX; if Excel locks the spreadsheet, the newest JSON remains available and the execution report records the export failure. The older XLSX may then be stale.
+
+### Comparison rows
+
+Every row is self-contained: the model/settings combination is repeated for each benchmark it ran. Filter the sheet by benchmark, model, or settings without joining another sheet. There are no Run, Trials, or Samples sheets.
+
+| Fields | Meaning |
+| --- | --- |
+| `trial_id`, `model`, `model_path`, `configuration`, `benchmark` | Trial identity, model filename and full path, configuration-group name, and benchmark |
+| `inference.*` | Requested native parameters, for example `inference.--ctx-size` and `inference.--cache-type-k` |
+| `generation.*` | Fixed answer-generation settings, including thinking, token limit, sampling settings, and seed |
+| `benchmark_options.*`, `request_concurrency` | Benchmark options and concurrent requests |
+| `score.*` | Declared benchmark scores, such as `score.pass_rate`; unavailable/invalid values are null |
+| `performance.*` | Aggregate decode/prompt speed, request latency, token totals, measured durations, and coverage counters |
+| `load_seconds`, `probe_seconds`, `cleanup_seconds`, `trial_seconds` | Timings for the enclosing trial |
+| `benchmark_seconds`, `trial_benchmark_seconds` | This benchmark's wall time versus the trial's total benchmark-controller time |
+| `sample_count`, `scored_count`, `count.*` | Aggregate sample counts, never individual records |
+| `trial_status`, `benchmark_status`, `trial_error`, `benchmark_error` | Outcomes and concise failure information |
+
+Column names are JSON keys verbatim: for example `results[0]["score.pass_rate"]` or `results[0]["performance.decode_tokens_per_second"]`. Both exports are built from the same normalized rows. All rows have the same keys; benchmark-specific columns are null/blank where unavailable or inapplicable, not zero. Nested settings flatten into separate columns; list values use numeric indexes such as `inference.--override.args.0`. No JSON objects are embedded in spreadsheet cells.
+
+Generation metrics belong to each benchmark evaluation; unrelated benchmarks are not averaged into an overall speed. Trial timings repeat across that trial's benchmark rows: do not sum repeated load or trial durations. Missing native arguments use image defaults; the comparison does not invent effective values for unspecified flags. Actual startup/server evidence remains under each trial.
+
+Neither comparison export nor the execution report includes individual samples, prompts, reasoning, answers, or full tracebacks. Error cells contain at most 500 characters; full evidence stays in benchmark summaries, native Inspect logs, trial artifacts, and text logs. External spreadsheet strings remain literal text rather than formulas. Quality leaders still appear in the CLI; no speed ranking or extra leader table is exported.
+
+A future read-only localhost UI can combine the execution plan/status and comparison rows; no UI is implemented. New runs do not create `plan.json`, `run.json`, or `report.json`. Existing result folders are not renamed or rewritten.
 
 ## Exercised verification
 
-- `python -m unittest discover -s tests -q`: 72 tests passed, including expansion, manifest mismatch rejection, timing coverage, report safety, lifecycle failures/cancellation, log routing, and readiness boundaries (disconnect recovery, timeout, container exit, and no generation-probe retry).
+- `python -m unittest discover -s tests -q`: 73 tests passed, including JSON/XLSX row parity, scalar settings, aggregate-only exports, renamed execution artifacts, live status transitions, failed exports, score eligibility, lifecycle failures/cancellation, logging, and readiness.
 - Both real-path CLI previews passed: the checked-in recipe resolves eight trials; model-only input resolves one default trial. Neither loads a model.
 - Rebuilt the benchmark image successfully.
 - Disposable CPU-only Docker smoke: one deliberately exited startup followed by two completed real Inspect/BigCodeBench sandbox evaluations of a synthetic one-problem corpus. Verified fixed manifests, probe versus benchmark reasoning settings, timing propagation, spreadsheet readback, and no remaining owned containers. The response service had no GPU device requests. These were workflow fixtures, not model scores or speed measurements; scripts/data/results were removed afterward.
 - Ran the new collector over the retained native evaluation at `results/20261103T184944Z-95d186f9/`: two measured calls, 9,880 generated tokens, 141.95804 summed decode seconds, approximately 69.598 server decode tokens/s. This reads existing evidence; no new inference request.
 - Automatic logging smoke (2026-11-04): two executions of the actual CLI with a disposable CPU response service and real Inspect/BigCodeBench sandbox evaluation, one fixture problem per execution. An unchanged open tail handle saw the second execution's inference output. All three stable live files exactly matched the concatenated per-run archives, child streams stayed out of the main console, and native `.eval`/JSON/XLSX results were retained. Also verified file-free plan-only, rejection of the removed logging flag, and owned-container cleanup. Temporary fixtures/results were removed; no GPU/model was loaded and no image rebuild was required. The 72-test CPU suite covers live flushes, stream/trial isolation, append/archive boundaries, concurrent writers, subprocess failures, and follower cleanup.
 - Startup disconnect fix (2026-11-04): reproduced the reported `RemoteDisconnected` using a real local HTTP server before editing. The readiness poll now catches connection-level failures within its existing deadline. Verified with a CPU-only Docker service that closes the first health connection, returns HTTP 503 next, then becomes healthy and answers the probe. Owned fixture cleanup passed; no competing GPU/model work or interference with the user's active second trial. The running orchestrator retains its old code; the fix applies on the next launch.
+- Comparison replay (2026-11-04): exported saved evidence from `results/20261103T210559-31669ea5/` into a temporary directory. Verified two trial/benchmark rows with 56 matching scalar columns in JSON and the single Results sheet. Scores, generation speeds, model/settings, load times, and trial durations matched the original evidence. Only the four approved top-level artifacts were generated; execution status contains no result/sample tables. Original artifacts were hash-verified unchanged and temporary exports removed. No Docker/model/GPU work.
 
 ### Real GPU integration smoke — 2026-11-03
 

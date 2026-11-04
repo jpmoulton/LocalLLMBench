@@ -16,7 +16,7 @@ import uuid
 import benchmark
 import inference
 from orchestrator.logging import RunLogs
-from orchestrator.report import write_report
+from orchestrator.report import write_results, write_status
 from orchestrator.state import now, save_json, update_counts
 
 
@@ -243,7 +243,7 @@ def _show_results(directory: Path, plan: dict, logs: RunLogs) -> None:
 
 
 def execute(
-    plan: dict, *, backend=None, reporter=write_report, logs: RunLogs | None = None,
+    plan: dict, *, backend=None, reporter=write_results, logs: RunLogs | None = None,
 ) -> tuple[Path, dict, dict | None]:
     if logs is None:
         with RunLogs() as owned_logs:
@@ -265,7 +265,7 @@ def execute(
             for trial in plan["trials"]
         ],
     }
-    save_json(output / "plan.json", plan)
+    save_json(output / "execution_plan.json", plan)
     report = None
 
     def persist(trial=None):
@@ -273,7 +273,7 @@ def execute(
         update_counts(run)
         if trial is not None:
             save_json(output / "trials" / trial["id"] / "trial.json", trial)
-        save_json(output / "run.json", run)
+        write_status(output, run)
 
     def report_results():
         nonlocal report

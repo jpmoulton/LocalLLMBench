@@ -36,7 +36,7 @@ Choose a stable lowercase Python identifier, using underscores if needed. Create
 | `NEEDS_DOCKER` | Boolean indicating whether the controller needs host Docker-daemon access, usually to create execution sandboxes. All benchmarks still run inside the controller container. |
 | `validate_options(options)` | Validate merged values and raise useful errors. Do not read datasets or require their paths to exist here. |
 | `prepare(options)` | Return `(payload, provenance)` after read-only input preparation. |
-| `SCORE_METRICS` (optional) | Map top-level numeric summary keys to `{label, direction, unit}` metadata. `direction` is `"higher"` or `"lower"`; only declared, finite scores from completed evaluations are eligible for per-benchmark leaders. |
+| `SCORE_METRICS` (optional) | Map top-level numeric summary keys to `{label, direction, unit}` metadata. These declared scores appear as `score.<key>` columns in both comparison exports. `direction` is `"higher"` or `"lower"`; only declared, finite scores from completed evaluations are eligible for CLI per-benchmark leaders. |
 
 All registered definitions and their options are loaded/validated during configuration loading, including unselected benchmarks. Keep imports and validation free of dataset access, runtime imports, and side effects.
 
@@ -44,7 +44,7 @@ Only selected input paths are checked and mounted. The launcher resolves relativ
 
 `prepare()` runs on the host for standalone `--select-only` and orchestrator planning, and inside each controller against mounted paths.
 
-The **payload** is benchmark-owned Python data passed to `make_task()`. The shared runner does not inspect or serialize it. **Provenance** must be a JSON-serializable, path-independent dictionary recording selection, input identity/version, and protocol details. The orchestrator freezes it in `plan.json`; each controller writes `manifest.json` and compares it exactly before generation. Exclude host/container paths, timestamps, and other incidental values. A mismatch makes the evaluation incomplete rather than selecting replacement tasks. Preparation is read-only; acquire assets separately.
+The **payload** is benchmark-owned Python data passed to `make_task()`. The shared runner does not inspect or serialize it. **Provenance** must be a JSON-serializable, path-independent dictionary recording selection, input identity/version, and protocol details. The orchestrator freezes it in `execution_plan.json`; each controller writes `manifest.json` and compares it exactly before generation. Exclude host/container paths, timestamps, and other incidental values. A mismatch makes the evaluation incomplete rather than selecting replacement tasks. Preparation is read-only; acquire assets separately.
 
 **Definition complete:** it imports without Inspect installed, validates options without input access, and prepares reproducible inputs/provenance on host and container paths.
 
