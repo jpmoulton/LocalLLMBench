@@ -41,7 +41,7 @@ Default-all now includes the 64K-reference-input RULER corpus as well as BigCode
 
 | File | Responsibility |
 | --- | --- |
-| `orchestrate.py` | Argument parsing, stacked 59-column plain-ASCII wordmark with chip motif, plan preview, final results, exit code |
+| `orchestrate.py` | Argument parsing, stacked 59-column plain-ASCII wordmark with chip motif (no tagline), plan preview, final results, exit code |
 | `orchestrator/recipe.py` | Safe YAML/schema validation, defaults, paths, deterministic expansion, frozen input manifests |
 | `orchestrator/runner.py` | Sequential lifecycle, readiness/probe, live controller output, cleanup and progress |
 | `orchestrator/logging.py` | Run-wide stream routing, live file writes, source/trial labels, and logging-mode ownership |
