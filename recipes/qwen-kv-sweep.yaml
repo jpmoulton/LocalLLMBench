@@ -51,6 +51,8 @@ generation:
   seed: 42         # Generation seed; separate from the seed used to select problems.
 
 # Optional. Omit this field or use null to run all registered benchmarks (the default).
+# Currently: 64 BigCodeBench problems + 64 RULER retrieval prompts per trial.
+# RULER needs its CPU-prepared corpus; see docs/benchmark_container.md.
 # To select a subset instead: benchmarks: [bigcodebench]
 benchmarks: null
 
@@ -58,6 +60,8 @@ benchmarks: null
 # BigCodeBench defaults: 64 problems, selection seed 42, and a 60-second timeout
 # for each reference-solution/generated-code test execution.
 # Its default dataset_path is already configured for this PC in the benchmark module.
+# RULER defaults: eight retrieval variants, eight samples each, selection seed 42,
+# using the prepared 64K-reference-input corpus. See qwen-ruler.yaml for overrides.
 # Uncomment the following only to override those defaults (e.g. count: 2 for a smoke run).
 # On another PC, set dataset_path to wherever that machine stores the dataset.
 #

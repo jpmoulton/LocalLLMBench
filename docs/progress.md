@@ -171,6 +171,18 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 - Renamed planning output to `execution_plan.json` and lightweight status to `execution_report.json`. Status updates do not rescan benchmark evidence or regenerate comparison files. Comparisons refresh after trials and at finalization; JSON remains available if XLSX export fails. New runs create none of the old plan/run/report filenames; historical results remain unchanged.
 - Comparison verification: 73 CPU tests passed. A real-evidence replay produced two comparison rows with 56 matching JSON/XLSX scalar columns, one Results sheet, and only the four approved top-level artifact names. Scores, speeds, model/settings, and load/trial timings matched original evidence. Execution status contained no result/sample tables. Original artifacts were hash-verified unchanged; temporary exports removed. No Docker/model/GPU work.
 
+## RULER retrieval subset — live integration smoke passed
+
+- User approved eight classic retrieval variants, eight examples each, at a 64K reference-input budget. This is not the full 13-task RULER suite. Implementation/protocol/setup are recorded in [benchmark_container.md](benchmark_container.md#ruler-retrieval-subset).
+- Added the independent `benchmarks/ruler/` module and registry entry. No shared runner, lifecycle, or report-format changes were needed. Default-all now includes both BigCodeBench and RULER; explicitly selected BigCodeBench smoke/stress recipes remain unchanged.
+- The supplied RULER directory contained 49 essays only. CPU staging runs pinned, SHA256-verified upstream NVIDIA NIAH code using pinned sentence/tokenizer resources and `cl100k_base` reference counts. It writes an immutable corpus under the asset directory's `prepared/` subdirectory; no datasets are committed.
+- Prepared 64 real prompts, 64,100–65,536 reference input tokens each. Host/container selection is fixed, hash-checked, and independent of model/settings. Dataset generation seed, per-task subset seed, and model generation seed are separate.
+- Existing reasoning/output settings are preserved. Scores use final-answer case-insensitive substring reference recall, with per-variant and aggregate percentages. Missing/error/truncated outcomes withhold aggregate scores. RULER alone requires no code sandbox/Docker socket.
+- Added `recipes/qwen-ruler.yaml`: Q4_K_M, 128K allocation, q8_0/q4_0 K/V, 64 identical prompts per trial. Default-all requires high-context serving; model-only mode still uses 8192 and is unsuitable for this default corpus. No implicit context resizing.
+- Verification: 99 host tests passed; 26 RULER tests rechecked after a numeric guard adjustment; actual default-all and recipe previews passed. Two CPU Docker/Inspect fixtures verified all eight variants, final-only fractional scoring, truncation withholding, frozen identities, native logs/timing extraction, and identical 66-column JSON/XLSX exports. Fixture scripts/results removed.
+- Initial implementation/verification remained CPU-only while the user played WoW. After explicit GPU permission, `recipes/qwen-ruler-smoke.yaml` completed a real Q4_K_M/q8_0, 128K-context trial with one prompt per variant: 8/8 scored at 100% recall, no errors/truncation/missing outcomes, 397.8 seconds total. Evidence: `results/20261104T190827-6ab3ec66/`; detailed metrics and limitations are in [the live verification record](benchmark_container.md#ruler-live-gpu-smoke--2026-11-04).
+- Verified the live 73-column JSON/XLSX comparison exports agree within normal numeric serialization precision and confirmed no Docker containers remained running. Full two-quant RULER comparison, peak VRAM measurement, and Linux-host execution remain unverified. No further GPU runs are authorized by that one smoke request.
+
 ## Progress
 
 ### 2026-11-03
@@ -190,4 +202,4 @@ Do not assume model identity, lineage, backend compatibility, or MTP support fro
 
 ## Next step
 
-The basic end-to-end integration step is successful and the user-approved three-mode logging cutover is implemented. Let the user choose the next component. Keep future UI, VRAM monitoring, advanced compatibility validation, and retry machinery outside this implementation.
+Let the user choose the next step. The RULER live smoke passed; larger runs and quant comparisons remain untested. Keep future UI, VRAM monitoring, advanced compatibility validation, and retry machinery outside this implementation.

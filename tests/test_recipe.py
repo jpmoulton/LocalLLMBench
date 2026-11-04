@@ -19,6 +19,10 @@ from orchestrator.recipe import build_plan
 
 class RecipeTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These recipe tests supply only a BigCodeBench corpus; plugin inputs stay isolated.
+        self.enterContext(patch.dict(
+            registry.BENCHMARKS, {"bigcodebench": "benchmarks.bigcodebench"}, clear=True,
+        ))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()

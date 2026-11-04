@@ -72,7 +72,10 @@ class OrchestratorTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(patch("orchestrator.logging.LIVE_LOG_DIR", self.root / "logs"))
-        config = resolve_config({"benchmark_options": {"bigcodebench": {"dataset_path": str(self.root)}}})
+        config = resolve_config({
+            "benchmarks": ["bigcodebench"],
+            "benchmark_options": {"bigcodebench": {"dataset_path": str(self.root)}},
+        })
         self.plan = {
             "schema_version": 1, "name": "lifecycle", "source": "fixture", "output_dir": str(self.root),
             "inference": {"bind_address": "127.0.0.1", "port": 18081},

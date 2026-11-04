@@ -43,7 +43,7 @@ There are no per-model benchmark or generation overrides. A run resolves those s
 
 This retains the agreed explicit-configuration approach: a block containing only scalar settings produces one configuration. Lists enable parameter-grid expansion. Separate groups describe particular combinations without generating unwanted cross-pairs.
 
-The supplied example produces three 128K configurations (q8_0, q4_0, bf16) plus one 256K configuration (q4_0 only). Two models therefore produce **eight trials**. With the currently registered BigCodeBench and its default 64 problems, that is 512 attempted model answers if every trial reaches generation. Canonical preflight does not request model answers. The example uses default-all benchmark selection, so additional registered benchmarks will also be included.
+The supplied example produces three 128K configurations (q8_0, q4_0, bf16) plus one 256K configuration (q4_0 only). Two models therefore produce **eight trials**. Default-all currently includes 64 BigCodeBench problems and 64 RULER retrieval prompts per trial: 1,024 attempted model answers if every trial reaches both evaluations. Canonical BigCodeBench preflight does not request model answers. Prepare the RULER corpus before running; see [its protocol and setup](benchmark_container.md#ruler-retrieval-subset). Additional registered benchmarks will also join default-all runs.
 
 Deterministic order: models in list order, then configuration groups in list order. Within a group, sort parameter names lexicographically, treating `kv_quantization` as another axis name; preserve each value list's order, with the last axis varying fastest. Reordering YAML mapping keys must not change trial order. Keep requested combinations even if different groups describe equivalent settings; there is no automatic deduplication or repeats mechanism.
 
@@ -119,7 +119,7 @@ The legacy standalone benchmark `inference.minimum_context` setting/check has be
 | Native `--fit`, `--spec-type` | `"off"`, `none` |
 | Other existing image behavior | KV offload on, continuous batching on, warmup on, prompt caching off, context shifting off, metrics on |
 | `benchmarks` | All registered benchmarks, resolved once for the run |
-| `benchmark_options` | Each benchmark's module defaults; BigCodeBench currently uses count `64`, subset seed `42`, test timeout `60` seconds, and its configured local dataset path |
+| `benchmark_options` | Module defaults: BigCodeBench selects `64` problems with seed `42` and test timeout `60` seconds; RULER selects `8` examples per each of eight retrieval variants with seed `42`, from its prepared 64K-reference-input corpus. Each module owns its dataset path. |
 | `generation.thinking`, `generation.max_tokens` | `true`, `8192` (reasoning plus final output) |
 | `generation.temperature`, `top_p`, `top_k`, `min_p`, `seed` | `1.0`, `0.95`, `20`, `0.05`, `42` |
 | `execution.concurrency`, `execution.request_timeout` | `1`, `900` seconds |

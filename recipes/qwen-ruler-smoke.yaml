@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=./recipe.schema.json
+# One model/configuration, one real 64K-reference-input prompt per retrieval variant.
+# Eight requests total; a workflow smoke, not a quality comparison.
+schema_version: 1
+name: qwen-27b-ruler-64k-smoke
+models:
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+inference:
+  configurations:
+    - name: 128k-ruler-q8-smoke
+      kv_quantization: [q8_0]
+      parameters:
+        --ctx-size: 131072
+        --gpu-layers: all
+        --flash-attn: "on"
+        --parallel: 1
+        --fit: "off"
+benchmarks: [ruler]
+benchmark_options:
+  ruler:
+    selection:
+      count_per_task: 1
+      seed: 42
+generation:
+  thinking: true
+  max_tokens: 8192
+output_dir: ../results

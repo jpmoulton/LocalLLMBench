@@ -4,7 +4,10 @@ from importlib import import_module
 from types import ModuleType
 
 
-BENCHMARKS = {"bigcodebench": "benchmarks.bigcodebench"}
+BENCHMARKS = {
+    "bigcodebench": "benchmarks.bigcodebench",
+    "ruler": "benchmarks.ruler",
+}
 
 
 def resolve_benchmarks(names: list[str] | None) -> list[str]:

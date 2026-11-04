@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=./recipe.schema.json
+# Two KV-cache choices; identical frozen retrieval prompts in both trials.
+# Prepare the CPU-only RULER dataset first; see docs/benchmark_container.md.
+schema_version: 1
+name: qwen-27b-ruler-64k
+
+models:
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+
+inference:
+  bind_address: 127.0.0.1
+  port: 8080
+  configurations:
+    - name: 128k-ruler-kv
+      kv_quantization: [q8_0, q4_0]
+      parameters:
+        --ctx-size: 131072
+        --gpu-layers: all
+        --flash-attn: "on"
+        --parallel: 1
+        --fit: "off"
+
+# Only the RULER retrieval subset, not BigCodeBench or the full 13-task RULER suite.
+benchmarks: [ruler]
+benchmark_options:
+  ruler:
+    # Default path: generated once from the local essays, never during a trial.
+    dataset_path: C:/Users/hocke/Documents/LLM-Reusable-Assets/benchmarks/datasets/current/ruler/prepared
+    # Omitting tasks selects all eight retrieval variants.
+    selection:
+      count_per_task: 8  # Default: 8 x 8 variants = 64 prompts per trial.
+      seed: 42          # Default subset-selection seed, not the preparation/generation seed.
+
+# These are the shared defaults. Reasoning and final output share max_tokens.
+# 64K describes the prepared INPUT budget in cl100k_base reference tokens.
+# Qwen's actual token count differs; 128K context leaves room for chat formatting
+# and generation. This recipe never pads prompts to the whole server context.
+generation:
+  thinking: true
+  max_tokens: 8192
+
+execution:
+  concurrency: 1
+  request_timeout: 900
+  startup_timeout: 300
+
+output_dir: ../results

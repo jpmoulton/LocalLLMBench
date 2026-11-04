@@ -2,9 +2,9 @@
 
 ## Scope
 
-Shared Inspect AI controller, with one directory per benchmark. BigCodeBench is the first registered benchmark, not the controller's built-in protocol. No sweep orchestration or UI work in this iteration.
+Shared Inspect AI controller, with one directory per benchmark. Registered modules are BigCodeBench and the RULER retrieval subset. Both use the same host orchestrator, frozen-input checks, generation settings, logging, and comparison exports.
 
-## Local dataset
+## BigCodeBench local dataset
 
 User-selected asset directory:
 
@@ -14,7 +14,96 @@ Observed assets: `corpus.jsonl`, `sample.jsonl`, `manifest.json`, and `task_doma
 
 The supplied manifest identifies the corpus as BigCodeBench v0.1.4, with 1,140 problems and source dataset revision `b74c0d0bf70d2c0bc459be537895cca163007f1a`. Its existing sample contains 64 problems selected using seed 42 and a domain-stratified policy. That pre-existing sample policy is not the policy selected for this new project.
 
-## Agreed decisions
+## RULER retrieval subset
+
+The local `ruler` asset directory contains 49 essays, not ready-made benchmark prompts. `benchmarks/ruler/prepare.py` uses NVIDIA's original NIAH generator to create a frozen corpus once, on CPU. Host and container preparation subsequently only read/select that corpus; no prompts are regenerated between trials.
+
+This is **eight classic RULER retrieval variants**, not the full 13-task suite or a paper-comparable leaderboard score:
+
+| Variant | Retrieval task |
+| --- | --- |
+| `niah_single_1` | One word-key/numeric-value needle in repeated noise |
+| `niah_single_2` | One word-key/numeric-value needle in essays |
+| `niah_single_3` | One word-key/UUID-value needle in essays |
+| `niah_multikey_1` | Four keyed needles in essays; query one key |
+| `niah_multikey_2` | Retrieve a word-key/numeric-value target among distractor needles |
+| `niah_multikey_3` | Retrieve a UUID-key/UUID-value target among distractor needles |
+| `niah_multivalue` | Retrieve four numeric values for one word key |
+| `niah_multiquery` | Retrieve the values for four queried word keys |
+
+### Prepare once, without a GPU
+
+The default corpus is already prepared on this PC at:
+
+`C:\Users\hocke\Documents\LLM-Reusable-Assets\benchmarks\datasets\current\ruler\prepared`
+
+For a fresh output directory, from the project root:
+
+```powershell
+docker build --tag localllmbench-benchmark:local benchmarks
+docker run --rm --cpus 2 --memory 4g --mount "type=bind,source=C:/Users/hocke/Documents/LLM-Reusable-Assets/benchmarks/datasets/current/ruler,target=/ruler" --entrypoint python localllmbench-benchmark:local -m benchmarks.ruler.prepare --essays /ruler/essays --output /ruler/prepared
+```
+
+The parent directory is mounted because preparation creates the output directory itself. Existing output is never overwritten; choose another output directory for a different corpus. Original essays are only read. Preparation needs network access to pinned source/tokenizer resources, but never downloads model weights or accesses an inference service. Upstream builds a large adjective/noun vocabulary, so CPU preparation uses appreciable RAM; the command above completed within its 4 GiB limit.
+
+Preparation options:
+
+| CLI option | Default and meaning |
+| --- | --- |
+| `--input-tokens` | `65536`: maximum input plus answer-prefix tokens, measured with the fixed reference tokenizer; minimum `4096` |
+| `--samples-per-task` | `8`: number generated for each variant |
+| `--seed` | `42`: synthetic problem-generation seed, from `0` through `2**32 - 1` |
+| `--reserved-output-tokens` | `8192`: upstream sequence-sizing reservation; input ceiling remains `--input-tokens` |
+| `--tasks` | All eight variants; optionally supply a space-separated subset |
+
+Artifacts are `corpus.jsonl`, `manifest.json`, and attribution notices. The manifest records source hashes, dependency versions, essay identities/order, tokenizer resources, preparation settings, and the corpus hash. Do not commit or redistribute generated essay prompts without appropriate permission.
+
+The generator is pinned to [NVIDIA/RULER revision db43f92](https://github.com/NVIDIA/RULER/tree/db43f92ff634bbce1c33d1fb15858aec4bba509a). Downloaded source, NLTK English sentence tables, and the `cl100k_base` vocabulary are SHA256-verified. Direct preparation dependencies are pinned in `benchmarks/ruler/requirements.txt`; attribution is in `benchmarks/ruler/THIRD_PARTY_NOTICES.txt`.
+
+### Length, selection, and reasoning
+
+**64K is a reference-token input budget, not a claim of exactly 64K Qwen tokens or a server allocation.** The fixed tokenizer is `tiktoken`'s `cl100k_base`, one of upstream's supported adapters. The actual prepared inputs range from 64,100 to 65,536 reference tokens. Chat-wrapper overhead is not included. Model-native counts and output must still fit the deployed context.
+
+`recipes/qwen-ruler.yaml` requests 131072 server context, one slot, and the shared 8192-token reasoning-plus-final output cap. Changing serving context or KV precision does not alter the prompts. To evaluate a different input length, prepare another corpus with `--input-tokens` and point `dataset_path` at it. Preparation's output reservation does not override `generation.max_tokens` or allocate server context.
+
+The official base template and answer prefix are sent together as one user message. The local essays, fixed reference tokenizer, chat transport, larger output budget, and reasoning-enabled/final-only scoring are explicit protocol adaptations. They make comparisons within a frozen LocalLLMBench run useful without claiming equivalence to the [original RULER evaluation](https://arxiv.org/abs/2404.06654).
+
+Module defaults:
+
+```yaml
+benchmarks: [ruler]
+benchmark_options:
+  ruler:
+    dataset_path: C:/Users/hocke/Documents/LLM-Reusable-Assets/benchmarks/datasets/current/ruler/prepared
+    # Omit tasks to use all eight variants; an explicit list selects a subset.
+    selection:
+      count_per_task: 8
+      seed: 42
+```
+
+Thus the default evaluation contains **64 prompts per trial**. Per-task selection ranks stable sample IDs by a versioned SHA256 of the selection seed and ID. Paths, models, and inference/generation settings do not participate. Selected IDs and the full source identity are frozen in `execution_plan.json` and checked inside every controller.
+
+There are three independent seeds: preparation, subset selection, and model generation. The initial pool contains eight examples per variant, so selecting all eight with another selection seed changes order, not membership. To sample different subsets, first generate a larger pool using `--samples-per-task`, then select fewer records per task. To synthesize different keys/values/positions, prepare a new corpus with another preparation `--seed`.
+
+### Scores and execution
+
+The scorer follows upstream's case-insensitive substring **reference recall**, not exact-match accuracy. Finding two of four requested values scores 50%; extra output is not penalized. Separately represented reasoning is retained by Inspect but excluded from scoring. The overall percentage is the equal-weight mean of selected variant scores.
+
+`score.retrieval_score` and eight `<variant>_score` fields appear in the existing `results.json` and Results worksheet, alongside model/settings, timings, and generation metrics. Unselected variant scores are null. Missing/duplicate/unexpected outcomes, request errors, or truncation make the evaluation incomplete and withhold all aggregate scores; an ordinary wrong answer remains a completed scored outcome. Per-sample evidence stays in the benchmark summary and native Inspect logs, not comparison exports.
+
+RULER has no generated-code execution or sandbox. A RULER-only controller does not mount the Docker socket. If BigCodeBench is selected too, its existing sandbox requirements still apply.
+
+```powershell
+# CPU-only preview; does not launch inference.
+.\.venv\Scripts\python.exe orchestrate.py --recipe recipes/qwen-ruler.yaml --plan-only
+
+# Starts the GPU model: run only when the GPU is available.
+.\.venv\Scripts\python.exe orchestrate.py --recipe recipes/qwen-ruler.yaml
+```
+
+The recipe runs Q4_K_M at q8_0 then q4_0 K/V: two trials, 64 identical prompts each, 128 total generation requests if both complete. Explicit BigCodeBench smoke/stress recipes remain unchanged. **Default-all now includes both modules**, so prepare both inputs and use sufficient serving context. The model-only CLI shortcut's 8192 context is not suitable for this default RULER corpus; use a high-context recipe instead. Context is never silently resized.
+
+## BigCodeBench decisions
 
 - Read the full local corpus rather than silently using the existing `sample.jsonl`.
 - Start with simple deterministic seeded selection: default 64 problems, seed 42, both configurable. Rank stable task IDs using a documented hash of the seed and task ID so selection does not depend on row ordering.
@@ -25,7 +114,7 @@ The supplied manifest identifies the corpus as BigCodeBench v0.1.4, with 1,140 p
 - Continue after sample execution errors where possible, retain diagnostics, and mark runs with such errors incomplete. Ordinary incorrect solutions are scored failures, not infrastructure errors.
 - Dataset/asset downloads and caching are allowed; external model/API calls require separate approval.
 
-## Selection policy to revisit with the user
+## BigCodeBench selection policy to revisit
 
 The user explicitly wants to revisit broad, guaranteed multi-category coverage. Simple seeded selection is acceptable now, but it does not guarantee domain or library coverage and does not select easier problems. Reconsider stratification or another coverage-aware policy later, with the user choosing the design.
 
@@ -39,6 +128,7 @@ Standalone settings live in `benchmark_config.json`; [orchestrator recipes](reci
 | --- | --- |
 | `benchmarks` | Omitted or `null`: all registered benchmarks, in registry order. Explicit nonempty list: only those benchmarks, in the supplied order. Unknown names and duplicates fail. |
 | `benchmark_options.bigcodebench` | `dataset_path`: local asset directory above; `selection: {"count": 64, "seed": 42}`; `test_timeout: 60` seconds |
+| `benchmark_options.ruler` | Prepared dataset path above; all eight retrieval variants; `selection: {"count_per_task": 8, "seed": 42}` |
 | `inference` | `container: "localllmbench-inference-128k"`, `model: "local-model"` for standalone attachment |
 | `generation` | `thinking: true`, `max_tokens: 8192`, `temperature: 1.0`, `top_p: 0.95`, `top_k: 20`, `min_p: 0.05`, `seed: 42` |
 | `execution` | `concurrency: 1`, `request_timeout: 900` seconds |
@@ -67,8 +157,12 @@ The generation seed is independent of the subset seed. Changing generation or in
 - `benchmarks/bigcodebench/task.py`: Complete prompts, reference preflight, sandboxed scoring, and coverage-aware result accounting.
 - `benchmarks/bigcodebench/sandbox.yaml`: this benchmark's code-execution environment.
 - `benchmarks/bigcodebench/requirements.txt`: benchmark-specific controller dependencies.
+- `benchmarks/ruler/prepare.py`: explicit CPU-only synthesis using pinned upstream code/resources.
+- `benchmarks/ruler/definition.py`: frozen-corpus validation, selection, and provenance.
+- `benchmarks/ruler/task.py`, `scoring.py`: Inspect adapter, reference recall, and completeness accounting.
+- `benchmarks/ruler/requirements.txt`: pinned CPU preparation dependencies.
 - `benchmarks/Dockerfile`, `benchmarks/requirements.txt`: shared controller image/dependencies. The build installs each benchmark directory's optional requirements file.
-- `tests/test_benchmark_config.py`, `tests/test_bigcodebench.py`: shared selection/configuration and BigCodeBench data-selection regressions.
+- `tests/test_benchmark_config.py`, `tests/test_bigcodebench.py`, `tests/test_ruler.py`: shared selection/configuration and benchmark-specific selection/scoring/coverage regressions.
 
 Controller dependencies: Inspect AI `0.3.287`, Inspect Evals `0.27.0`, OpenAI SDK `3.4.0`. Python and Docker client base images are digest-pinned in the Dockerfile. Direct Python dependencies are version-pinned; transitive versions are recorded per run, but are not a full dependency lockfile. Keep the built image for exact repeat runs.
 
@@ -103,6 +197,7 @@ List registered benchmarks and preview preparation without Docker or model execu
 python benchmark.py --list-benchmarks
 python benchmark.py --select-only
 python benchmark.py --benchmarks bigcodebench --select-only
+python benchmark.py --benchmarks ruler --select-only
 ```
 
 Run all configured benchmarks, or explicitly select only BigCodeBench:
@@ -248,3 +343,36 @@ The [host orchestrator](orchestrator.md) now manages sweeps and spreadsheet expo
 The full 64-task generation run has not been executed. Two passes establish the integration path, not a useful quality estimate. The high-context server was exercised with short prompts, not a filled 128K context. No Linux-host or other-model run has been tested.
 
 The orchestrator integration subsequently passed 61 CPU regression tests and a CPU-only Docker/Inspect smoke; see [its verification record](orchestrator.md#exercised-verification). That smoke used synthetic responses/tasks, not new model inference. Shared runtime changes include frozen manifest checks before generation, timing extraction, and removal of the legacy minimum-context guard.
+
+### RULER CPU verification — 2026-11-04
+
+- Rebuilt the shared benchmark image; 99 host regressions passed. The 26 RULER regressions also passed after the final numeric-score guard adjustment. New module LSP diagnostics are clean.
+- Executed the pinned generator under `--cpus 2 --memory 4g`: 64 real prompts across eight variants, 17,344,560 corpus bytes, reference inputs 64,100–65,536 tokens. Corpus SHA256: `e419d27d77b27385de4e4d4fbdde0682808d2d647204ac0a9f28dc53fc604fb3`. Original essay files match the recorded preparation hashes.
+- Actual CLI default-all preparation selected 64 BigCodeBench plus 64 RULER records. The RULER recipe's plan-only preview resolved both KV configurations without starting containers or loading a model.
+- Executed two real CPU Docker/Inspect evaluations with controlled HTTP responses and one real frozen prompt per retrieval variant. Both controllers ran without network access beyond loopback, GPU requests, or Docker socket mounts. Host/container manifests matched exactly.
+- The first response fixture deliberately returned wrong, partial, and correct final answers while placing all references in separate reasoning. Expected aggregate recall was 75%; Inspect and the module summary agreed. This is a scoring/transport fixture, not a model-quality result.
+- The second fixture truncated one response. The benchmark became incomplete and all overall/per-variant comparison scores were null; timing evidence remained available. Native Inspect's own mean over scored samples is not the authoritative complete-run score.
+- Both exports were read back: one Results row with 66 matching JSON/XLSX columns, correct sample counts, status, and score availability. Temporary fixture scripts/results were removed.
+- No inference server/model was started. Qwen-native token lengths, VRAM fit, retrieval quality, and performance remain to be checked when the user permits a GPU run.
+
+## RULER live GPU smoke — 2026-11-04
+
+After the user explicitly made the GPU available, ran [qwen-ruler-smoke.yaml](../recipes/qwen-ruler-smoke.yaml) through the real orchestrator: Qwen3.8-27B Q4_K_M weights, q8_0 K/V caches, 131072 context, one slot, reasoning enabled, and one frozen prompt per retrieval variant. Retained local evidence: `results/20261104T190827-6ab3ec66/`.
+
+| Measurement | Observed result |
+| --- | ---: |
+| Total run time | 397.8 seconds |
+| Load/readiness time | 97.767 seconds |
+| Benchmark evaluation time | 289.331 seconds |
+| Samples scored | 8 / 8 |
+| Overall and every variant's retrieval recall | 100% |
+| Errors / truncations / missing outcomes | 0 / 0 / 0 |
+| Server-reported prompt tokens, total | 567,305 |
+| Server prompt throughput | 2,582.023 tokens/second |
+| Generated tokens, total | 3,103 |
+| Server decode throughput | 55.958 tokens/second |
+| Mean request latency | 35.962 seconds |
+
+The single Results row and `results.json` matched across 73 columns, allowing ordinary floating-point serialization rounding in XLSX. Inference cleanup completed; `docker ps` showed no running containers afterward.
+
+This proves the live long-input integration at this configuration, not a quantization comparison or full-context capability. The two-trial, 64-prompts-per-trial RULER recipe remains untested. No total/peak VRAM measurement was collected, and no Linux-host run was exercised. Generated results remain local and are not committed.

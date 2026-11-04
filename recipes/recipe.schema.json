@@ -101,7 +101,7 @@
       "default": {},
       "propertyNames": {"$ref": "#/$defs/benchmarkName"},
       "additionalProperties": {"type": "object"},
-      "description": "Fixed options keyed by registered benchmark name. Each module owns defaults and validation; this schema deliberately does not embed BigCodeBench's option schema. Nested arrays here are ordinary benchmark data, never sweep axes."
+      "description": "Fixed options keyed by registered benchmark name. Each module owns defaults and validation; this schema deliberately does not embed individual benchmark option schemas. Nested arrays here are ordinary benchmark data, never sweep axes."
     },
     "generation": {
       "type": "object",

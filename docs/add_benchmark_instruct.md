@@ -12,6 +12,7 @@ Read the existing implementation for patterns, not as a universal benchmark prot
 
 - [BigCodeBench definition](../benchmarks/bigcodebench/definition.py): options, local inputs, deterministic selection, provenance.
 - [BigCodeBench runtime](../benchmarks/bigcodebench/task.py): Inspect task and coverage-aware summary.
+- [RULER definition](../benchmarks/ruler/definition.py), [runtime](../benchmarks/ruler/task.py), and [scoring](../benchmarks/ruler/scoring.py): a no-sandbox retrieval module with multiple task variants, fractional scores, and immutable synthetic inputs.
 - [Shared configuration](../benchmarks/config.py), [registry](../benchmarks/registry.py), and [runner](../benchmarks/run.py): actual shared contracts.
 - [Container documentation](benchmark_container.md): inference prerequisites, build/run setup, security limits, and existing verification.
 
@@ -45,6 +46,8 @@ Only selected input paths are checked and mounted. The launcher resolves relativ
 `prepare()` runs on the host for standalone `--select-only` and orchestrator planning, and inside each controller against mounted paths.
 
 The **payload** is benchmark-owned Python data passed to `make_task()`. The shared runner does not inspect or serialize it. **Provenance** must be a JSON-serializable, path-independent dictionary recording selection, input identity/version, and protocol details. The orchestrator freezes it in `execution_plan.json`; each controller writes `manifest.json` and compares it exactly before generation. Exclude host/container paths, timestamps, and other incidental values. A mismatch makes the evaluation incomplete rather than selecting replacement tasks. Preparation is read-only; acquire assets separately.
+
+RULER illustrates the acquisition boundary: `python -m benchmarks.ruler.prepare` is an explicit CPU-only staging command inside the image. It generates and hashes a corpus before a run. Its host `definition.prepare()` only validates/selects frozen records; it never downloads resources or regenerates prompts for each model. Keep token-length conventions, tokenizer identity, and protocol adaptations in provenance rather than assuming every model tokenizes identically.
 
 **Definition complete:** it imports without Inspect installed, validates options without input access, and prepares reproducible inputs/provenance on host and container paths.
 

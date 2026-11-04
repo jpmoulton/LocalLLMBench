@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=./recipe.schema.json
+# Preview without loading a model:
+# .\.venv\Scripts\python.exe orchestrate.py --recipe recipes/qwen-stress.yaml --plan-only
+# 2 models x 2 contexts x 2 KV precisions x 2 micro-batch sizes = 16 sequential trials.
+# 64 fixed problems per trial = 1,024 benchmark generations if all trials reach evaluation.
+# This is a long-duration workflow/deployment test, not a filled-context benchmark.
+# GPU fit is NOT guaranteed, especially for Q6_K with 256K context and q8_0 KV.
+
+schema_version: 1
+name: qwen-27b-multi-axis-stress
+
+# Run every configuration on Q4_K_M first, then repeat them on Q6_K.
+models:
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+  - F:/Models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q6_K.gguf
+
+inference:
+  bind_address: 127.0.0.1
+  port: 8080
+  configurations:
+    - name: context-kv-microbatch
+      # Each precision applies to BOTH K and V; these are paired, not separate axes.
+      kv_quantization: [q8_0, q4_0]
+      parameters:
+        --ctx-size: [131072, 262144]  # 128K and 256K allocated context.
+        --ubatch-size: [256, 512]    # Physical processing micro-batch size.
+        --batch-size: 2048          # Fixed logical processing batch size.
+        --gpu-layers: all
+        --flash-attn: "on"         # Required here for quantized V-cache support.
+        --parallel: 1              # One generation slot; trials never overlap.
+        --fit: "off"               # Do not automatically alter the requested setup to fit.
+
+# Answer generation is fixed across all trials; these are NOT sweep axes.
+generation:
+  thinking: true
+  max_tokens: 8192  # Reasoning plus final answer; truncation is not a scored failure.
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.05
+  seed: 42
+
+# Explicit selection prevents newly registered benchmarks from expanding this stress run.
+benchmarks: [bigcodebench]
+benchmark_options:
+  bigcodebench:
+    dataset_path: C:/Users/hocke/Documents/LLM-Reusable-Assets/benchmarks/datasets/current/bigcodebench
+    selection:
+      count: 64  # Change to 8 for 128 total benchmark generations across the same 16 trials.
+      seed: 42   # Same selected problems for every trial; independent of generation.seed.
+    test_timeout: 60
+
+execution:
+  concurrency: 1       # Sequential benchmark requests; not a concurrent-serving load test.
+  request_timeout: 900 # Per-request timeout; failures do not trigger generation retries.
+  startup_timeout: 300 # Existing startup deadline; failed trials are cleaned up and skipped.
+
+output_dir: ../results
